@@ -1,0 +1,44 @@
+\begin{tikzpicture}[font=\scriptsize, node distance=3mm,
+  box/.style={draw=ink!60, rounded corners=2pt, fill=white, inner sep=3pt, align=center},
+  agent/.style={draw=ink!70, circle, minimum size=6mm, inner sep=0pt, fill=white},
+  thr/.style={draw=rule!70, rounded corners=1.5pt, fill=rule!8, minimum width=21mm, minimum height=4.6mm, align=center},
+  arr/.style={-{Latex[length=1.5mm]}, draw=ink!70, line width=0.5pt}]
+% ---- forum ----
+\node[agent, fill=ink!10] (M) {M};
+\node[below=0.3mm of M, font=\tiny, text=ink!80] {manager};
+\node[thr, right=8mm of M, yshift=5.6mm] (T1) {thread: \emph{fix parser}};
+\node[thr, below=1.6mm of T1] (T2) {thread: \emph{write tests}};
+\node[thr, below=1.6mm of T2] (T3) {thread: \emph{review patch}};
+\node[agent, right=5mm of T1] (S1) {$s_1$};
+\node[agent, right=1.5mm of S1] (S4) {$s_4$};
+\node[agent, right=5mm of T2] (S2) {$s_2$};
+\node[agent, right=5mm of T3, draw=bad, text=bad, thick] (S3) {$s_3$};
+\node[agent, right=6mm of S3, dashed] (H) {H};
+\draw[arr] (M) -- (T1.west); \draw[arr] (M) -- (T2.west); \draw[arr] (M) -- (T3.west);
+\draw[ink!60] (T1) -- (S1); \draw[ink!60] (S1) -- (S4); \draw[ink!60] (T2) -- (S2);
+\draw[bad] (T3) -- (S3); \draw[ink!50, dashed] (S3) -- (H);
+\node[font=\tiny, text=bad, anchor=north] at ($(S3.south)+(0,-0.3mm)$) {bad actor};
+\node[font=\tiny, text=ink!70, anchor=north] at ($(H.south)+(0.6mm,-0.3mm)$) {human};
+\node[box, draw=rule, text=rule, fill=white, font=\tiny, anchor=north west, minimum width=0pt] (E) at ($(M.west|-T3.south)+(-1mm,-5.5mm)$)
+  {\textbf{enforcement:} read gate $\cdot$ close-with-evidence $\cdot$ review $\cdot$ dissent $\cdot$ budget cut-off $\cdot$ escalation};
+\node[font=\scriptsize\bfseries, text=rule, anchor=south west] (FL) at ($(M.west|-T1.north)+(-1mm,1.2mm)$) {Forum (inner loop)};
+\node[font=\tiny, text=ink!70, anchor=west] at (FL.east) {topology emerges at runtime};
+\begin{scope}[on background layer]
+\node[draw=rule, fill=soft, rounded corners=3pt, inner sep=2.5pt, fit=(FL)(M)(T1)(T3)(S4)(H)(E)] (F) {};
+\end{scope}
+% ---- rulebook ----
+\node[box, draw=rule, anchor=east, text width=31mm, align=left, font=\tiny\ttfamily] (R) at ($(F.west)+(-11mm,0)$) {%
+\textbf{rulebook.yaml}\\[1pt]
+visibility: own-thread;\\\ \ siblings after posting\\
+handoff: full-thread\\
+closing: evidence + 1 review\\
+dissent: post-before-read\\
+escalation: 2 fails -> split\\
+budget: 200k tok / thread\\
+norms: "..." \textrm{\textit{(prompt only)}}};
+\draw[arr, draw=rule] (R.east) -- node[above, font=\tiny, text=rule]{governs} (F.west|-R.east);
+% ---- optimizer ----
+\node[box, draw=opt, text=opt, anchor=south, text width=31mm] (O) at ($(R.north)+(0,7mm)$) {\textbf{reflective optimizer} (outer loop): reads scores, threads, traces; blames a rule; proposes an edit};
+\draw[arr, draw=opt] (O) -- node[right, font=\tiny, text=opt]{edit} (R);
+\draw[arr, draw=opt] (F.north) |- node[pos=0.72, above, font=\tiny, text=opt]{scores $+$ threads $+$ traces on the training split} (O.east);
+\end{tikzpicture}
