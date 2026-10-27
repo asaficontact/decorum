@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { existsSync, lstatSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { test } from "node:test";
-import { commitAll, createIsolatedWorkspace, ignoredTopLevel, isDirty, mergeBranch, prepareGit } from "../src/workspace.ts";
+import { commitAll, createIsolatedWorkspace, ignoredTopLevel, isDirty, mergeBranch, prepareGit, removeStaleIndexLock } from "../src/workspace.ts";
 import { gitOut, gitRepo, tempDir } from "./helpers.ts";
 
 test("an isolated worktree links the checkout's installed dependencies and never commits the links", () => {
@@ -51,4 +51,15 @@ test("a merge conflict is reported, not hidden", () => {
 	const m = mergeBranch(repo, ws.branch);
 	assert.equal(m.ok, false);
 	assert.match(m.output, /CONFLICT/);
+});
+
+test("a stale index.lock is removed so the final commit can run", () => {
+	const repo = gitRepo();
+	prepareGit(repo);
+	writeFileSync(join(repo, ".git", "index.lock"), "");
+	writeFileSync(join(repo, "late.txt"), "l\n");
+	assert.equal(commitAll(repo, "blocked").committed, false);
+	assert.equal(removeStaleIndexLock(repo), true);
+	assert.equal(commitAll(repo, "after").committed, true);
+	assert.equal(removeStaleIndexLock(repo), false);
 });

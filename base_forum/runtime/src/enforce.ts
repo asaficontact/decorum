@@ -39,6 +39,14 @@ export function checkSpawn(rb: Rulebook, s: TrialState, requested: number): Deci
 	return OK;
 }
 
+/** Budget: may a finished worker resume work now? Only the live cap applies; resuming starts no new worker. */
+export function checkResume(rb: Rulebook, s: TrialState): Decision {
+	if (s.liveWorkers + 1 > rb.budget.max_live_workers) {
+		return { ok: false, rule: "budget.max_live_workers", reason: `At most ${rb.budget.max_live_workers} workers may work at once; ${s.liveWorkers} are working.`, terminate: false };
+	}
+	return OK;
+}
+
 /** Visibility: may this agent read this thread? The authority owns every thread, so it always may. */
 export function checkRead(rb: Rulebook, agent: string, participants: readonly string[]): Decision {
 	if (rb.visibility === "all" || participants.includes(agent)) return OK;

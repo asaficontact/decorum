@@ -8,14 +8,14 @@ import type { Model } from "@earendil-works/pi-ai";
 import { createAgentSession, DefaultResourceLoader, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
 import type { AgentSession, ModelRuntime, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { Decision, TrialState } from "./enforce.ts";
-import { checkBudget, checkSpawn } from "./enforce.ts";
+import { checkBudget, checkResume, checkSpawn } from "./enforce.ts";
 import type { ForumEvent } from "./forum.ts";
 import { Forum, ForumError } from "./forum.ts";
 import { AUTHORITY, authoritySystemPrompt, digest, WORKER_NUDGE, workerFirstPrompt, workerSystemPrompt } from "./prompts.ts";
 import type { Rulebook } from "./rulebook.ts";
 import type { ForumHost, WorkerSpec } from "./tools.ts";
 import { authorityTools, workerTools } from "./tools.ts";
-import { commitAll, createIsolatedWorkspace, headSha, mergeBranch, prepareGit } from "./workspace.ts";
+import { commitAll, createIsolatedWorkspace, headSha, mergeBranch, prepareGit, removeStaleIndexLock } from "./workspace.ts";
 
 export const VERSION = "0.1.0";
 
@@ -52,6 +52,7 @@ interface Usage {
 	cacheWrite: number;
 	costUsd: number;
 	llmCalls: number;
+	compactions: number;
 }
 
 interface AgentHandle {
@@ -71,6 +72,8 @@ interface AgentHandle {
 	usage: Usage;
 	errors: string[];
 	lastText: string;
+	/** Forum messages handed to pi's steering queue in the current run, so any pi never delivered can be put back. */
+	steered: Array<{ text: string; events: ForumEvent[] }>;
 }
 
 export interface Summary {
@@ -121,6 +124,8 @@ export class ForumRuntime implements ForumHost {
 	private authorityWake: (() => void) | null = null;
 	private authorityWakes = 0;
 	private totalWorkers = 0;
+	/** assign_workers calls run one at a time: pi runs a message's tool calls in parallel, and the cap and the names must not race. */
+	private assignLock: Promise<unknown> = Promise.resolve();
 	private readonly errors: string[] = [];
 	private wallTimer: NodeJS.Timeout | null = null;
 
@@ -181,6 +186,8 @@ export class ForumRuntime implements ForumHost {
 		if (this.wallTimer) clearTimeout(this.wallTimer);
 		let autoCommitted = false;
 		if (this.o.finalCommit) {
+			// An agent's git command killed by a stop can leave index.lock behind; no agent is running now.
+			if (removeStaleIndexLock(this.o.repo)) this.log("removed a stale .git/index.lock left by a stopped command");
 			const c = commitAll(this.o.repo, "decorum: commit work left uncommitted at the end of the trial");
 			autoCommitted = c.committed;
 			if (!c.ok) this.errors.push(`final commit failed: ${c.output}`);
@@ -255,8 +262,20 @@ export class ForumRuntime implements ForumHost {
 			this.log(`${a.name}: prompt failed: ${errorText(e)}`);
 		} finally {
 			a.running = false;
+			this.reclaimSteers(a);
 		}
-		// Anything that arrived after the last steer point waits in the inbox for the next prompt.
+	}
+
+	/**
+	 * A message steered after pi's last steering check of a run stays in pi's queue when the run ends. Take any such
+	 * messages back into the inbox, in order, so the loop that called runPrompt sees them.
+	 */
+	private reclaimSteers(a: AgentHandle): void {
+		const left = a.session.clearQueue().steering;
+		const back: ForumEvent[] = [];
+		for (const s of a.steered) if (left.includes(s.text)) back.push(...s.events);
+		a.steered = [];
+		if (back.length) a.inbox.unshift(...back);
 	}
 
 	// ---------- message delivery ----------
@@ -283,7 +302,10 @@ export class ForumRuntime implements ForumHost {
 		}
 		if (a.running) {
 			const evs = this.drain(a);
-			a.session.steer(digest(evs)).catch((e: unknown) => {
+			const text = digest(evs);
+			a.steered.push({ text, events: evs });
+			a.session.steer(text).catch((e: unknown) => {
+				a.steered = a.steered.filter((s) => s.text !== text);
 				a.inbox.unshift(...evs);
 				a.errors.push(`steer failed: ${errorText(e)}`);
 			});
@@ -304,9 +326,10 @@ export class ForumRuntime implements ForumHost {
 
 	/** A finished worker that receives a post in its thread goes back to work, if a slot is free. */
 	private revive(w: AgentHandle): void {
-		const d = checkSpawn(this.rulebook, this.state(), 1);
+		const d = checkResume(this.rulebook, this.state());
 		if (!d.ok) {
-			this.forum.note("runtime", `${w.name} has new messages but cannot resume: ${d.reason}`);
+			// The post stays in its inbox; onWorkerIdle resumes it when a slot frees.
+			this.forum.note("runtime", `${w.name} has new messages and will resume when a slot frees: ${d.reason}`);
 			return;
 		}
 		w.finished = false;
@@ -320,6 +343,11 @@ export class ForumRuntime implements ForumHost {
 	}
 
 	private onWorkerIdle(): void {
+		if (!this.stopped) {
+			for (const w of this.agents.values()) {
+				if (w.role === "worker" && w.finished && !w.loop && w.inbox.some((e) => this.wakesFinished(w, e)) && checkResume(this.rulebook, this.state()).ok) this.revive(w);
+			}
+		}
 		if (this.liveWorkers() > 0) return;
 		const m = this.agents.get(AUTHORITY);
 		if (m?.waiting) {
@@ -332,7 +360,14 @@ export class ForumRuntime implements ForumHost {
 
 	// ---------- ForumHost: what the tools call ----------
 
-	async assignWorkers(by: string, threadId: string, specs: WorkerSpec[]): Promise<string> {
+	assignWorkers(by: string, threadId: string, specs: WorkerSpec[]): Promise<string> {
+		const run = this.assignLock.then(() => this.assignWorkersNow(by, threadId, specs));
+		this.assignLock = run.catch(() => undefined);
+		return run;
+	}
+
+	private async assignWorkersNow(by: string, threadId: string, specs: WorkerSpec[]): Promise<string> {
+		if (this.stopped) throw new ForumError(`The trial is stopping: ${this.stopReason}`);
 		const thread = this.forum.thread(threadId);
 		if (thread.status === "closed") throw new ForumError(`Thread ${threadId} is closed.`);
 		if (!specs.length) throw new ForumError("Give at least one worker.");
@@ -430,8 +465,8 @@ export class ForumRuntime implements ForumHost {
 	}
 
 	refuse(agent: string, tool: string, d: Exclude<Decision, { ok: true }>): never {
-		this.forum.refusal(agent, tool, d.rule, d.reason);
-		if (d.terminate) this.stop(d.rule, d.reason);
+		if (d.terminate) this.stop(d.rule, d.reason, agent, tool);
+		else this.forum.refusal(agent, tool, d.rule, d.reason);
 		throw new ForumError(`Refused by the rulebook (${d.rule}): ${d.reason}`);
 	}
 
@@ -461,10 +496,10 @@ export class ForumRuntime implements ForumHost {
 					name: "decorum-rulebook",
 					factory: (pi) => {
 						pi.on("tool_call", async (event) => {
+							if (runtime.stopped) return { block: true, reason: `The trial is stopping: ${runtime.stopReason}`, terminate: true };
 							const d = checkBudget(runtime.rulebook, runtime.state());
 							if (d.ok) return undefined;
-							runtime.forum.refusal(spec.name, event.toolName, d.rule, d.reason);
-							runtime.stop(d.rule, d.reason);
+							runtime.stop(d.rule, d.reason, spec.name, event.toolName);
 							return { block: true, reason: d.reason, terminate: true };
 						});
 					},
@@ -499,11 +534,28 @@ export class ForumRuntime implements ForumHost {
 			finished: false,
 			loop: null,
 			nudges: 0,
-			usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, costUsd: 0, llmCalls: 0 },
+			usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, costUsd: 0, llmCalls: 0, compactions: 0 },
 			errors: [],
 			lastText: "",
+			steered: [],
 		};
 		session.subscribe((ev) => {
+			if (ev.type === "compaction_end") {
+				// Compaction is an LLM call too, and on a large context an expensive one.
+				const cu = ev.result?.usage;
+				if (cu) {
+					handle.usage.input += cu.input ?? 0;
+					handle.usage.output += cu.output ?? 0;
+					handle.usage.cacheRead += cu.cacheRead ?? 0;
+					handle.usage.cacheWrite += cu.cacheWrite ?? 0;
+					handle.usage.costUsd += cu.cost?.total || costFromTable(spec.model, cu);
+					handle.usage.llmCalls++;
+					handle.usage.compactions++;
+				}
+				const d = checkBudget(this.rulebook, this.state());
+				if (!d.ok) this.stop(d.rule, d.reason);
+				return;
+			}
 			if (ev.type !== "message_end" || ev.message.role !== "assistant") return;
 			const m = ev.message;
 			const u = m.usage;
@@ -543,11 +595,12 @@ export class ForumRuntime implements ForumHost {
 		return `Workers: ${ws.map((w) => `${w.name} ${w.loop ? "working" : (this.forum.assignmentOf(w.name)?.status ?? "idle")}`).join(", ")}.`;
 	}
 
-	/** Stop the trial: every agent is aborted, every wait returns. Idempotent. */
-	stop(rule: string, reason: string): void {
+	/** Stop the trial. A stop for a rule (not the authority's normal end) leaves a refusal row in the forum. */
+	stop(rule: string, reason: string, agent = "runtime", tool = "*"): void {
 		if (this.stopped) return;
 		this.stopped = rule;
 		this.stopReason = reason;
+		if (rule !== "authority_done") this.forum.refusal(agent, tool, rule, reason);
 		this.log(`stopping: ${rule}: ${reason}`);
 		this.abort.abort();
 		for (const a of this.agents.values()) {
@@ -556,17 +609,22 @@ export class ForumRuntime implements ForumHost {
 				a.waiting = null;
 				r([]);
 			}
+			// Abort only ends the active run; pi starts another for anything still queued, so empty the queue first.
+			a.session.clearQueue();
+			a.steered = [];
 			if (a.running) a.session.abort().catch(() => undefined);
 		}
 		this.authorityWake?.();
 	}
 
 	private async stopAll(reason: string): Promise<void> {
+		// Mark the trial stopped before aborting, so no loop takes an abort as a cue for another prompt.
+		if (!this.stopped) this.stop("authority_done", reason);
 		for (const a of this.agents.values()) {
 			if (a.running) await a.session.abort().catch(() => undefined);
 		}
+		await this.assignLock;
 		const loops = [...this.agents.values()].map((a) => a.loop).filter((l): l is Promise<void> => l !== null);
-		if (!this.stopped && loops.length) this.stop("authority_done", reason);
 		await Promise.allSettled(loops);
 		for (const a of this.agents.values()) {
 			if (a.role === "worker" && !a.finished) {

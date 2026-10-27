@@ -5,7 +5,7 @@
 // the benchmark grades `git diff base..HEAD` and an uncommitted change is invisible to it.
 
 import { execFileSync } from "node:child_process";
-import { appendFileSync, existsSync, mkdirSync, readFileSync, symlinkSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, rmSync, symlinkSync } from "node:fs";
 import { dirname, isAbsolute, join } from "node:path";
 
 export interface GitResult {
@@ -46,6 +46,16 @@ export function headSha(repo: string): string | null {
 export function isDirty(dir: string): boolean {
 	const r = git(dir, ["status", "--porcelain"]);
 	return r.ok && r.output.length > 0;
+}
+
+/** Remove .git/index.lock if one is left behind (a git command killed mid-run). Call only when no agent can be running git. */
+export function removeStaleIndexLock(repo: string): boolean {
+	const gitDir = git(repo, ["rev-parse", "--absolute-git-dir"]);
+	if (!gitDir.ok) return false;
+	const lock = join(gitDir.output, "index.lock");
+	if (!existsSync(lock)) return false;
+	rmSync(lock, { force: true });
+	return true;
 }
 
 /** Stage and commit everything not ignored. Returns true if a commit was made. */

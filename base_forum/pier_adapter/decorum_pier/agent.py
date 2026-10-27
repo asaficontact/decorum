@@ -50,7 +50,7 @@ PROVIDERS: dict[str, tuple[list[str], list[str]]] = {
     "kimi-coding": (["api.kimi.com"], ["KIMI_API_KEY"]),
     "openrouter": (["openrouter.ai"], ["OPENROUTER_API_KEY"]),
     "fireworks": (["api.fireworks.ai"], ["FIREWORKS_API_KEY"]),
-    "together": (["api.together.xyz"], ["TOGETHER_API_KEY"]),
+    "together": (["api.together.ai"], ["TOGETHER_API_KEY"]),
     "anthropic": (["api.anthropic.com"], ["ANTHROPIC_API_KEY"]),
     "openai": (["api.openai.com"], ["OPENAI_API_KEY"]),
     "faux": ([], []),

@@ -5,6 +5,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { test } from "node:test";
 import type { ForumEvent } from "../src/forum.ts";
+import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
 import { call, gitOut, runTrial, say } from "./helpers.ts";
 
 const events = (outDir: string): ForumEvent[] =>
@@ -254,4 +255,78 @@ test("closing: evidence refuses a finish without evidence", async () => {
 	);
 	assert.deepEqual(summary.refusals.map((r) => r.rule), ["closing"]);
 	assert.equal(summary.agents.find((a) => a.name === "w1")?.assignment?.evidence, "ran: pytest -q -> 14 passed in 1.2s");
+});
+
+// ---- regressions from the fresh review (2026-10-27) ----
+
+test("a stop while a worker has a queued message ends the trial; nothing keeps running", async () => {
+	const t0 = Date.now();
+	const { summary } = await runTrial(
+		{
+			authority: ({ step }) => {
+				if (step === 0) return call("open_thread", { title: "t", goal: "g" });
+				if (step === 1) return call("assign_workers", { thread: "T1", workers: [{ name: "w1", persona: "p", instructions: "keep working" }] });
+				return call("post", { thread: "T1", text: `keep going ${step}` });
+			},
+			w1: () => call("bash", { command: "sleep 0.3" }),
+		},
+		{ rulebook: { budget: { wall_clock_sec: 2 } } },
+	);
+	assert.equal(summary.end_reason, "budget.wall_clock_sec");
+	assert.ok(Date.now() - t0 < 15_000, `run() returned promptly (${Date.now() - t0} ms)`);
+	const w1 = summary.agents.find((a) => a.name === "w1")!;
+	assert.equal(w1.assignment?.status, "stopped");
+});
+
+test("two assign_workers calls in one message respect the live cap and never reuse a name", async () => {
+	const { summary } = await runTrial(
+		{
+			authority: ({ step, seen }) => {
+				if (step === 0) return call("open_thread", { title: "t", goal: "g" });
+				if (step === 1)
+					return fauxAssistantMessage(
+						[
+							fauxToolCall("assign_workers", { thread: "T1", workers: [{ persona: "p", instructions: "i" }, { persona: "p", instructions: "i" }] }),
+							fauxToolCall("assign_workers", { thread: "T1", workers: [{ persona: "p", instructions: "i" }, { persona: "p", instructions: "i" }, { persona: "p", instructions: "i" }] }),
+						],
+						{ stopReason: "toolUse" },
+					);
+				if (!seen.includes("w2 finished")) return call("wait", { timeout_sec: 30 });
+				return say("done");
+			},
+			"*": ({ step }) => (step === 0 ? call("finish", { summary: "ok" }) : say("ok")),
+		},
+		{ rulebook: { budget: { max_live_workers: 4 } } },
+	);
+	const workers = summary.agents.filter((a) => a.role === "worker");
+	assert.deepEqual(workers.map((w) => w.name), ["w1", "w2"]);
+	assert.equal(summary.forum.assignments, 2);
+	assert.deepEqual(summary.refusals.map((r) => r.rule), ["budget.max_live_workers"]);
+});
+
+test("a finished worker can be sent back even when max_workers_total is reached", async () => {
+	const { summary, repo } = await runTrial(
+		{
+			authority: ({ step, seen }) => {
+				if (step === 0) return call("open_thread", { title: "t", goal: "g" });
+				if (step === 1) return call("assign_workers", { thread: "T1", workers: [{ name: "w1", persona: "p", instructions: "write a" }] });
+				if (!seen.includes("w1 finished its assignment: a")) return call("wait", { timeout_sec: 30 });
+				if (!seen.includes("Posted")) return call("post", { thread: "T1", text: "now write b" });
+				if (!seen.includes("w1 finished its assignment: b")) return call("wait", { timeout_sec: 30 });
+				return say("done");
+			},
+			w1: ({ step }) => {
+				if (step === 0) return call("write", { path: "a.txt", content: "a\n" });
+				if (step === 1) return call("finish", { summary: "a" });
+				if (step === 2) return say("ok");
+				if (step === 3) return call("write", { path: "b.txt", content: "b\n" });
+				if (step === 4) return call("finish", { summary: "b" });
+				return say("ok");
+			},
+		},
+		{ rulebook: { budget: { max_workers_total: 1 } } },
+	);
+	assert.equal(summary.end_reason, "authority_done");
+	assert.ok(existsSync(join(repo, "b.txt")));
+	assert.equal(summary.refusals.length, 0);
 });
