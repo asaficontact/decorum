@@ -1,0 +1,11 @@
+task	language	repository	k3_max_pass_rate	k3_runs	k3_median_minutes	k3_mean_usd	k27_code_pass_rate	k27_runs
+onedump-dump-encryption-pipeline	go	liweiyi88/onedump	0.25	4	38	1.81	0.25	4
+igel-persist-feature-schema	python	nidhaloff/igel	0.75	4	39	2.07	0.00	4
+obsidian-linter-auto-table-of-contents	typescript	platers/obsidian-linter	0.75	4	42	2.14	0.00	4
+bandit-incremental-cache-control	python	PyCQA/bandit	0.75	4	43	2.54	0.00	4
+go-critic-doc-link-checker	go	go-critic/go-critic	0.50	4	51	2.64	0.25	4
+clack-async-autocomplete-options	typescript	bombshell-dev/clack	0.25	4	57	3.40	0.00	4
+csstree-shorthand-expansion-compression	javascript	csstree/csstree	0.50	4	71	2.27	0.00	4
+mobly-grouped-test-barriers	python	google/mobly	0.50	4	74	3.54	0.00	4
+cliffy-config-file-parsing	typescript	c4spar/cliffy	0.75	4	49	3.10	0.00	4
+participle-grammar-conflict-analysis	go	alecthomas/participle	0.50	4	89	1.85	0.25	4
