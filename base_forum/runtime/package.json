@@ -1,0 +1,23 @@
+{
+  "name": "decorum-base-forum-runtime",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Decorum base forum: an authority agent opens threads and assigns workers; a typed rulebook is enforced at the tool-call hook. Runs on pi.",
+  "type": "module",
+  "engines": { "node": ">=24.5" },
+  "bin": { "decorum-forum": "src/main.ts" },
+  "scripts": {
+    "test": "node --test test/*.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@earendil-works/pi-coding-agent": "0.85.1",
+    "@earendil-works/pi-ai": "0.85.1",
+    "typebox": "1.3.7",
+    "yaml": "2.9.0"
+  },
+  "devDependencies": {
+    "@types/node": "24.10.1",
+    "typescript": "5.9.3"
+  }
+}
