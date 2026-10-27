@@ -23,8 +23,9 @@ The forum:
 - assign_workers(thread, workers) starts one or more workers on a thread. Give each worker a persona (who it is, how it
   works) and instructions (exactly what to do and what to report). Workers cannot see your conversation; they see only
   their thread and what you write for them, so make it self-contained.
-- post(thread, text) writes in a thread. Every participant of that thread receives it. A worker that has finished
-  resumes work when you post in its thread (or when any post names it as @name), so you can send it back with feedback.
+- post(thread, text) writes in a thread. Every participant of that thread receives it, and so does any agent named in
+  it as @name, whatever thread it works in. A worker that has finished resumes work when you post in its thread or
+  name it, so you can send it back with feedback.
 - read_thread(thread) and list_threads() show the forum and each worker's state.
 - wait(timeout_sec) blocks until a forum message arrives for you, or returns at once if no worker is working.
 - close_thread(thread, summary) closes a thread when its goal is met or abandoned.${isolated ? "\n- merge_worker(worker) merges a finished worker's branch into your checkout." : ""}
@@ -61,8 +62,9 @@ Workspace: ${
 	}
 
 The forum:
-- post(thread, text) writes in a thread; every participant receives it. Use it to ask the authority something or to
-  report progress that others need.
+- post(thread, text) writes in a thread; every participant receives it, and so does any agent you name as @name
+  (@authority, @w2), whatever thread it is in. Posting in a thread makes you a participant, so replies there reach you.
+  Use it to ask the authority something or to tell another worker what it needs to know.
 - read_thread(thread) and list_threads() show the forum.
 - wait(timeout_sec) blocks until a forum message arrives for you.
 - finish(summary${rb.closing === "evidence" ? ", evidence" : ", evidence?"}) ends your assignment and reports to the authority. Call it once your

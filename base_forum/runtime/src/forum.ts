@@ -22,7 +22,16 @@ export interface Post {
 	thread: string;
 	author: string;
 	text: string;
+	/** Agents named as @name in the text; each is delivered the post wherever it is written. */
+	mentions: string[];
 	at: string;
+}
+
+const MENTION = /(?<![\w@])@([a-z][a-z0-9-]{0,23})\b/g;
+
+/** The @names in a post, in order, without repeats. */
+export function mentionsIn(text: string): string[] {
+	return [...new Set([...text.matchAll(MENTION)].map((m) => m[1]!))];
 }
 
 export type AssignmentStatus = "working" | "finished" | "stopped";
@@ -135,7 +144,9 @@ export class Forum {
 		const t = this.thread(threadId);
 		if (t.status === "closed") throw new ForumError(`Thread ${threadId} is closed.`);
 		if (!text.trim()) throw new ForumError("A post needs text.");
-		const p: Post = { id: `P${++this.nPosts}`, thread: threadId, author, text: text.trim(), at: this.now().toISOString() };
+		// Posting in a thread makes the author a participant of it, so replies there reach it.
+		if (!t.participants.includes(author)) t.participants.push(author);
+		const p: Post = { id: `P${++this.nPosts}`, thread: threadId, author, text: text.trim(), mentions: mentionsIn(text), at: this.now().toISOString() };
 		this.postsByThread.get(threadId)!.push(p);
 		this.emit({ kind: "post", post: p });
 		return p;

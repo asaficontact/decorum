@@ -282,7 +282,11 @@ export class ForumRuntime implements ForumHost {
 
 	private route(ev: ForumEvent): void {
 		let recipients: string[] = [];
-		if (ev.kind === "post") recipients = this.forum.thread(ev.post.thread).participants.filter((p) => p !== ev.post.author);
+		if (ev.kind === "post") {
+			// the thread's participants, plus anyone named as @name, wherever they work
+			const named = ev.post.mentions.filter((m) => this.agents.has(m));
+			recipients = [...new Set([...this.forum.thread(ev.post.thread).participants, ...named])].filter((p) => p !== ev.post.author);
+		}
 		else if (ev.kind === "finished") {
 			const owner = this.forum.thread(ev.assignment.thread).owner;
 			if (owner !== ev.assignment.worker) recipients = [owner];
@@ -321,7 +325,7 @@ export class ForumRuntime implements ForumHost {
 	/** A finished worker is woken only by the thread's owner or by a post that names it (@name); peers' chatter waits in its inbox. */
 	private wakesFinished(w: AgentHandle, ev: ForumEvent): boolean {
 		if (ev.kind !== "post") return false;
-		return ev.post.author === this.forum.thread(ev.post.thread).owner || ev.post.text.includes(`@${w.name}`);
+		return ev.post.author === this.forum.thread(ev.post.thread).owner || ev.post.mentions.includes(w.name);
 	}
 
 	/** A finished worker that receives a post in its thread goes back to work, if a slot is free. */
@@ -417,6 +421,8 @@ export class ForumRuntime implements ForumHost {
 
 	wait(agent: string, timeoutSec: number, signal: AbortSignal | undefined): Promise<string> {
 		const a = this.agents.get(agent)!;
+		// A message steered while this agent was busy would otherwise sit in pi's queue until wait returns.
+		this.reclaimSteers(a);
 		if (a.inbox.length) return Promise.resolve(digest(this.drain(a)));
 		if (a.role === "authority" && this.liveWorkers() === 0) return Promise.resolve("No worker is working, so no message will arrive. Continue, or finish.");
 		if (this.stopped) return Promise.resolve(`The trial is stopping: ${this.stopReason}`);
@@ -438,6 +444,7 @@ export class ForumRuntime implements ForumHost {
 
 	finishWorker(agent: string, summary: string, evidence: string | undefined): string {
 		const w = this.agents.get(agent)!;
+		if (w.finished) return "You have already finished; the authority has your report. End your turn now.";
 		let note = "";
 		if (this.rulebook.workspace === "isolated") {
 			const c = commitAll(w.cwd, `${agent}: ${summary.split("\n")[0]!.slice(0, 72)}`);

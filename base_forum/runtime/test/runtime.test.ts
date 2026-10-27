@@ -5,6 +5,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { test } from "node:test";
 import type { ForumEvent } from "../src/forum.ts";
+import { mentionsIn } from "../src/forum.ts";
 import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
 import { call, gitOut, runTrial, say } from "./helpers.ts";
 
@@ -329,4 +330,76 @@ test("a finished worker can be sent back even when max_workers_total is reached"
 	assert.equal(summary.end_reason, "authority_done");
 	assert.ok(existsSync(join(repo, "b.txt")));
 	assert.equal(summary.refusals.length, 0);
+});
+
+// ---- routing: mentions and joining a thread by posting (Tawab, 2026-10-27) ----
+
+test("an @name reaches that agent from any thread, and wakes it if it had finished", async () => {
+	const { summary, outDir } = await runTrial({
+		authority: ({ step, seen }) => {
+			if (step === 0) return call("open_thread", { title: "a", goal: "g" });
+			if (step === 1) return call("open_thread", { title: "b", goal: "g" });
+			if (step === 2) return call("assign_workers", { thread: "T1", workers: [{ name: "w1", persona: "p", instructions: "tell w2" }] });
+			if (step === 3) return call("assign_workers", { thread: "T2", workers: [{ name: "w2", persona: "p", instructions: "finish" }] });
+			if (!(seen.includes("w1 finished") && seen.includes("w2 finished its assignment: second"))) return call("wait", { timeout_sec: 30 });
+			return say("done");
+		},
+		w1: ({ step, seen }) => {
+			if (step === 0) return call("wait", { timeout_sec: 1 });
+			if (step === 1) return call("post", { thread: "T1", text: "@w2 please also check the parser" });
+			if (step === 2) return call("finish", { summary: "told w2" });
+			assert.ok(!seen.includes("[T2]"), "w1 is not a participant of T2");
+			return say("ok");
+		},
+		w2: ({ step, seen }) => {
+			if (step === 0) return call("finish", { summary: "first" });
+			if (step === 1) return say("ok");
+			assert.match(seen, /\[T1\] w1: @w2 please also check the parser/);
+			if (step === 2) return call("finish", { summary: "second" });
+			return say("ok");
+		},
+	});
+	assert.equal(summary.end_reason, "authority_done");
+	const posts = events(outDir).flatMap((e) => (e.kind === "post" ? [e.post] : []));
+	assert.deepEqual(posts.find((p) => p.author === "w1")?.mentions, ["w2"]);
+});
+
+test("a worker that posts in another thread becomes a participant and receives the replies", async () => {
+	const { summary } = await runTrial({
+		authority: ({ step, seen }) => {
+			if (step === 0) return call("open_thread", { title: "a", goal: "g" });
+			if (step === 1) return call("open_thread", { title: "b", goal: "g" });
+			if (step === 2) return call("assign_workers", { thread: "T1", workers: [{ name: "w1", persona: "p", instructions: "ask in T2" }] });
+			if (!seen.includes("[T2] w1: is the API frozen?")) return call("wait", { timeout_sec: 30 });
+			if (!seen.includes("Posted")) return call("post", { thread: "T2", text: "yes, frozen" });
+			if (!seen.includes("w1 finished")) return call("wait", { timeout_sec: 30 });
+			return say("done");
+		},
+		w1: ({ step, seen }) => {
+			if (step === 0) return call("post", { thread: "T2", text: "is the API frozen?" });
+			if (!seen.includes("[T2] authority: yes, frozen")) return call("wait", { timeout_sec: 30 });
+			if (!seen.includes("Finished;")) return call("finish", { summary: "got the answer" });
+			return say("ok");
+		},
+	});
+	assert.equal(summary.end_reason, "authority_done");
+	assert.equal(summary.agents.find((a) => a.name === "w1")?.assignment?.status, "finished");
+	assert.ok(summary.duration_sec < 10, `no message waited out a 30 s wait (${summary.duration_sec} s)`);
+});
+
+test("a second finish() is a no-op, not a second report", async () => {
+	const { outDir } = await runTrial({
+		authority: ({ step, seen }) => {
+			if (step === 0) return call("open_thread", { title: "a", goal: "g" });
+			if (step === 1) return call("assign_workers", { thread: "T1", workers: [{ name: "w1", persona: "p", instructions: "i" }] });
+			if (!seen.includes("w1 finished")) return call("wait", { timeout_sec: 30 });
+			return say("done");
+		},
+		w1: ({ step }) => (step < 2 ? call("finish", { summary: `report ${step}` }) : say("ok")),
+	});
+	assert.equal(events(outDir).filter((e) => e.kind === "finished").length, 1);
+});
+
+test("mentionsIn finds each @name once and ignores e-mail addresses", () => {
+	assert.deepEqual(mentionsIn("@w1 and @api-2, again @w1; mail me@host.com or @@x"), ["w1", "api-2"]);
 });
