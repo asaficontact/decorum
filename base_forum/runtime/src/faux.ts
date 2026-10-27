@@ -43,8 +43,10 @@ function smoke(ctx: Context) {
 		return fauxAssistantMessage("Done: wrote and committed the smoke file.");
 	}
 	if (who === "authority") {
-		if (step === 0) return fauxAssistantMessage(fauxToolCall("open_thread", { title: "Smoke files", goal: "Each worker writes its own smoke file." }), { stopReason: "toolUse" });
-		if (step === 1)
+		// pi's grep and find need rg and fd in the sandbox; the smoke trial exercises both before it starts the forum
+		if (step === 0) return fauxAssistantMessage([fauxToolCall("grep", { pattern: "a", limit: 1 }), fauxToolCall("find", { pattern: "*", limit: 1 })], { stopReason: "toolUse" });
+		if (step === 1) return fauxAssistantMessage(fauxToolCall("open_thread", { title: "Smoke files", goal: "Each worker writes its own smoke file." }), { stopReason: "toolUse" });
+		if (step === 2)
 			return fauxAssistantMessage(
 				fauxToolCall("assign_workers", {
 					thread: "T1",

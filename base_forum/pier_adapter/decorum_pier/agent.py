@@ -141,9 +141,12 @@ class DecorumForum(BaseInstalledAgent):
         packages = (
             "if command -v apt-get >/dev/null; then "
             "apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends "
-            "ca-certificates curl xz-utils git >/dev/null; "
-            "elif command -v dnf >/dev/null; then dnf install -y -q ca-certificates curl xz git; "
-            "elif command -v yum >/dev/null; then yum install -y -q ca-certificates curl xz git; fi"
+            "ca-certificates curl xz-utils git ripgrep fd-find >/dev/null; "
+            "elif command -v dnf >/dev/null; then dnf install -y -q ca-certificates curl xz git ripgrep fd-find; "
+            "elif command -v yum >/dev/null; then yum install -y -q ca-certificates curl xz git; fi; "
+            # pi's grep and find tools need rg and fd on PATH; without them they try a download the sandbox blocks
+            'command -v fd >/dev/null || { f=$(command -v fdfind) && ln -sf "$f" /usr/local/bin/fd; } || true; '
+            "command -v rg >/dev/null || echo 'decorum: ripgrep not installed; pi grep will fall back to failing' >&2"
         )
         node = (
             "arch=$(uname -m); case $arch in x86_64) a=x64;; aarch64|arm64) a=arm64;; "
