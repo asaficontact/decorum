@@ -97,6 +97,7 @@ echo "job $JOB_NAME: ${#ids[@]} tasks, mode $MODE, rulebook $RULEBOOK, authority
 printf '%q ' "${cmd[@]}"; echo
 [ -n "${DRY_RUN:-}" ] && exit 0
 mkdir -p "$JOBS_DIR"
+echo "watch it live in another terminal: python3 $BASE/scripts/watch.py $JOBS_DIR/$JOB_NAME"
 "${cmd[@]}"
 echo
 python3 "$BASE/scripts/summarize.py" "$JOBS_DIR/$JOB_NAME" --reference "$TASKS"

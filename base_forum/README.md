@@ -13,6 +13,7 @@ base_forum/
   scripts/run_baseline.sh   run N DeepSWE tasks with Pier + Docker
   scripts/summarize.py      one table per job, against the leaderboard's Kimi K3 reference
   scripts/regrade.sh        grade a trial's patch by hand when Pier's verifier step fails
+  scripts/watch.py          follow a running job live: threads, assignments, posts, tool calls, cost
   tasks/baseline-10.tsv     the 10 baseline tasks, with Kimi K3 / K2.7-code reference pass rates
 ```
 
@@ -85,6 +86,11 @@ Defaults: authority `moonshotai/kimi-k3` at `max` thinking (as on the DeepSWE le
 default is an environment variable; see the top of `scripts/run_baseline.sh`. On an Apple-silicon Mac the task images
 (linux/amd64) run under emulation: expect the first build of each task image to take several minutes and test suites
 to run slower than on the leaderboard.
+
+Watching live: the runtime writes the forum and every agent's session as it goes, and Docker mounts them on the host.
+In a second terminal, `python3 base_forum/scripts/watch.py base_forum/jobs/<job>` prints threads opening, workers
+joining with their personas and instructions, every post and finish, refusals, each agent's tool calls, and the running
+cost (`--quiet` for the forum only). The job directory name is printed by `run_baseline.sh` when it starts.
 
 Results: `base_forum/jobs/<job>/`; `python3 base_forum/scripts/summarize.py base_forum/jobs/<job> --reference
 base_forum/tasks/baseline-10.tsv` prints one line per trial (reward, cost, time, workers, posts, end reason) beside the
