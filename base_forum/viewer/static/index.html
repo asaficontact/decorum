@@ -3,16 +3,23 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Decorum forum</title>
-<link rel="icon" href="data:,">
+<title>Forum Decorum</title>
+<link rel="icon" href="mark.svg" type="image/svg+xml">
+<link rel="preload" href="fonts/source-serif-4.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="fonts/decorum-ui-sans.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
+<svg xmlns="http://www.w3.org/2000/svg" style="display:none" aria-hidden="true"><symbol id="mark" viewBox="0 0 48 48"><path d="M14 5h20a10 10 0 0 1 10 10v14a10 10 0 0 1-10 10H19l-9 7.5V38.6A10 10 0 0 1 4 29V15A10 10 0 0 1 14 5z" fill="currentColor"/><path transform="translate(15.65 31.79) scale(0.03401 -0.03401)" d="M226 -109Q181 -109 144.5 -92.5Q108 -76 87.5 -50.0Q67 -24 68 5Q77 25 88.5 32.0Q100 39 116 39Q138 39 153.5 23.5Q169 8 180 -21L205 -82L182 -63Q193 -66 201.0 -66.5Q209 -67 218 -67Q274 -67 300.0 -46.5Q326 -26 326 16Q326 40 316.0 58.5Q306 77 279.0 96.0Q252 115 201 137Q156 158 120.5 179.5Q85 201 65.0 231.0Q45 261 45 305Q45 339 59.0 367.0Q73 395 101.0 414.5Q129 434 171 444V457L188 415Q148 405 132.0 382.5Q116 360 116 328Q116 306 125.5 290.0Q135 274 161.5 257.0Q188 240 239 215Q254 209 267.5 201.5Q281 194 295.0 186.5Q309 179 323 171V164Q358 142 378.5 110.0Q399 78 399 33Q399 -9 381.0 -41.0Q363 -73 325.0 -91.0Q287 -109 226 -109ZM263 685Q309 685 345.5 668.5Q382 652 403.0 625.5Q424 599 422 570Q412 551 402.0 544.0Q392 537 376 537Q354 537 338.0 553.0Q322 569 311 598L286 659L316 637Q303 641 292.5 642.5Q282 644 271 644Q211 644 187.5 622.5Q164 601 164 569Q164 545 174.5 527.5Q185 510 212.0 492.5Q239 475 290 451Q341 427 375.5 404.5Q410 382 428.0 353.5Q446 325 446 283Q446 247 430.0 219.5Q414 192 385.5 173.5Q357 155 317 145V134L302 176Q337 186 356.0 209.5Q375 233 375 264Q375 286 363.0 303.0Q351 320 323.5 337.0Q296 354 250 374Q232 382 216.0 390.5Q200 399 186.5 407.5Q173 416 160 424V430Q122 456 106.5 485.0Q91 514 91 553Q91 588 107.5 618.0Q124 648 162.0 666.5Q200 685 263 685Z" fill="var(--mark-paper, #fff)"/></symbol></svg>
 <div class="app">
   <aside class="rail" aria-label="Runs">
     <header class="rail-head">
-      <h1>Decorum forum</h1>
-      <p class="sub">Every run in the job folders, live. Name a run with Rename.</p>
+      <h1><a class="brand" href="./" aria-label="Forum Decorum, all runs"><svg class="mark" aria-hidden="true"><use href="#mark"/></svg><span class="wordmark">Forum Decorum</span></a></h1>
+      <p class="sub">Teams of coding agents at work under a rulebook, live from this computer's benchmark runs.</p>
+      <div class="page-nav" role="tablist" aria-label="Pages">
+        <button type="button" role="tab" id="nav-runs" aria-selected="true">Runs</button>
+        <button type="button" role="tab" id="nav-insights" aria-selected="false">Insights across runs</button>
+      </div>
     </header>
     <nav id="trials" class="trials"></nav>
     <footer class="rail-foot"><span id="updated">Connecting…</span></footer>
@@ -25,6 +32,60 @@
       <p>In each task, the <b>authority</b> plans the work and runs it through <b>threads</b>: it assigns <b>workers</b> to them, each with a persona and instructions, and they report back with posts and a finish report. Click an agent to see everything it did.</p>
     </div>
 
+    <section id="insights" hidden aria-labelledby="in-title">
+      <header class="run-top">
+        <p class="eyebrow">Insights across runs</p>
+        <h2 id="in-title">How the teams worked</h2>
+        <p class="ta-lede" id="in-lede"></p>
+        <div class="in-filters">
+          <div class="seg-ctl" role="group" aria-label="Benchmark" id="in-bench"></div>
+          <label class="in-check"><input type="checkbox" id="in-extra"> Include scripted runs and replays</label>
+        </div>
+        <div class="in-runs" id="in-runs" role="group" aria-label="Runs to include"></div>
+        <p class="in-banner" id="in-banner"></p>
+      </header>
+
+      <section class="in-sec" aria-labelledby="in-h-search">
+        <h3 id="in-h-search">Search what was said</h3>
+        <form class="in-search" id="in-search-form" role="search">
+          <input type="search" id="in-q" placeholder="A word or phrase, e.g. async, schema, flaky test" aria-label="Search posts and finish reports">
+          <button type="submit">Search</button>
+        </form>
+        <p class="ta-sub" id="in-search-sum">Searches every post and finish report in the selected runs.</p>
+        <ol class="in-hits" id="in-hits"></ol>
+      </section>
+
+      <section class="in-sec" aria-labelledby="in-h-runs">
+        <h3 id="in-h-runs">Runs side by side</h3>
+        <div class="table-wrap"><table class="run-table"><thead><tr>
+          <th scope="col">Run</th><th scope="col" class="num">Passed</th><th scope="col" class="num">Workers per task</th><th scope="col" class="num">Threads per task</th><th scope="col" class="num">Posts per task</th><th scope="col" class="num">Sent back</th><th scope="col" class="num">Refused</th><th scope="col" class="num">Cost per task</th><th scope="col" class="num">Time per task</th>
+        </tr></thead><tbody id="in-runrows"></tbody></table></div>
+      </section>
+
+      <div class="ta-charts">
+        <figure class="ta-fig">
+          <figcaption><b>Cost and result, task by task</b><span>One row per run, one dot per task; further right cost more.</span></figcaption>
+          <div id="in-cost"></div>
+        </figure>
+        <figure class="ta-fig">
+          <figcaption><b>What the threads were about</b><span>Threads by topic, with how often work in them was sent back.</span></figcaption>
+          <div id="in-kinds" class="ta-roles"></div>
+        </figure>
+      </div>
+
+      <section class="in-sec" aria-labelledby="in-h-phase">
+        <h3 id="in-h-phase">How each task unfolded</h3>
+        <p class="ta-sub">Each bar is one thread, from when it opened to its last post, coloured by topic. A tick marks a send-back.</p>
+        <div id="in-phases" class="in-phases"></div>
+      </section>
+
+      <section class="in-sec" aria-labelledby="in-h-matrix">
+        <h3 id="in-h-matrix">The same task across runs</h3>
+        <div class="table-wrap"><table class="run-table in-matrix" id="in-matrix"></table></div>
+      </section>
+      <p class="ta-note" id="in-note"></p>
+    </section>
+
     <section id="run" hidden aria-labelledby="r-title">
       <header class="run-top">
         <p class="eyebrow" id="r-eyebrow"></p>
@@ -34,16 +95,49 @@
         </div>
         <p class="facts" id="r-facts"></p>
       </header>
+      <div class="view-tabs run-tabs" role="tablist" aria-label="Run view">
+        <button role="tab" id="rt-tasks" aria-selected="true" aria-controls="r-tasks-view">Tasks</button>
+        <button role="tab" id="rt-teams" aria-selected="false" aria-controls="r-teams-view">Team analysis</button>
+      </div>
+      <div id="r-tasks-view" role="tabpanel" aria-labelledby="rt-tasks">
       <section class="run-score" aria-label="Results">
         <p class="score" id="r-score"></p>
         <div id="r-bar"></div>
         <p class="legend" id="r-legend"></p>
       </section>
+      <section class="retry" id="r-retry" hidden aria-label="Retry failed tasks"></section>
       <div class="table-wrap">
         <table class="run-table">
           <thead><tr><th scope="col">Task</th><th scope="col">Result</th><th scope="col" class="num">New tests</th><th scope="col" class="num">Workers</th><th scope="col" class="num">Posts</th><th scope="col" class="num">Time</th><th scope="col" class="num">Cost</th></tr></thead>
           <tbody id="r-rows"></tbody>
         </table>
+      </div>
+      </div>
+      <div id="r-teams-view" role="tabpanel" aria-labelledby="rt-teams" hidden>
+        <p class="ta-lede" id="ta-lede"></p>
+        <section class="ta-setup" aria-labelledby="ta-setup-h">
+          <h3 id="ta-setup-h">Setup</h3>
+          <dl id="ta-setup"></dl>
+        </section>
+        <div class="ta-charts">
+          <figure class="ta-fig">
+            <figcaption><b>Result by team size</b><span>One dot per task. Hover a dot for the task.</span></figcaption>
+            <div id="ta-size" class="ta-size"></div>
+          </figure>
+          <figure class="ta-fig">
+            <figcaption><b>Result when a role was on the team</b><span>Passed out of graded tasks, with and without the role.</span></figcaption>
+            <div id="ta-roles" class="ta-roles"></div>
+          </figure>
+        </div>
+        <div class="ta-legend" id="ta-legend"></div>
+        <h3 class="ta-h">Who worked on what</h3>
+        <div class="table-wrap">
+          <table class="run-table ta-table">
+            <thead><tr><th scope="col">Task</th><th scope="col">Result</th><th scope="col">Team</th><th scope="col" class="num">Threads</th><th scope="col">Posts, authority and workers</th><th scope="col" class="num">Sent back</th><th scope="col" class="num">Refused</th><th scope="col" class="num">Cost</th><th scope="col" class="num">Time</th></tr></thead>
+            <tbody id="ta-rows"></tbody>
+          </table>
+        </div>
+        <p class="ta-note" id="ta-note"></p>
       </div>
     </section>
 
@@ -61,9 +155,10 @@
         </div>
         <p class="facts" id="t-facts"></p>
         <p class="note" id="t-note" hidden></p>
+        <p class="attempt" id="t-attempt" hidden></p>
         <p class="problem" id="t-problem" hidden></p>
         <details class="task" id="t-task" hidden>
-          <summary>The task, as the authority received it</summary>
+          <summary>The task as given to the authority</summary>
           <div class="task-text" id="t-task-text"></div>
         </details>
       </header>
@@ -97,11 +192,17 @@
       <button type="button" id="d-close" aria-label="Close">Close</button>
     </header>
     <p class="d-persona" id="d-persona"></p>
-    <h4>What it did, newest first</h4>
+    <h4>Its actions, newest first</h4>
     <ol id="d-actions" class="actions"></ol>
   </aside>
 </div>
 <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+<dialog class="retry-dialog" id="retry-dialog" aria-labelledby="rd-title">
+  <h3 id="rd-title">Retry?</h3>
+  <p id="rd-text"></p>
+  <div class="rd-actions"><button type="button" id="rd-cancel">Cancel</button><button type="button" class="primary" id="rd-go">Retry</button></div>
+</dialog>
 <script src="app.js"></script>
+<script src="analysis.js"></script>
 </body>
 </html>
