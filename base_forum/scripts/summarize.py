@@ -50,7 +50,8 @@ def earlier_attempts(job: Path) -> tuple[dict[str, int], float]:
                 row = json.loads(line)
             except ValueError:
                 continue
-            counts[row.get("task", "?")] = counts.get(row.get("task", "?"), 0) + 1
+            if row.get("moved_to"):  # a not-started task had no attempt to set aside
+                counts[row.get("task", "?")] = counts.get(row.get("task", "?"), 0) + 1
     cost = 0.0
     for s_path in job.glob(".attempts/*/agent/decorum/summary.json"):
         try:

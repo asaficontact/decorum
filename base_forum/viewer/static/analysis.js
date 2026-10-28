@@ -208,27 +208,37 @@ $("nav-runs").addEventListener("click", () => { setPage("runs"); if (S.runs.leng
 function inRuns() {
   return S.runs.filter((r) => (IN.extra || (!r.faux && r.benchmark !== "Replay")) && (IN.bench === "all" || r.benchmark === IN.bench));
 }
+// The filters are rebuilt only when the list of runs changes; otherwise their pressed state is set in place, so a
+// poll never takes the keyboard focus away from a button.
 function renderInsightsFilters() {
   const bench = $("in-bench");
-  bench.replaceChildren();
-  for (const [k, label] of [["all", "All benchmarks"], ["DeepSWE", "DeepSWE"], ["SWE-bench Pro", "SWE-bench Pro V2"]]) {
-    const b = el("button", "", label);
-    b.type = "button";
-    b.setAttribute("aria-pressed", String(IN.bench === k));
-    b.addEventListener("click", () => { IN.bench = k; renderInsightsFilters(); loadInsights(true); });
-    bench.append(b);
+  if (!bench.children.length) {
+    for (const [k, label] of [["all", "All benchmarks"], ["DeepSWE", "DeepSWE"], ["SWE-bench Pro", "SWE-bench Pro V2"]]) {
+      const b = el("button", "", label);
+      b.type = "button";
+      b.dataset.bench = k;
+      b.addEventListener("click", () => { IN.bench = k; renderInsightsFilters(); loadInsights(true); });
+      bench.append(b);
+    }
   }
+  for (const b of bench.children) b.setAttribute("aria-pressed", String(IN.bench === b.dataset.bench));
   $("in-extra").checked = IN.extra;
   const box = $("in-runs");
-  box.replaceChildren();
-  for (const r of inRuns()) {
-    const b = el("button", "in-run", runLabel(r));
-    b.type = "button";
-    b.setAttribute("aria-pressed", String(!IN.off.has(r.job)));
-    b.title = r.job;
-    b.addEventListener("click", () => { IN.off.has(r.job) ? IN.off.delete(r.job) : IN.off.add(r.job); renderInsightsFilters(); loadInsights(true); });
-    box.append(b);
+  const runs = inRuns();
+  const sig = JSON.stringify(runs.map((r) => [r.job, runLabel(r)]));
+  if (box.dataset.sig !== sig) {
+    box.dataset.sig = sig;
+    box.replaceChildren();
+    for (const r of runs) {
+      const b = el("button", "in-run", runLabel(r));
+      b.type = "button";
+      b.dataset.job = r.job;
+      b.title = r.job;
+      b.addEventListener("click", () => { IN.off.has(r.job) ? IN.off.delete(r.job) : IN.off.add(r.job); renderInsightsFilters(); loadInsights(true); });
+      box.append(b);
+    }
   }
+  for (const b of box.children) b.setAttribute("aria-pressed", String(!IN.off.has(b.dataset.job)));
 }
 $("in-extra").addEventListener("change", (e) => { IN.extra = e.target.checked; renderInsightsFilters(); loadInsights(true); });
 function selectedJobs() { return inRuns().filter((r) => !IN.off.has(r.job)).map((r) => r.job); }
@@ -406,9 +416,14 @@ $("in-search-form").addEventListener("submit", async (e) => {
   list.replaceChildren();
   document.querySelector(".in-more")?.remove();
   if (!q) return;
+  const jobs = selectedJobs();
+  if (!jobs.length) {
+    $("in-search-sum").textContent = "Tick at least one run above to search it.";
+    return;
+  }
   $("in-search-sum").textContent = "Searching…";
   try {
-    const d = await getJSON(`api/search?q=${encodeURIComponent(q)}&jobs=${encodeURIComponent(selectedJobs().join(","))}`);
+    const d = await getJSON(`api/search?q=${encodeURIComponent(q)}&jobs=${encodeURIComponent(jobs.join(","))}`);
     $("in-search-sum").textContent = d.total ? `${plural(d.total, "match")} for “${q}”${d.more ? `, newest ${d.hits.length} shown` : ""}.` : `Nothing in the selected runs says “${q}”.`;
     const words = q.toLowerCase().split(/\s+/).filter(Boolean);
     for (const h of d.hits) {
@@ -428,7 +443,7 @@ $("in-search-form").addEventListener("submit", async (e) => {
       const re = new RegExp(`(${words.map((w) => w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|")})`, "gi");
       snip.split(re).forEach((part, i) => text.append(i % 2 ? el("mark", "", part) : document.createTextNode(part)));
       li.append(top, text, el("div", "in-hit-foot")); 
-      li.lastChild.append(where, el("span", "ta-sub", ` in ${h.run}`));
+      li.lastChild.append(where, el("span", "ta-sub", ` in ${h.run}${h.earlier ? ", an earlier attempt" : ""}`));
       if (list.children.length >= 5) li.hidden = true;
       list.append(li);
     }

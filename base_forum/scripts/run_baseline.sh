@@ -149,6 +149,9 @@ printf '%q ' "${cmd[@]}"; echo
 [ -n "${DRY_RUN:-}" ] && exit 0
 mkdir -p "$JOBS_DIR"
 echo "watch it live: python3 $BASE/viewer/forum_view.py --open --jobs $JOBS_DIR   (or in a terminal: python3 $BASE/scripts/watch.py $JOBS_DIR/$JOB_NAME)"
-"${cmd[@]}" || echo "run_baseline: pier exited with $?; the summary below says which tasks have no result"
+rc=0
+"${cmd[@]}" || rc=$?
+[ "$rc" -eq 0 ] || echo "run_baseline: pier exited with $rc; the summary below says which tasks have no result"
 echo
-python3 "$BASE/scripts/summarize.py" "$JOBS_DIR/$JOB_NAME" --reference "$TASKS"
+python3 "$BASE/scripts/summarize.py" "$JOBS_DIR/$JOB_NAME" --reference "$TASKS" || true
+exit "$rc"

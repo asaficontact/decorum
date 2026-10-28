@@ -14,7 +14,7 @@ const S = {
   runs: [],
   trials: [],
   sel: null, // {job, trial}
-  retryOff: new Set(), // "job/task" the reader unticked in a run's retry list
+  retryTick: new Map(), // "job/task" -> ticked or not, where the reader changed a run's retry list
   runSel: null, // job of the run whose overview is open
   openRuns: new Set(JSON.parse(localStorage.getItem("decorum.openRuns") || "[]")),
   closedRuns: new Set(JSON.parse(localStorage.getItem("decorum.closedRuns") || "[]")),
@@ -371,7 +371,7 @@ function select(t) {
 
 // ---------- retrying failed tasks ----------
 
-const STATE_WORD = { failed: "failed", interrupted: "was interrupted", "not started": "never started" };
+const STATE_WORD = { failed: "failed", interrupted: "was interrupted", "not started": "never started", "graded, with an error": "graded after an error" };
 function shortReason(reason) {
   if (!reason) return "failed";
   const kind = reason.split(":")[0];
@@ -383,6 +383,7 @@ function renderRetry(r) {
   const show = rt && (rt.in_progress || (rt.tasks.length && r.status !== "running"));
   if (!show) {
     box.hidden = true;
+    box.dataset.sig = "";
     return;
   }
   const sig = JSON.stringify([r.job, rt.in_progress, rt.tasks.map((x) => x.task), rt.log]);
@@ -397,23 +398,29 @@ function renderRetry(r) {
     return;
   }
   box.classList.remove("live");
-  const n = rt.tasks.length;
-  box.append(el("h3", "", `${plural(n, "task")} without a result`));
-  box.append(el("p", "", "These tasks failed or never finished, so this run has no grade for them. Retry runs only them again, in this run, with the same models, rulebook and time limit. Each failed attempt is kept and can still be opened."));
+  const missing = rt.tasks.filter((x) => x.default).length;
+  const graded = rt.tasks.length - missing;
+  box.append(el("h3", "", missing ? `${plural(missing, "task")} without a result` : `${plural(graded, "task")} graded after an error`));
+  box.append(el("p", "", "Retry runs the ticked tasks again, in this run, with the same models, rulebook and time limit. Each failed attempt is kept and can still be opened. Tasks that were interrupted or never started always run with any retry: Pier runs every task that has no result."));
+  if (graded) box.append(el("p", "retry-caution", "A task graded after an error (most often the time limit: the verifier still graded what was left) has a result. It is not ticked: retrying only the tasks that failed, until they pass, raises the pass rate. Tick it if you want it anyway; the summary shows that it took more than one attempt."));
   const list = el("ul", "retry-list");
   for (const x of rt.tasks) {
+    const key = `${r.job}/${x.task}`;
     const li = el("li");
     const label = el("label");
     const box1 = el("input");
     box1.type = "checkbox";
-    box1.checked = !S.retryOff.has(`${r.job}/${x.task}`);
+    box1.checked = x.always || (S.retryTick.has(key) ? S.retryTick.get(key) : x.default);
+    box1.disabled = x.always;
+    box1.dataset.task = x.task;
     box1.addEventListener("change", () => {
-      box1.checked ? S.retryOff.delete(`${r.job}/${x.task}`) : S.retryOff.add(`${r.job}/${x.task}`);
+      S.retryTick.set(key, box1.checked);
       updateRetryButton(r);
     });
     const t = S.trials.find((y) => y.job === r.job && y.trial === x.trial);
     label.append(box1, el("span", "retry-task", t ? humanTask(t) : x.task));
-    li.append(label, el("span", "retry-why", `${STATE_WORD[x.state] || x.state}${x.state === "failed" && x.reason ? `: ${x.reason}` : ""}`));
+    const why = `${STATE_WORD[x.state] || x.state}${x.reason && !x.always ? `: ${clip(x.reason, 240)}` : ""}${x.always ? " (runs with any retry)" : ""}`;
+    li.append(label, el("span", "retry-why", why));
     list.append(li);
   }
   const go = el("button", "primary", "");
@@ -434,7 +441,11 @@ function renderRetry(r) {
   if (rt.log) box.append(logDetails(r.job, rt.log, "The last retry's output"));
   updateRetryButton(r);
 }
-function pickedTasks(r) { return r.retry.tasks.map((x) => x.task).filter((t) => !S.retryOff.has(`${r.job}/${t}`)); }
+function pickedTasks(r) {
+  return r.retry.tasks
+    .filter((x) => x.always || (S.retryTick.has(`${r.job}/${x.task}`) ? S.retryTick.get(`${r.job}/${x.task}`) : x.default))
+    .map((x) => x.task);
+}
 function updateRetryButton(r) {
   const go = $("retry-go");
   if (!go) return;
@@ -463,7 +474,8 @@ function askRetry(r) {
   $("rd-go").onclick = async () => {
     dlg.close();
     try {
-      const all = tasks.length === r.retry.tasks.length;
+      const defaults = r.retry.tasks.filter((x) => x.default).map((x) => x.task);
+      const all = tasks.length === defaults.length && tasks.every((t) => defaults.includes(t));
       const res = await fetch("api/runs/retry", { method: "POST", headers: { "Content-Type": "application/json", "X-Decorum-Viewer": "1" }, body: JSON.stringify({ job: r.job, ...(all ? {} : { tasks }) }) });
       const body = await res.json();
       if (!res.ok) throw new Error(body.error || res.status);
@@ -477,6 +489,7 @@ function askRetry(r) {
 }
 $("rd-cancel").addEventListener("click", () => $("retry-dialog").close());
 
+function clip(text, n = 200) { return text && text.length > n ? `${text.slice(0, n - 1)}…` : text; }
 function renderAttempt(t) {
   const box = $("t-attempt");
   const run = runOf(t.job);
@@ -486,7 +499,7 @@ function renderAttempt(t) {
   box.replaceChildren();
   if (mine) {
     const latest = run.trials.find((x) => x.task === t.task);
-    box.append(`An earlier attempt, set aside when this task was retried${mine.retried_at ? ` on ${shortDate(mine.retried_at)}` : ""}. Why: ${mine.reason || "it failed"}. `);
+    box.append(`An earlier attempt, set aside when this task was retried${mine.retried_at ? ` on ${shortDate(mine.retried_at)}` : ""}. Why: ${clip(mine.reason) || "it failed"}. `);
     if (latest) {
       const b = el("button", "linkish", "Open the latest attempt");
       b.type = "button";
@@ -494,7 +507,7 @@ function renderAttempt(t) {
       box.append(b);
     }
   } else if (before.length) {
-    box.append(`Attempt ${before.length + 1} of this task. The ${before.length > 1 ? "last earlier attempt" : "first attempt"} ended with ${before.at(-1).reason || "an error"}. `);
+    box.append(`Attempt ${before.length + 1} of this task. The ${before.length > 1 ? "last earlier attempt" : "first attempt"} ended with ${clip(before.at(-1).reason) || "an error"}. `);
     const b = el("button", "linkish", "Open it");
     b.type = "button";
     b.addEventListener("click", () => select(before.at(-1)));
@@ -825,7 +838,7 @@ async function pollTrials() {
     S.trials = d.runs.flatMap((r) => [...r.trials, ...(r.earlier || [])]);
     renderRail();
     if (S.runSel && !S.sel) { renderRunOverview(); loadTeams(false); }
-    if (S.page === "insights") { if (!$("in-runs").contains(document.activeElement)) renderInsightsFilters(); loadInsights(false); }
+    if (S.page === "insights") { renderInsightsFilters(); loadInsights(false); }
     $("updated").textContent = S.paused ? "Updates paused" : `Updated ${new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}`;
     if (firstLoad) {
       firstLoad = false;

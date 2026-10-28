@@ -330,7 +330,7 @@ def test_the_http_api_and_the_page(jobs: Path) -> None:
         )
         assert d["next"] == 1
         page = urllib.request.urlopen(f"{base}/").read().decode()
-        assert "Decorum forum" in page and "app.js" in page
+        assert "Forum Decorum" in page and "app.js" in page
         for bad in (
             "/api/trial?job=nope&trial=x",
             "/../forum_view.py",
@@ -897,6 +897,7 @@ def test_the_retry_endpoint_checks_everything_then_starts_the_script(
         started.append((job.name, tasks)) or Proc(),
         ".attempts/retry-x.log",
     )
+    store.launch_grace = 0
     server = ThreadingHTTPServer(("127.0.0.1", 0), fv.make_handler(store))
     threading.Thread(target=server.serve_forever, daemon=True).start()
     base = f"http://127.0.0.1:{server.server_address[1]}"
@@ -926,14 +927,14 @@ def test_the_retry_endpoint_checks_everything_then_starts_the_script(
         assert post({"job": "nope"})[0] == 404
         assert post({"job": "j", "tasks": ["a-one"]}) == (
             400,
-            {"error": "not retryable (graded, or not in this run): a-one"},
+            {"error": "already graded, not retried: a-one"},
         )
         assert post({"job": "j", "tasks": "b-two"})[0] == 400
         assert post(["j"])[0] == 400
         assert started == []
         assert post({"job": "j", "tasks": ["b-two"]}) == (
             200,
-            {"job": "j", "tasks": ["b-two"], "log": ".attempts/retry-x.log"},
+            {"job": "j", "tasks": ["b-two", "c-three"], "log": ".attempts/retry-x.log"},
         )
         assert started == [("j", ["b-two"])]
         (jobs / "j" / ".attempts").mkdir(exist_ok=True)
@@ -989,3 +990,101 @@ def test_the_real_launcher_runs_the_script_detached_and_logs_beside_the_attempts
         log.startswith(".attempts/retry-")
         and "has no config.json" in (job / log).read_text()
     )
+
+
+def test_the_retry_list_marks_what_runs_by_default_and_what_always_runs(
+    jobs: Path,
+) -> None:
+    retry_job(jobs)
+    t = make_trial(jobs, "j", "d-four")
+    (t / "result.json").write_text(
+        json.dumps(
+            {
+                "verifier_result": {"rewards": {"reward": 0.0}},
+                "exception_info": {
+                    "exception_type": "AgentTimeoutError",
+                    "exception_message": "timed out",
+                },
+            }
+        )
+    )
+    cfg = json.loads((jobs / "j" / "config.json").read_text())
+    cfg["datasets"][0]["task_names"].append("d-four")
+    (jobs / "j" / "config.json").write_text(json.dumps(cfg))
+    old = time.time() - 4000
+    for p in [jobs / "j", *(jobs / "j").rglob("*")]:
+        os.utime(p, (old, old))
+    [run] = fv.Store([jobs]).runs()
+    rows = {
+        x["task"]: (x["state"], x["default"], x["always"])
+        for x in run["retry"]["tasks"]
+    }
+    assert rows == {
+        "b-two": ("failed", True, False),
+        "c-three": ("not started", True, True),
+        "d-four": ("graded, with an error", False, False),
+    }
+
+
+def test_a_retry_that_refuses_at_once_says_why(jobs: Path) -> None:
+    job = retry_job(jobs)
+    store = fv.Store([jobs])
+
+    class Done:
+        def poll(self):
+            return 2
+
+    def launch(found: Path, tasks: list[str] | None) -> tuple[Done, str]:
+        (found / ".attempts").mkdir(exist_ok=True)
+        (found / ".attempts" / "retry-x.log").write_text(
+            "job j: 3 tasks\nretry_failed: MOONSHOT_API_KEY is not set; put it in base_forum/.env\n"
+        )
+        return Done(), ".attempts/retry-x.log"
+
+    store.launch = launch
+    with pytest.raises(
+        RuntimeError, match="stopped at once: retry_failed: MOONSHOT_API_KEY is not set"
+    ):
+        store.retry("j", None)
+    # making .attempts/ did not make the stopped run look like it is running
+    assert store.runs()[0]["status"] == "stopped" and not fv.retry_failed.is_running(
+        job
+    )
+
+
+def test_requests_under_another_host_name_are_refused(jobs: Path) -> None:
+    retry_job(jobs)
+    server = ThreadingHTTPServer(
+        ("127.0.0.1", 0), fv.make_handler(fv.Store([jobs]), ("trex.example.ts.net",))
+    )
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    port = server.server_address[1]
+    try:
+        for host, code in (
+            (f"evil.example:{port}", 421),
+            (f"localhost:{port}", 200),
+            ("trex.example.ts.net", 200),
+        ):
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{port}/api/runs", headers={"Host": host}
+            )
+            try:
+                got = urllib.request.urlopen(req).status
+            except urllib.error.HTTPError as e:
+                got = e.code
+            assert got == code, host
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/api/runs/retry",
+            data=b'{"job":"j"}',
+            method="POST",
+            headers={
+                "Host": "evil.example",
+                "Content-Type": "application/json",
+                "X-Decorum-Viewer": "1",
+            },
+        )
+        with pytest.raises(urllib.error.HTTPError) as e:
+            urllib.request.urlopen(req)
+        assert e.value.code == 421
+    finally:
+        server.shutdown()

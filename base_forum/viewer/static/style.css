@@ -377,3 +377,5 @@ button.primary:disabled { opacity: .45; cursor: default; }
 .rd-actions button:not(.primary) { background: none; border: 1px solid var(--line); border-radius: 999px; padding: 7px 14px; cursor: pointer; }
 @media (max-width: 860px) { .retry-list li { grid-template-columns: 1fr; } }
 @media (max-width: 860px) { #r-title, #t-title, #in-title { font-size: 25px; } }
+.retry-caution { margin: 0 0 10px; font-size: 13.5px; color: var(--ink); background: var(--hl); border-radius: 8px; padding: 8px 12px; max-width: 860px; }
+.retry-list input:disabled + .retry-task { color: var(--soft); }

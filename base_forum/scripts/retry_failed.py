@@ -6,13 +6,17 @@
     python3 base_forum/scripts/retry_failed.py base_forum/jobs/<job> --task <id>   # just this task (repeatable)
     python3 base_forum/scripts/retry_failed.py base_forum/jobs/<job> --yes         # no question (the viewer's Retry button)
 
-A task is retried when its attempt did not end in a grade of its own work:
-  failed       Pier recorded an error (the agent's time limit, a Docker or network failure, a crash, a cancel), and the
-               task did not pass;
+A task is retried when its attempt ended without a grade of its own work:
+  failed       Pier recorded an error (a Docker or network failure, a crash, a cancel, the agent's time limit before
+               anything was graded) and there is no grade;
   interrupted  the trial folder has no result.json and the job is not running (Pier was stopped mid-trial);
   not started  the task is in the job's plan but has no trial folder.
-A task that was graded (passed or not, by Pier or by regrade.sh) is never retried: running it again until it passes would change what the
-number means.
+Pier runs every interrupted and not-started task on any resume, so those always run, whichever tasks you pick.
+
+A task that was graded is not retried: running again only what failed, until it passes, would raise the pass rate.
+One exception, on request: an attempt Pier graded after an error (most often the agent's time limit: the verifier
+still grades what was left) is listed as "graded, with an error" and retried only when you name it with --task or
+pass --graded-errors. The summary then shows that the task took more than one attempt.
 
 How: each failed attempt's folder is moved to <job>/.attempts/<trial>/ and logged in <job>/.attempts/attempts.jsonl
 (the viewer shows it as an earlier attempt), then `pier job resume` runs the tasks that no longer have a result, with
@@ -91,8 +95,9 @@ def planned_tasks(config: dict) -> list[str]:
 
 
 def last_write(job: Path) -> float:
-    """The newest modification time among the job's files, two levels deep (cheap and enough to see a live run)."""
-    times = [job.stat().st_mtime]
+    """The newest modification time among the job's files, two levels deep (cheap and enough to see a live run).
+    The job folder's own time is left out: creating .attempts/ changes it, and a new trial folder has its own."""
+    times = [0.0]
     for p in job.iterdir():
         if p.name == ATTEMPTS:
             continue
@@ -167,7 +172,8 @@ def classify(job: Path) -> list[dict]:
         regraded = (trial / "regrade" / "reward.json").exists()
         if exc and not regraded and not (reward is not None and reward >= 1):
             msg = " ".join(str(exc.get("exception_message") or "").split())[:300]
-            rows.append({"task": task, "trial": trial.name, "state": "failed", "reason": f"{exc.get('exception_type') or 'error'}: {msg}".rstrip(": "), "exception_type": exc.get("exception_type"), "reward": reward})
+            state = "failed" if reward is None else "graded, with an error"
+            rows.append({"task": task, "trial": trial.name, "state": state, "reason": f"{exc.get('exception_type') or 'error'}: {msg}".rstrip(": "), "exception_type": exc.get("exception_type"), "reward": reward})
         else:
             rows.append({"task": task, "trial": trial.name, "state": "graded", "reason": "", "reward": reward})
     have: dict[str, int] = {}
@@ -181,8 +187,26 @@ def classify(job: Path) -> list[dict]:
     return rows
 
 
-def retryable(rows: list[dict]) -> list[dict]:
-    return [r for r in rows if r["state"] in ("failed", "interrupted", "not started")]
+RETRIED = ("failed", "interrupted", "not started")
+ALWAYS = ("interrupted", "not started")  # Pier runs these on any resume
+
+
+def retryable(rows: list[dict], graded_errors: bool = False) -> list[dict]:
+    """The attempts a retry runs again by default (and, with graded_errors, the ones graded after an error)."""
+    return [r for r in rows if r["state"] in RETRIED or (graded_errors and r["state"] == "graded, with an error")]
+
+
+def pick(rows: list[dict], tasks: list[str], graded_errors: bool = False) -> tuple[list[dict], list[str]]:
+    """What a retry of `tasks` (all when empty) runs, and why it refuses (unknown or graded task ids)."""
+    if not tasks:
+        return retryable(rows, graded_errors), []
+    known = {r["task"] for r in rows}
+    ok = {r["task"] for r in retryable(rows, graded_errors=True)}
+    errors = [f"not in this job: {t}" for t in tasks if t not in known]
+    errors += [f"already graded, not retried: {t}" for t in tasks if t in known and t not in ok]
+    picked = [r for r in rows if r["task"] in tasks and r["task"] in ok]
+    picked += [r for r in rows if r["state"] in ALWAYS and r not in picked]
+    return picked, errors
 
 
 def run_dir(job: Path, config: dict) -> Path:
@@ -212,8 +236,8 @@ def read_env_file(path: Path) -> dict[str, str]:
             s = s[7:].lstrip()
         k, v = s.split("=", 1)
         k, v = k.strip(), v.strip()
-        if len(v) >= 2 and v[0] == v[-1] and v[0] in "'\"":
-            v = v[1:-1]
+        if v[:1] in ("'", '"') and v[0] in v[1:]:
+            v = v[1 : v.index(v[0], 1)]  # a quoted value ends at its closing quote; a comment may follow
         elif " #" in v:
             v = v.split(" #", 1)[0].rstrip()
         if k:
@@ -228,6 +252,25 @@ def needed_keys(config: dict) -> list[str]:
         return []
     models = [agent.get("model_name"), kw.get("worker_model")]
     return sorted({KEYS[m.split("/")[0]] for m in models if isinstance(m, str) and m.split("/")[0] in KEYS})
+
+
+def take_lock(job: Path, tasks: list[str]) -> bool:
+    """Create .attempts/retry.lock atomically; False when another retry holds it (a stale lock is replaced)."""
+    att = job / ATTEMPTS
+    att.mkdir(exist_ok=True)
+    lock = att / LOCK
+    for _ in range(2):
+        try:
+            fd = os.open(lock, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+        except FileExistsError:
+            if lock_holder(job):
+                return False
+            lock.unlink(missing_ok=True)  # its process is gone
+            continue
+        with os.fdopen(fd, "w") as f:
+            f.write(json.dumps({"pid": os.getpid(), "started_at": datetime.now(timezone.utc).isoformat(timespec="seconds"), "tasks": tasks}))
+        return True
+    return False
 
 
 def archive(job: Path, picked: list[dict]) -> list[dict]:
@@ -256,7 +299,8 @@ def archive(job: Path, picked: list[dict]) -> list[dict]:
 def main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("job", type=Path, help="the job folder, e.g. base_forum/jobs/swebenchpro-forum-base-0-20261028T101500Z")
-    ap.add_argument("--task", action="append", default=[], help="retry only this task id (repeatable); it must be one that failed")
+    ap.add_argument("--task", action="append", default=[], help="retry this task id (repeatable); interrupted and not-started tasks run too, since Pier runs them on any resume")
+    ap.add_argument("--graded-errors", action="store_true", help="also retry attempts Pier graded after an error (a timeout graded 0): this raises the pass rate")
     ap.add_argument("--dry-run", action="store_true", help="list what would be retried and the command, and stop")
     ap.add_argument("--yes", "-y", action="store_true", help="do not ask before starting")
     ap.add_argument("--force", action="store_true", help="retry even if the job looks like it is still running")
@@ -272,21 +316,18 @@ def main(argv: list[str]) -> int:
         print(f"retry_failed: {a.job} has no config.json; is it a Pier job folder?", file=sys.stderr)
         return 2
     rows = classify(job)
-    todo = retryable(rows)
-    if a.task:
-        unknown = [t for t in a.task if t not in {r["task"] for r in rows}]
-        if unknown:
-            print(f"retry_failed: not in this job: {', '.join(unknown)}", file=sys.stderr)
-            return 2
-        graded = [t for t in a.task if t not in {r["task"] for r in todo}]
-        if graded:
-            print(f"retry_failed: already graded, not retried: {', '.join(graded)}", file=sys.stderr)
-            return 2
-        todo = [r for r in todo if r["task"] in a.task]
+    todo, errors = pick(rows, a.task, a.graded_errors)
+    if errors:
+        print("retry_failed: " + "; ".join(errors), file=sys.stderr)
+        return 2
     graded_n = sum(r["state"] == "graded" for r in rows)
-    print(f"job {job.name}: {len(rows)} tasks, {graded_n} graded, {len(retryable(rows))} to retry")
+    print(f"job {job.name}: {len(rows)} tasks, {graded_n} graded, {len(todo)} to retry")
     for r in todo:
-        print(f"  {r['state']:<12} {r['task']}" + (f"\n               {r['reason']}" if r["reason"] and r["state"] == "failed" else ""))
+        also = " (runs on any resume)" if a.task and r["task"] not in a.task else ""
+        print(f"  {r['state']:<12} {r['task']}{also}" + (f"\n               {r['reason']}" if r["reason"] and r["state"] not in ALWAYS else ""))
+    left = [r for r in rows if r["state"] == "graded, with an error" and r not in todo]
+    if left:
+        print(f"not retried: {len(left)} graded after an error ({', '.join(r['task'] for r in left)}); name one with --task, or pass --graded-errors")
     if not todo:
         print("nothing to retry")
         return 2
@@ -319,10 +360,12 @@ def main(argv: list[str]) -> int:
             print("not retried")
             return 2
 
-    moved = archive(job, todo)
+    if not take_lock(job, [r["task"] for r in todo]):
+        print(f"retry_failed: another retry is running on this job (pid {lock_holder(job)})", file=sys.stderr)
+        return 3
     lock = job / ATTEMPTS / LOCK
-    lock.write_text(json.dumps({"pid": os.getpid(), "started_at": moved[0]["at"], "tasks": [r["task"] for r in todo]}))
     try:
+        archive(job, todo)
         code = subprocess.call(cmd, cwd=cwd, env=env)
     finally:
         lock.unlink(missing_ok=True)

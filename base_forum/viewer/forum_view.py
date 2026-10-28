@@ -486,6 +486,7 @@ class Store:
             str, subprocess.Popen
         ] = {}  # job -> the retry this server started, while it runs
         self.launch = launch_retry
+        self.launch_grace = 2.0  # seconds to watch a new retry for an immediate refusal
 
     def scan(self) -> list[dict]:
         with self.lock:
@@ -620,7 +621,9 @@ class Store:
             del self.retries[job.name]
             proc = None
         try:
-            todo = retry_failed.retryable(retry_failed.classify(job))
+            todo = retry_failed.retryable(
+                retry_failed.classify(job), graded_errors=True
+            )
         except (SystemExit, OSError, ValueError):
             todo = []
         logs = (
@@ -630,7 +633,13 @@ class Store:
         )
         return {
             "tasks": [
-                {k: r.get(k) for k in ("task", "state", "reason", "trial")}
+                {
+                    **{k: r.get(k) for k in ("task", "state", "reason", "trial")},
+                    "default": r["state"]
+                    in retry_failed.RETRIED,  # ticked unless the reader unticks it
+                    "always": r["state"]
+                    in retry_failed.ALWAYS,  # Pier runs it on any resume
+                }
                 for r in todo
             ],
             "in_progress": proc is not None
@@ -660,7 +669,7 @@ class Store:
         }
 
     def retry(self, job: str, tasks: object) -> dict:
-        """Start retry_failed.py on a run's failed tasks (all of them, or the ones named)."""
+        """Start retry_failed.py on a run's failed tasks (the default ones, or the ones named)."""
         if not self.retry_enabled:
             raise PermissionError(
                 "retrying is switched off in this viewer (--no-retry)"
@@ -669,6 +678,7 @@ class Store:
             not isinstance(tasks, list) or not all(isinstance(t, str) for t in tasks)
         ):
             raise TypeError("tasks must be a list of task ids")
+        named = list(dict.fromkeys(tasks or []))
         with self.lock:
             found = next((j for _, j in self._job_dirs() if j.name == job), None)
             if found is None or not (found / "config.json").exists():
@@ -678,25 +688,41 @@ class Store:
                 raise RuntimeError(
                     "this run is still running; retry it when it has finished"
                 )
-            can = {t["task"] for t in state["tasks"]}
-            if not can:
+            picked, errors = retry_failed.pick(retry_failed.classify(found), named)
+            if errors:
+                raise ValueError("; ".join(errors))
+            if not picked:
                 raise ValueError(
                     "nothing to retry: every task in this run has a graded attempt"
                 )
-            picked = sorted(can) if not tasks else list(dict.fromkeys(tasks))
-            bad = [t for t in picked if t not in can]
-            if bad:
-                raise ValueError(
-                    f"not retryable (graded, or not in this run): {', '.join(bad)}"
-                )
-            proc, log = self.launch(found, picked if tasks else None)
+            proc, log = self.launch(found, named or None)
             self.retries[job] = proc
-            return {"job": job, "tasks": picked, "log": log}
+        # a retry that refuses (a missing key, no pier) stops within a moment: say why instead of "started"
+        deadline = time.time() + self.launch_grace
+        while time.time() < deadline and proc.poll() is None:
+            time.sleep(0.1)
+        if proc.poll() not in (None, 0):
+            lines = [
+                x
+                for x in (found / log).read_text(errors="replace").splitlines()
+                if x.strip()
+            ]
+            raise RuntimeError(
+                f"the retry stopped at once: {lines[-1] if lines else 'see ' + log}"
+            )
+        return {"job": job, "tasks": [r["task"] for r in picked], "log": log}
 
-    def teams(self, job: str) -> dict | None:
+    def teams(self, job: str, runs: list[dict] | None = None) -> dict | None:
         """How the authority staffed each task of one run, and the run's setup."""
         with self.lock:
-            run = next((r for r in self.runs() if r["job"] == job), None)
+            run = next(
+                (
+                    r
+                    for r in (runs if runs is not None else self.runs())
+                    if r["job"] == job
+                ),
+                None,
+            )
             if run is None:
                 return None
             rows, setup = [], None
@@ -743,10 +769,11 @@ class Store:
         """Every selected run with its tasks' teams and threads, for the cross-run page."""
         with self.lock:
             out = []
-            for r in self.runs():
+            runs = self.runs()
+            for r in runs:
                 if jobs and r["job"] not in jobs:
                     continue
-                d = self.teams(r["job"])
+                d = self.teams(r["job"], runs)
                 if d:
                     out.append(d)
             return {"runs": out}
@@ -867,8 +894,11 @@ class Store:
                 finished_at = _local_iso(res.get("finished_at"))
                 # A job with no finish time is running only while something in it still moves: a crashed pier
                 # never writes finished_at, and must not look alive forever.
+                # the job folder's own time changes when a retry makes .attempts/; a new trial folder has its own
                 touched = [
-                    p.stat().st_mtime for p in (job, job / "result.json") if p.exists()
+                    p.stat().st_mtime
+                    for p in [job / "result.json", *job.iterdir()]
+                    if p.exists() and p.name != ATTEMPTS
                 ]
                 touched += [
                     self.trials[(job.name, t["trial"])].last_activity()
@@ -1092,8 +1122,21 @@ def _ts(iso: str | None) -> float | None:
         return None
 
 
-def make_handler(store: Store):
+def make_handler(store: Store, extra_hosts: tuple[str, ...] = ()):
     class H(BaseHTTPRequestHandler):
+        def _host_ok(self) -> bool:
+            """Answer only requests addressed to this server by name: a page that rebinds its own DNS name to
+            127.0.0.1 is then refused, so it can neither read the forums nor start a retry."""
+            port = self.server.server_address[1]
+            host = (self.headers.get("Host") or "").lower()
+            names = {
+                "127.0.0.1",
+                "localhost",
+                "[::1]",
+                *(h.lower() for h in extra_hosts),
+            }
+            return host in names or host in {f"{n}:{port}" for n in names}
+
         def _send(self, code: int, body: bytes, ctype: str) -> None:
             self.send_response(code)
             self.send_header("Content-Type", ctype)
@@ -1106,6 +1149,8 @@ def make_handler(store: Store):
             self._send(200, json.dumps(obj).encode(), "application/json")
 
         def do_POST(self) -> None:
+            if not self._host_ok():
+                return self._send(421, b'{"error":"unknown host"}', "application/json")
             u = urlparse(self.path)
             if u.path not in ("/api/runs/rename", "/api/runs/retry"):
                 return self._send(404, b'{"error":"not found"}', "application/json")
@@ -1145,6 +1190,12 @@ def make_handler(store: Store):
             return self._json({"job": body.get("job"), "name": name or None})
 
         def do_GET(self) -> None:
+            if not self._host_ok():
+                return self._send(
+                    421,
+                    b"unknown host; start the viewer with --allow-host <name>",
+                    "text/plain",
+                )
             u = urlparse(self.path)
             q = {k: v[0] for k, v in parse_qs(u.query).items()}
             if u.path == "/api/runs":
@@ -1229,6 +1280,13 @@ def main() -> None:
         "--open", action="store_true", help="open the page in the default browser"
     )
     ap.add_argument(
+        "--allow-host",
+        action="append",
+        default=[],
+        help="another name the page is reached by (behind a proxy such as tailscale serve); "
+        "requests under any other name are refused",
+    )
+    ap.add_argument(
         "--no-retry",
         action="store_true",
         help="hide the Retry button (retrying runs tasks again, which costs model calls)",
@@ -1239,7 +1297,9 @@ def main() -> None:
     TASK_DIRS.extend(p.expanduser().resolve() for p in a.tasks)
     store = Store([p.expanduser().resolve() for p in a.jobs])
     store.retry_enabled = store.retry_enabled and not a.no_retry
-    server = ThreadingHTTPServer((a.host, a.port), make_handler(store))
+    server = ThreadingHTTPServer(
+        (a.host, a.port), make_handler(store, (a.host, *a.allow_host))
+    )
     url = f"http://{a.host}:{a.port}/"
     print(
         f"decorum forum viewer: {url}  (jobs: {', '.join(map(str, store.roots))}; Ctrl-C to stop)",
