@@ -1,9 +1,11 @@
 # base_forum — Decorum's base forum and its DeepSWE runner
 
-The baseline Decorum compares evolved rulebooks against: an **authority agent** that opens threads and assigns
-**workers** (one or several per thread, each with its own persona and instructions) through a **forum**, governed by
-a **typed rulebook** that the runtime enforces at every tool call. The base rulebook, `base-0`, keeps the forum as
-open as possible and enforces only the trial's limits.
+The baseline Decorum compares evolved rulebooks against: an **authority agent** that manages a team of
+**workers** through a **forum**. It turns the task into a requirement list, designs the team, opens threads and
+assigns workers to them (one or several per thread, each with a persona and instructions it writes), follows and
+verifies the work, and commits. A **typed rulebook** is enforced at every tool call. The base rulebook, `base-0`,
+keeps the forum open and enforces two things: the authority manages and does not edit files itself, and the
+trial's limits.
 
 ```
 base_forum/
@@ -13,7 +15,8 @@ base_forum/
   scripts/run_baseline.sh   run N DeepSWE tasks with Pier + Docker
   scripts/summarize.py      one table per job, against the leaderboard's Kimi K3 reference
   scripts/regrade.sh        grade a trial's patch by hand when Pier's verifier step fails
-  scripts/watch.py          follow a running job live: threads, assignments, posts, tool calls, cost
+  scripts/watch.py          follow a running job live in the terminal
+  viewer/                   the forum viewer: a live web page over every trial in the job folders
   tasks/baseline-10.tsv     the 10 baseline tasks, with Kimi K3 / K2.7-code reference pass rates
 ```
 
@@ -25,7 +28,10 @@ pi session:
 
 1. **The authority** (`-m`, e.g. Kimi K3) gets the instruction, pi's coding tools, and the forum tools:
    `open_thread`, `assign_workers`, `post`, `read_thread`, `list_threads`, `wait`, `close_thread` (and
-   `merge_worker` when the rulebook isolates workers). Whether to use workers at all is its decision.
+   `merge_worker` when the rulebook isolates workers). Its prompt (`runtime/src/prompts.ts`) makes it the manager:
+   write a numbered requirement list in a "Plan" thread, design a team of usually 2 to 4 workers with one owner per
+   requirement and per file, brief each one completely, manage through `wait` and posts, verify every requirement
+   itself, then commit. Under `authority: manager` its `write` and `edit` calls are refused.
 2. **Workers** (`worker_model`, e.g. Kimi K2.7-code) are started only through `assign_workers(thread, workers[])`,
    each with a persona and instructions. They see their thread and what the authority wrote, not its conversation.
    They have pi's coding tools plus `post`, `read_thread`, `list_threads`, `wait`, `finish(summary, evidence?)`.
@@ -47,6 +53,7 @@ pi session:
 | `posting` | `all` | `participants` | `post` |
 | `workspace` | `shared` (one checkout) | `isolated` (a git worktree per worker, installed deps linked in) | `assign_workers`, `finish`, `merge_worker` |
 | `closing` | `self` | `evidence` | `finish` |
+| `authority` | `manager` (no write or edit for the authority) | `player` | the `tool_call` hook, forum mode only |
 | `budget.usd_per_trial` | 10 | number or null | every tool call and every model response |
 | `budget.max_live_workers` | 4 | integer | `assign_workers`, resuming a worker |
 | `budget.max_workers_total` | null | integer or null | `assign_workers` |
@@ -88,9 +95,15 @@ default is an environment variable; see the top of `scripts/run_baseline.sh`. On
 to run slower than on the leaderboard.
 
 Watching live: the runtime writes the forum and every agent's session as it goes, and Docker mounts them on the host.
-In a second terminal, `python3 base_forum/scripts/watch.py base_forum/jobs/<job>` prints threads opening, workers
-joining with their personas and instructions, every post and finish, refusals, each agent's tool calls, and the running
-cost (`--quiet` for the forum only). The job directory name is printed by `run_baseline.sh` when it starts.
+
+- **In the browser:** `python3 base_forum/viewer/forum_view.py --open` (http://127.0.0.1:8479/). The left column
+  lists every trial in `base_forum/jobs`, running ones first. A trial shows its task, cost and time, the team (each
+  agent's persona, state and current action), and its threads as columns: the plan, workers joining with their
+  instructions, every post, finish reports, and each worker's tool calls folded per step. **L** switches to one
+  timeline, **T** back; clicking an agent shows everything it did; **Pause updates** freezes the page while you read.
+  Standard library only; it binds to 127.0.0.1.
+- **In the terminal:** `python3 base_forum/scripts/watch.py base_forum/jobs/<job>` prints the same events as lines
+  (`--quiet` for the forum only). `run_baseline.sh` prints both commands when it starts.
 
 Results: `base_forum/jobs/<job>/`; `python3 base_forum/scripts/summarize.py base_forum/jobs/<job> --reference
 base_forum/tasks/baseline-10.tsv` prints one line per trial (reward, cost, time, workers, posts, end reason) beside the
@@ -99,8 +112,9 @@ leaderboard's Kimi K3 pass rate for that task. `pier view base_forum/jobs/<job>`
 ## Developing
 
 ```bash
-cd base_forum/runtime && npm ci && npm test && npx tsc --noEmit      # 23 tests, scripted agents, no key
+cd base_forum/runtime && npm ci && npm test && npx tsc --noEmit      # 39 tests, scripted agents, no key
 cd base_forum/pier_adapter && uv run --with pytest --with-editable . pytest -q
+cd base_forum/viewer && uv run --no-project --with pytest pytest -q
 node base_forum/runtime/src/main.ts run --instruction "..." --repo /tmp/repo --out /tmp/out --faux smoke   # no model
 pier run -p <task> --agent-import-path decorum_pier:DecorumForum --ak faux=smoke --env docker   # Pier + Docker, no model
 ```

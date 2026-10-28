@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Decorum forum</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="app">
+  <aside class="rail" aria-label="Trials">
+    <header class="rail-head">
+      <h1>Decorum forum</h1>
+      <p class="sub">Every trial in the job folders, live.</p>
+    </header>
+    <nav id="trials" class="trials"></nav>
+    <footer class="rail-foot"><span id="updated">Connecting…</span></footer>
+  </aside>
+
+  <main class="main" id="main">
+    <div class="empty" id="empty">
+      <h2>Pick a trial</h2>
+      <p>Running trials are at the top of the list. A trial's threads, the agents working in them, and what they say to each other appear here as it happens.</p>
+      <p>In each trial, the <b>authority</b> plans the work and runs it through <b>threads</b>: it assigns <b>workers</b> to them, each with a persona and instructions, and they report back with posts and a finish report. Click an agent to see everything it did.</p>
+    </div>
+
+    <section id="trial" hidden>
+      <header class="trial-head">
+        <div class="title-row">
+          <div>
+            <p class="eyebrow" id="t-eyebrow"></p>
+            <h2 id="t-title"></h2>
+          </div>
+          <div class="live-ctl">
+            <span class="state" id="t-state"></span>
+            <button id="pause" type="button" aria-pressed="false">Pause updates</button>
+          </div>
+        </div>
+        <p class="facts" id="t-facts"></p>
+        <p class="note" id="t-note" hidden></p>
+        <p class="problem" id="t-problem" hidden></p>
+        <details class="task" id="t-task" hidden>
+          <summary>The task, as the authority received it</summary>
+          <div class="task-text" id="t-task-text"></div>
+        </details>
+      </header>
+
+      <section class="team" aria-label="Agents">
+        <h3>Team</h3>
+        <div id="team" class="team-grid"></div>
+      </section>
+
+      <section class="refusals" id="refusals" hidden aria-label="Refused by the rulebook"></section>
+
+      <div class="view-tabs" role="tablist" aria-label="View">
+        <button role="tab" id="tab-threads" aria-selected="true" aria-controls="threads">Threads <kbd>T</kbd></button>
+        <button role="tab" id="tab-timeline" aria-selected="false" aria-controls="timeline">Timeline <kbd>L</kbd></button>
+      </div>
+
+      <section id="threads" class="board" role="tabpanel" aria-labelledby="tab-threads"></section>
+      <section id="timeline" class="timeline" role="tabpanel" aria-labelledby="tab-timeline" hidden>
+        <div class="log" role="log" aria-label="Everything in order" id="timeline-log"></div>
+      </section>
+    </section>
+  </main>
+
+  <aside class="drawer" id="drawer" hidden aria-label="Agent activity">
+    <header>
+      <div>
+        <p class="eyebrow">Agent</p>
+        <h3 id="d-name"></h3>
+        <p class="d-meta" id="d-meta"></p>
+      </div>
+      <button type="button" id="d-close" aria-label="Close">Close</button>
+    </header>
+    <p class="d-persona" id="d-persona"></p>
+    <h4>What it did, newest first</h4>
+    <ol id="d-actions" class="actions"></ol>
+  </aside>
+</div>
+<script src="app.js"></script>
+</body>
+</html>
