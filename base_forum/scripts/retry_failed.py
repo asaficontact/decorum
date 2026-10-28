@@ -445,7 +445,9 @@ def main(argv: list[str]) -> int:
         print("retry_failed: " + "; ".join(errors), file=sys.stderr)
         return 2
     graded_n = sum(r["state"] == "graded" for r in rows)
-    print(f"job {job.name}: {len(rows)} tasks, {graded_n} graded, {len(todo)} to retry")
+    with_error = sum(r["state"] == "graded, with an error" for r in rows)
+    graded_words = f"{graded_n + with_error} graded" + (f" ({with_error} after an error)" if with_error else "")
+    print(f"job {job.name}: {len(rows)} tasks, {graded_words}, {len(todo)} to retry")
     for r in todo:
         also = " (runs on any resume)" if a.task and r["task"] not in a.task else ""
         print(
