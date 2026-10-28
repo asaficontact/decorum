@@ -59,6 +59,17 @@ PROVIDERS: dict[str, tuple[list[str], list[str]]] = {
 THINKING = {"off", "minimal", "low", "medium", "high", "xhigh", "max"}
 
 
+def _as_bool(value: bool | str, name: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    v = str(value).strip().lower()
+    if v in ("true", "1", "yes"):
+        return True
+    if v in ("false", "0", "no"):
+        return False
+    raise ValueError(f"{name} must be true or false; got {value!r}")
+
+
 def _provider(model: str) -> str:
     if "/" not in model:
         raise ValueError(f"A model is written provider/model-id (e.g. moonshotai/kimi-k3); got {model!r}")
@@ -96,6 +107,8 @@ class DecorumForum(BaseInstalledAgent):
         worker_thinking: str = "high",
         repo: str = "/app",
         faux: str | None = None,
+        commit: bool | str = True,
+        wall_clock_sec: float | str | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(*args, **kwargs)
@@ -105,6 +118,12 @@ class DecorumForum(BaseInstalledAgent):
         self.worker_thinking = worker_thinking
         self.repo = repo
         self.faux = faux
+        # What the benchmark grades: the committed diff (DeepSWE) or the working tree (SWE-bench Pro: commit=false).
+        self.commit = _as_bool(commit, "commit")
+        # The benchmark's agent time limit less a margin, so the runtime stops and writes its summary before Pier kills it.
+        self.wall_clock_sec = None if wall_clock_sec in (None, "", "none") else float(wall_clock_sec)
+        if self.wall_clock_sec is not None and self.wall_clock_sec <= 0:
+            raise ValueError(f"wall_clock_sec must be positive; got {wall_clock_sec!r}")
         for name, level in (("authority_thinking", authority_thinking), ("worker_thinking", worker_thinking)):
             if level not in THINKING:
                 raise ValueError(f"{name} must be one of {sorted(THINKING)}; got {level!r}")
@@ -216,7 +235,10 @@ class DecorumForum(BaseInstalledAgent):
             "--authority-thinking", self.authority_thinking,
             "--worker-thinking", self.worker_thinking,
             "--work-dir", "/tmp/decorum-work",
+            "--commit-policy", "commit" if self.commit else "leave",
         ]  # fmt: skip
+        if self.wall_clock_sec is not None:
+            args += ["--wall-clock-sec", str(int(self.wall_clock_sec))]
         if self.faux:
             args += ["--faux", self.faux]
         else:

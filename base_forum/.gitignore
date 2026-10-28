@@ -4,3 +4,4 @@ jobs/
 __pycache__/
 *.egg-info/
 .venv/
+.swebench-pro/

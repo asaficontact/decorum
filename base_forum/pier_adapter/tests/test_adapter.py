@@ -56,6 +56,18 @@ def test_command_carries_both_models_and_the_rulebook(tmp_path):
     assert DecorumSingle.name() == "decorum-single"
 
 
+def test_swebench_pro_settings_reach_the_runtime(tmp_path):
+    default = make(tmp_path)._command()
+    assert "--commit-policy commit" in default and "--wall-clock-sec" not in default
+    pro = make(tmp_path, commit="false", wall_clock_sec="2880")._command()
+    assert "--commit-policy leave" in pro and "--wall-clock-sec 2880" in pro
+    assert "--commit-policy leave" in make(tmp_path, commit=False)._command()
+    with pytest.raises(ValueError, match="commit must be true or false"):
+        make(tmp_path, commit="sometimes")
+    with pytest.raises(ValueError, match="wall_clock_sec must be positive"):
+        make(tmp_path, wall_clock_sec=0)
+
+
 def test_configuration_errors_are_named(tmp_path):
     with pytest.raises(ValueError, match="worker_model"):
         DecorumForum(logs_dir=tmp_path, model_name="moonshotai/kimi-k3")
@@ -91,10 +103,10 @@ def test_trajectory_from_a_real_smoke_trial(tmp_path):
     t = build_trajectory(summary, out, agent_name="decorum-forum", version="test")
     Trajectory.model_validate(t.to_json_dict())  # the schema Pier's viewer reads
     assert t.agent.model_name == "faux/authority"
-    assert [s.trajectory_id for s in t.subagent_trajectories or []] == ["w1", "w2"]
+    assert [s.trajectory_id for s in t.subagent_trajectories or []] == ["w1", "w2", "w3"]
     assign = next(st for st in t.steps if st.tool_calls and st.tool_calls[0].function_name == "assign_workers")
     refs = assign.observation.results[0].subagent_trajectory_ref
-    assert [r.trajectory_id for r in refs] == ["w1", "w2"]
+    assert [r.trajectory_id for r in refs] == ["w1", "w2", "w3"]
     assert t.final_metrics.total_cost_usd == pytest.approx(summary["cost_usd"])
     assert t.final_metrics.extra["end_reason"] == "authority_done"
     assert t.final_metrics.total_steps == sum(len(x.steps) for x in [t, *t.subagent_trajectories])

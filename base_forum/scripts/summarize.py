@@ -76,15 +76,26 @@ def load(job: Path) -> list[dict]:
     return rows
 
 
-def reference(path: Path | None) -> dict[str, dict]:
+REFERENCE_COLUMNS = {
+    "k3_max_pass_rate": "DeepSWE leaderboard, Kimi K3 (max, mini-swe-agent, 4 runs)",
+    "kimi_k2_v1_2025": "Scale's 2025 SWE-bench Pro v1 run, Kimi K2 (SWE-agent, 250 turns)",
+}
+
+
+def reference(path: Path | None) -> tuple[dict[str, dict], str | None]:
+    """Rows of a task TSV (comment lines skipped; the first other line is the header) and its reference column."""
     if not path or not path.exists():
-        return {}
-    lines = path.read_text().splitlines()
+        return {}, None
+    lines = [
+        line
+        for line in path.read_text().splitlines()
+        if line.strip() and not line.startswith("#")
+    ]
     head = lines[0].split("\t")
+    col = next((c for c in REFERENCE_COLUMNS if c in head), None)
     return {
-        r[0]: dict(zip(head, r))
-        for r in (line.split("\t") for line in lines[1:] if line.strip())
-    }
+        r[0]: dict(zip(head, r)) for r in (line.split("\t") for line in lines[1:])
+    }, col
 
 
 def main() -> int:
@@ -99,14 +110,15 @@ def main() -> int:
     if not rows:
         print(f"no trials with result.json under {a.job}", file=sys.stderr)
         return 1
-    ref = reference(a.reference)
+    ref, ref_col = reference(a.reference)
     for r in rows:
-        r["k3_reference"] = ref.get(r["task"], {}).get("k3_max_pass_rate")
+        v = ref.get(r["task"], {}).get(ref_col) if ref_col else None
+        r["reference"] = float(v) if v not in (None, "") else None
     cols = [
         "task",
         "reward",
         "graded_by",
-        "k3_reference",
+        "reference",
         "cost_usd",
         "agent_minutes",
         "workers",
@@ -126,7 +138,7 @@ def main() -> int:
     graded = [r for r in rows if r["reward"] is not None]
     passed = sum(1 for r in graded if r["reward"] >= 1)
     cost = sum(r["cost_usd"] or 0 for r in rows)
-    refs = [float(r["k3_reference"]) for r in rows if r["k3_reference"]]
+    refs = [r["reference"] for r in rows if r["reference"] is not None]
     print()
     print(
         f"{len(rows)} trials, {len(graded)} graded, {passed} passed ({passed / len(graded):.0%})"
@@ -135,7 +147,7 @@ def main() -> int:
     )
     if refs:
         print(
-            f"leaderboard Kimi K3 (max, mini-swe-agent, 4 runs) on the same tasks: mean pass rate {sum(refs) / len(refs):.2f}"
+            f"reference = {REFERENCE_COLUMNS.get(ref_col or '', ref_col)}: mean {sum(refs) / len(refs):.2f} on the same tasks"
         )
     print(
         f"cost ${cost:.2f} total, ${cost / len(rows):.2f} per trial; workers used in {sum(1 for r in rows if r['workers'])} of {len(rows)} trials"

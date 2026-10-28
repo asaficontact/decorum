@@ -4,8 +4,8 @@ The baseline Decorum compares evolved rulebooks against: an **authority agent** 
 **workers** through a **forum**. It turns the task into a requirement list, designs the team, opens threads and
 assigns workers to them (one or several per thread, each with a persona and instructions it writes), follows and
 verifies the work, and commits. A **typed rulebook** is enforced at every tool call. The base rulebook, `base-0`,
-keeps the forum open and enforces two things: the authority manages and does not edit files itself, and the
-trial's limits.
+keeps the forum open and enforces three things: the authority manages and does not edit files itself, it runs
+the task with a team of 3 to 6 workers, and the trial's limits. It runs on DeepSWE and on SWE-bench Pro V2.
 
 ```
 base_forum/
@@ -17,7 +17,8 @@ base_forum/
   scripts/regrade.sh        grade a trial's patch by hand when Pier's verifier step fails
   scripts/watch.py          follow a running job live in the terminal
   viewer/                   the forum viewer: a live web page over every trial in the job folders
-  tasks/baseline-10.tsv     the 10 baseline tasks, with Kimi K3 / K2.7-code reference pass rates
+  tasks/baseline-10.tsv     DeepSWE: the 10 baseline tasks, with Kimi K3 / K2.7-code reference pass rates
+  tasks/swebenchpro-10.tsv  SWE-bench Pro V2: the 10 tasks the collaborators use, with Scale's 2025 per-task results
 ```
 
 ## How a trial runs
@@ -31,7 +32,9 @@ pi session:
    `merge_worker` when the rulebook isolates workers). Its prompt (`runtime/src/prompts.ts`) makes it the manager:
    write a numbered requirement list in a "Plan" thread, design a team of usually 2 to 4 workers with one owner per
    requirement and per file, brief each one completely, manage through `wait` and posts, verify every requirement
-   itself, then commit. Under `authority: manager` its `write` and `edit` calls are refused.
+   itself, then commit (or, for a benchmark that grades the working tree, leave the changes uncommitted). Under
+   `authority: manager` its `write` and `edit` calls are refused, and under base-0 it must start between 3 and 6
+   workers: if it tries to finish with fewer it is sent back with the reason.
 2. **Workers** (`worker_model`, e.g. Kimi K2.7-code) are started only through `assign_workers(thread, workers[])`,
    each with a persona and instructions. They see their thread and what the authority wrote, not its conversation.
    They have pi's coding tools plus `post`, `read_thread`, `list_threads`, `wait`, `finish(summary, evidence?)`.
@@ -56,7 +59,8 @@ pi session:
 | `authority` | `manager` (no write or edit for the authority) | `player` | the `tool_call` hook, forum mode only |
 | `budget.usd_per_trial` | 10 | number or null | every tool call and every model response |
 | `budget.max_live_workers` | 4 | integer | `assign_workers`, resuming a worker |
-| `budget.max_workers_total` | null | integer or null | `assign_workers` |
+| `budget.max_workers_total` | 6 | integer or null | `assign_workers` |
+| `budget.min_workers_total` | 3 | integer (0 = none) | when the authority tries to end the trial: sent back with the reason |
 | `budget.wall_clock_sec` | 9000 | number or null | a timer, every tool call |
 | `norms` | "" | free text | prompt only |
 
@@ -88,6 +92,16 @@ base_forum/scripts/run_baseline.sh                 # the 10 baseline tasks, foru
 MODE=single base_forum/scripts/run_baseline.sh     # the same 10, one Kimi K3 agent and no forum
 ```
 
+**SWE-bench Pro** (V2, Scale's Harbor tasks from `scaleapi/SWE-bench_Pro-os`, fetched into `base_forum/.swebench-pro`
+the first time): put `BENCHMARK=swebenchpro` in front of any of the commands above. It runs the 10 tasks in
+`tasks/swebenchpro-10.tsv` as the benchmark defines them: each task's own sandbox (1 CPU, 4 GB) and time limit
+(3000 s), the agent offline except for the model's API, the grade read from the working tree. So nobody commits:
+the prompts say so, and any commit an agent makes anyway is undone at the end with its changes kept.
+
+**Time limits** come from the tasks: `run_baseline.sh` reads `[agent] timeout_sec` from each task.toml and tells the
+runtime to stop 120 s before the shortest, so it always hands over its work and writes its summary before Pier stops
+it. DeepSWE's tasks allow 3 h; base-0's own 2.5 h (the leaderboard's) is the tighter there.
+
 Defaults: authority `moonshotai/kimi-k3` at `max` thinking (as on the DeepSWE leaderboard), workers
 `moonshotai/kimi-k2.7-code` at `high`, rulebook `base-0`, 2 trials at once, 4 CPUs and 8 GB per trial. Every
 default is an environment variable; see the top of `scripts/run_baseline.sh`. On an Apple-silicon Mac the task images
@@ -112,7 +126,7 @@ leaderboard's Kimi K3 pass rate for that task. `pier view base_forum/jobs/<job>`
 ## Developing
 
 ```bash
-cd base_forum/runtime && npm ci && npm test && npx tsc --noEmit      # 39 tests, scripted agents, no key
+cd base_forum/runtime && npm ci && npm test && npx tsc --noEmit      # 45 tests, scripted agents, no key
 cd base_forum/pier_adapter && uv run --with pytest --with-editable . pytest -q
 cd base_forum/viewer && uv run --no-project --with pytest pytest -q
 node base_forum/runtime/src/main.ts run --instruction "..." --repo /tmp/repo --out /tmp/out --faux smoke   # no model

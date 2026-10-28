@@ -379,3 +379,32 @@ def test_concurrent_requests_never_read_an_event_twice(jobs: Path) -> None:
         t.join()
     d = store.detail("job1", trial.name, 0)
     assert [e["seq"] for e in d["events"]] == list(range(1, 301))
+
+
+def test_a_swebench_pro_task_gets_its_title_and_repository_from_the_task(
+    jobs: Path,
+) -> None:
+    tid = "instance_ansible__ansible-83fb24b923064d3576d473747ebbe62e4535c9e3-vba6da65a0f3baefda7a058ebbd0a8dcafb8512f5"
+    tdir = jobs / "tasks" / tid
+    tdir.mkdir(parents=True)
+    (tdir / "task.toml").write_text("[agent]\ntimeout_sec = 3000.0\n")
+    (tdir / "instruction.md").write_text(
+        "A code repository is available in /app.\n\n<pr_description>\n## Title Support multiple destination ports in iptables rules\n\n## Description\n..."
+    )
+    trial = jobs / "job1" / f"{tid[:40]}__x"
+    (trial / "agent" / "decorum").mkdir(parents=True)
+    append(
+        trial / "agent" / "decorum" / "forum.jsonl",
+        {"seq": 1, "at": iso(time.time()), "kind": "note", "agent": "a", "text": "x"},
+    )
+    (trial / "config.json").write_text(
+        json.dumps(
+            {
+                "task": {"path": str(tdir)},
+                "agent": {"import_path": "decorum_pier:DecorumForum"},
+            }
+        )
+    )
+    [ov] = fv.Store([jobs]).scan()
+    assert ov["title"] == "Support multiple destination ports in iptables rules"
+    assert ov["repository"] == "ansible/ansible"

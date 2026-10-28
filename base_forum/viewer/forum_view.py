@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import threading
 import time
 import webbrowser
@@ -415,6 +416,18 @@ def task_info(trial: Path) -> dict:
             if (c / "instruction.md").is_file():
                 info["instruction"] = (c / "instruction.md").read_text()
             break
+    # SWE-bench Pro tasks carry no display title: take the PR description's "## Title ..." line, and the
+    # repository from the id (instance_<org>__<repo>-<sha>-v...).
+    if "display_title" not in info and info.get("instruction"):
+        m = re.search(
+            r"^#+\s*Title:?\s*(.+)$", info["instruction"], re.MULTILINE
+        ) or re.search(r"<pr_description>\s*#*\s*(.+)", info["instruction"])
+        if m:
+            info["display_title"] = m.group(1).strip()[:160]
+    if "repository_url" not in info:
+        m = re.match(r"instance_([^_]+)__([^-]+)-", rel.name)
+        if m:
+            info["repository_url"] = f"https://github.com/{m.group(1)}/{m.group(2)}"
     _TASK_INFO[trial] = info
     return info
 
