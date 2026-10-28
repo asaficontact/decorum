@@ -8,18 +8,19 @@ import type { Model } from "@earendil-works/pi-ai";
 import { createAgentSession, DefaultResourceLoader, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
 import type { AgentSession, ModelRuntime, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { Decision, TrialState } from "./enforce.ts";
-import { checkAuthorityTool, checkBudget, checkResume, checkSpawn } from "./enforce.ts";
+import { checkAuthorityTool, checkBudget, checkFinishTrial, checkResume, checkSpawn } from "./enforce.ts";
 import type { ForumEvent } from "./forum.ts";
 import { Forum, ForumError } from "./forum.ts";
 import { AUTHORITY, authoritySystemPrompt, digest, WORKER_NUDGE, workerFirstPrompt, workerSystemPrompt } from "./prompts.ts";
 import type { Rulebook } from "./rulebook.ts";
 import type { ForumHost, WorkerSpec } from "./tools.ts";
 import { authorityTools, workerTools } from "./tools.ts";
-import { commitAll, createIsolatedWorkspace, headSha, mergeBranch, prepareGit, removeStaleIndexLock } from "./workspace.ts";
+import { commitAll, createIsolatedWorkspace, headSha, mergeBranch, prepareGit, removeStaleIndexLock, resetToBase } from "./workspace.ts";
 
 export const VERSION = "0.1.0";
 
 export type Mode = "forum" | "single";
+export type CommitPolicy = "commit" | "leave";
 export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 
 export interface RuntimeOptions {
@@ -39,8 +40,14 @@ export interface RuntimeOptions {
 	maxAuthorityWakes?: number;
 	/** How many times a worker that stops without finish() is nudged before it is marked stopped. */
 	maxWorkerNudges?: number;
-	/** Commit whatever is uncommitted when the trial ends. */
-	finalCommit?: boolean;
+	/**
+	 * What the benchmark grades. "commit" (DeepSWE: the committed diff from the base): the authority commits and the
+	 * runtime commits anything left at the end. "leave" (SWE-bench Pro: the working tree): nobody commits, and if an
+	 * agent committed anyway the runtime moves HEAD back to the base, keeping every change in the working tree.
+	 */
+	commitPolicy?: CommitPolicy;
+	/** A wall-clock cap from the benchmark (its agent time limit less a margin for wrapping up); the tighter of this and the rulebook's applies. */
+	wallClockSec?: number;
 	now?: () => number;
 	log?: (line: string) => void;
 }
@@ -89,6 +96,9 @@ export interface Summary {
 	base_sha: string | null;
 	final_sha: string | null;
 	auto_committed: boolean;
+	commit_policy: CommitPolicy;
+	/** Under "leave": commits agents made that the runtime undid (their changes stay in the working tree). */
+	commits_undone: number;
 	cost_usd: number;
 	tokens: { input: number; output: number; cache_read: number; cache_write: number };
 	llm_calls: number;
@@ -134,13 +144,17 @@ export class ForumRuntime implements ForumHost {
 		this.o = {
 			maxAuthorityWakes: 60,
 			maxWorkerNudges: 2,
-			finalCommit: true,
+			commitPolicy: "commit",
+			wallClockSec: undefined as unknown as number,
 			...opts,
 			workDir: opts.workDir ?? join("/tmp", "decorum-work"),
 			now,
 			log: opts.log ?? ((line) => process.stdout.write(line + "\n")),
 		};
-		this.rulebook = opts.rulebook;
+		// The tighter of the rulebook's clock and the benchmark's is the one enforced, and the one agents are told.
+		const ruleWall = opts.rulebook.budget.wall_clock_sec;
+		const wall = opts.wallClockSec !== undefined ? (ruleWall === null ? opts.wallClockSec : Math.min(ruleWall, opts.wallClockSec)) : ruleWall;
+		this.rulebook = { ...opts.rulebook, budget: { ...opts.rulebook.budget, wall_clock_sec: wall } };
 		this.startedAtMs = now();
 		mkdirSync(opts.outDir, { recursive: true });
 		this.forum = new Forum({ logPath: join(opts.outDir, "forum.jsonl"), now: () => new Date(now()) });
@@ -171,7 +185,7 @@ export class ForumRuntime implements ForumHost {
 				thinking: this.o.authorityThinking,
 				appendPrompt:
 					this.o.mode === "forum"
-						? authoritySystemPrompt(this.rulebook, { repo: this.o.repo, workerModel: modelId(this.o.workerModel) })
+						? authoritySystemPrompt(this.rulebook, { repo: this.o.repo, workerModel: modelId(this.o.workerModel), commitPolicy: this.o.commitPolicy })
 						: "",
 				customTools: (h) => (this.o.mode === "forum" ? authorityTools(this, h) : []),
 			});
@@ -185,15 +199,21 @@ export class ForumRuntime implements ForumHost {
 		await this.stopAll(this.stopped ? this.stopReason : "The authority ended the trial.");
 		if (this.wallTimer) clearTimeout(this.wallTimer);
 		let autoCommitted = false;
-		if (this.o.finalCommit) {
-			// An agent's git command killed by a stop can leave index.lock behind; no agent is running now.
-			if (removeStaleIndexLock(this.o.repo)) this.log("removed a stale .git/index.lock left by a stopped command");
+		let commitsUndone = 0;
+		// An agent's git command killed by a stop can leave index.lock behind; no agent is running now.
+		if (removeStaleIndexLock(this.o.repo)) this.log("removed a stale .git/index.lock left by a stopped command");
+		if (this.o.commitPolicy === "commit") {
 			const c = commitAll(this.o.repo, "decorum: commit work left uncommitted at the end of the trial");
 			autoCommitted = c.committed;
 			if (!c.ok) this.errors.push(`final commit failed: ${c.output}`);
 			if (c.committed) this.log("committed the work left uncommitted at the end of the trial");
+		} else if (baseSha) {
+			const r = resetToBase(this.o.repo, baseSha);
+			commitsUndone = r.commitsUndone;
+			if (!r.ok) this.errors.push(`could not move HEAD back to the base: ${r.output}`);
+			if (r.commitsUndone) this.log(`agents made ${r.commitsUndone} commit(s); HEAD moved back to the base, every change kept in the working tree`);
 		}
-		const summary = this.summary({ startedIso, baseSha, endReason, autoCommitted });
+		const summary = this.summary({ startedIso, baseSha, endReason, autoCommitted, commitsUndone });
 		writeFileSync(join(this.o.outDir, "summary.json"), JSON.stringify(summary, null, 2) + "\n");
 		for (const a of this.agents.values()) a.session.dispose();
 		this.log(`done: end_reason=${endReason} cost=$${summary.cost_usd.toFixed(4)} agents=${summary.agents.length} threads=${summary.forum.threads} posts=${summary.forum.posts}`);
@@ -206,7 +226,16 @@ export class ForumRuntime implements ForumHost {
 			await this.runPrompt(m, prompt);
 			if (this.stopped) return this.stopped;
 			if (this.o.mode === "single") return "authority_done";
-			if (m.inbox.length === 0 && this.liveWorkers() === 0) return "authority_done";
+			if (m.inbox.length === 0 && this.liveWorkers() === 0) {
+				const d = checkFinishTrial(this.rulebook, this.state());
+				if (d.ok) return "authority_done";
+				if (this.authorityWakes >= this.o.maxAuthorityWakes) return "authority_wake_limit";
+				// it ended its turn with too small a team: send it back with the reason, and leave a row
+				this.forum.refusal(AUTHORITY, "end_turn", d.rule, d.reason);
+				this.authorityWakes++;
+				prompt = `[rulebook] ${d.reason}`;
+				continue;
+			}
 			if (this.authorityWakes >= this.o.maxAuthorityWakes) {
 				this.forum.note("runtime", `The authority was woken ${this.authorityWakes} times; the limit is ${this.o.maxAuthorityWakes}. Ending the trial.`);
 				return "authority_wake_limit";
@@ -416,7 +445,7 @@ export class ForumRuntime implements ForumHost {
 				branch,
 				model: this.o.workerModel,
 				thinking: this.o.workerThinking,
-				appendPrompt: workerSystemPrompt(this.rulebook, { name, cwd, branch, thread: this.forum.thread(threadId), assignment }),
+				appendPrompt: workerSystemPrompt(this.rulebook, { name, cwd, branch, thread: this.forum.thread(threadId), assignment, commitPolicy: this.o.commitPolicy }),
 				customTools: (h) => workerTools(this, h),
 			});
 			w.loop = this.workerLoop(w, workerFirstPrompt(assignment));
@@ -658,7 +687,7 @@ export class ForumRuntime implements ForumHost {
 		}
 	}
 
-	private summary(x: { startedIso: string; baseSha: string | null; endReason: string; autoCommitted: boolean }): Summary {
+	private summary(x: { startedIso: string; baseSha: string | null; endReason: string; autoCommitted: boolean; commitsUndone: number }): Summary {
 		const agents = [...this.agents.values()];
 		const sum = (f: (u: Usage) => number) => agents.reduce((s, a) => s + f(a.usage), 0);
 		const refusals = this.forum.events.flatMap((e) => (e.kind === "refusal" ? [{ agent: e.agent, tool: e.tool, rule: e.rule, reason: e.reason, at: e.at }] : []));
@@ -681,6 +710,8 @@ export class ForumRuntime implements ForumHost {
 			base_sha: x.baseSha,
 			final_sha: headSha(this.o.repo),
 			auto_committed: x.autoCommitted,
+			commit_policy: this.o.commitPolicy,
+			commits_undone: x.commitsUndone,
 			cost_usd: sum((u) => u.costUsd),
 			tokens: { input: sum((u) => u.input), output: sum((u) => u.output), cache_read: sum((u) => u.cacheRead), cache_write: sum((u) => u.cacheWrite) },
 			llm_calls: sum((u) => u.llmCalls),

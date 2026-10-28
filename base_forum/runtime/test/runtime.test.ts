@@ -7,6 +7,7 @@ import { test } from "node:test";
 import type { ForumEvent } from "../src/forum.ts";
 import { mentionsIn } from "../src/forum.ts";
 import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
+import { BASE_RULEBOOK } from "../src/rulebook.ts";
 import { call, gitOut, runTrial, say } from "./helpers.ts";
 
 const events = (outDir: string): ForumEvent[] =>
@@ -440,4 +441,105 @@ test("under authority: player, and in single mode, the authority edits files its
 		assert.equal(summary.refusals.length, 0, JSON.stringify(opts));
 		assert.ok(existsSync(join(repo, "a.txt")));
 	}
+});
+
+// ---- benchmarks that grade the working tree (SWE-bench Pro), the benchmark's clock, the 6-worker cap ----
+
+test("commit policy leave: nothing is committed, and an agent's stray commit is undone with its changes kept", async () => {
+	const { summary, repo } = await runTrial(
+		{
+			authority: ({ step, seen }) => {
+				assert.match(String(seen), /Do the task/);
+				if (step === 0) return call("open_thread", { title: "t", goal: "g" });
+				if (step === 1) return call("assign_workers", { thread: "T1", workers: [{ name: "w1", persona: "p", instructions: "i" }] });
+				if (!seen.includes("w1 finished")) return call("wait", { timeout_sec: 30 });
+				return say("done");
+			},
+			w1: ({ step, ctx }) => {
+				assert.match(String(ctx.systemPrompt), /Nobody commits: the grader reads the working tree/);
+				if (step === 0) return call("write", { path: "a.txt", content: "a\n" });
+				if (step === 1) return call("bash", { command: "git add -A && git -c user.name=x -c user.email=x@x commit -qm stray" });
+				if (step === 2) return call("write", { path: "b.txt", content: "b\n" });
+				if (step === 3) return call("finish", { summary: "a and b" });
+				return say("ok");
+			},
+		},
+		{ extra: { commitPolicy: "leave" } },
+	);
+	assert.equal(summary.commit_policy, "leave");
+	assert.equal(summary.auto_committed, false);
+	assert.equal(summary.commits_undone, 1);
+	assert.equal(summary.final_sha, summary.base_sha, "HEAD is back at the base");
+	const status = gitOut(repo, "status", "--porcelain").split("\n").sort();
+	assert.deepEqual(status, ["?? a.txt", "?? b.txt"], "both changes are in the working tree, uncommitted");
+});
+
+test("the authority prompt under commit policy leave says to hand over uncommitted work", () => {
+	return import("../src/prompts.ts").then(({ authoritySystemPrompt }) => {
+		const p = authoritySystemPrompt(BASE_RULEBOOK, { repo: "/app", workerModel: "m", commitPolicy: "leave" });
+		assert.match(p, /leave all changes in the working tree, uncommitted \(the grader reads the working tree\)/);
+		assert.match(p, /Nobody commits/);
+		assert.doesNotMatch(p, /commit on the task's branch/);
+	});
+});
+
+test("a benchmark clock tighter than the rulebook's is enforced, and is the one agents are told", async () => {
+	const { summary } = await runTrial(
+		{
+			authority: ({ step, ctx }) => {
+				if (step === 0) assert.match(String(ctx.systemPrompt), /0 minutes of wall clock/);
+				return step === 0 ? call("bash", { command: "sleep 30" }) : say("late");
+			},
+		},
+		{ extra: { wallClockSec: 1 } },
+	);
+	assert.equal(summary.end_reason, "budget.wall_clock_sec");
+	assert.equal(summary.rulebook.budget.wall_clock_sec, 1);
+});
+
+test("base-0 starts at most 6 workers in a trial", async () => {
+	const many = (n: number) => Array.from({ length: n }, () => ({ persona: "p", instructions: "i" }));
+	const { summary } = await runTrial(
+		{
+			authority: ({ step, seen }) => {
+				if (step === 0) return call("open_thread", { title: "t", goal: "g" });
+				if (step === 1) return call("assign_workers", { thread: "T1", workers: many(4) });
+				if (step === 2) return call("wait", { timeout_sec: 30 });
+				if (!seen.includes("Refused by the rulebook (budget.max_workers_total)")) return call("assign_workers", { thread: "T1", workers: many(3) });
+				if (!seen.includes("Started w5, w6")) return call("assign_workers", { thread: "T1", workers: many(2) });
+				if (!(seen.match(/finished its assignment/g)?.length === 6)) return call("wait", { timeout_sec: 30 });
+				return say("done");
+			},
+			"*": ({ step }) => (step === 0 ? call("finish", { summary: "ok" }) : say("ok")),
+		},
+	);
+	assert.equal(summary.rulebook.budget.max_workers_total, 6);
+	assert.equal(summary.agents.filter((a) => a.role === "worker").length, 6);
+	assert.deepEqual(summary.refusals.map((r) => r.rule), ["budget.max_workers_total"]);
+});
+
+test("base-0's minimum team: an authority that tries to finish with fewer than 3 workers is sent back with the reason", async () => {
+	const { summary } = await runTrial(
+		{
+			authority: ({ step, seen }) => {
+				if (step === 0) return say("I can do this alone. Done.");
+				assert.match(seen, /\[rulebook\] Under this rulebook the task is done by a team of at least 3 workers, and you have started 0/);
+				if (step === 1) return call("open_thread", { title: "t", goal: "g" });
+				if (step === 2) return call("assign_workers", { thread: "T1", workers: [1, 2, 3].map(() => ({ persona: "p", instructions: "i" })) });
+				if ((seen.match(/finished its assignment/g)?.length ?? 0) < 3) return call("wait", { timeout_sec: 30 });
+				return say("done");
+			},
+			"*": ({ step }) => (step === 0 ? call("finish", { summary: "ok" }) : say("ok")),
+		},
+		{ rulebook: { budget: { min_workers_total: 3 } } },
+	);
+	assert.equal(summary.end_reason, "authority_done");
+	assert.equal(summary.agents.filter((a) => a.role === "worker").length, 3);
+	assert.deepEqual(summary.refusals.map((r) => [r.agent, r.tool, r.rule]), [["authority", "end_turn", "budget.min_workers_total"]]);
+});
+
+test("an authority that never builds the team is stopped by the wake limit, not looped forever", async () => {
+	const { summary } = await runTrial({ authority: () => say("No.") }, { rulebook: { budget: { min_workers_total: 3 } }, extra: { maxAuthorityWakes: 3 } });
+	assert.equal(summary.end_reason, "authority_wake_limit");
+	assert.equal(summary.refusals.length, 3);
 });

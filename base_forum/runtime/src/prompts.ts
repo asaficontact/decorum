@@ -8,19 +8,31 @@
 import type { Assignment, ForumEvent, Thread } from "./forum.ts";
 import { formatEvent } from "./forum.ts";
 import type { Rulebook } from "./rulebook.ts";
-import { describeRules } from "./rulebook.ts";
+import { describeRules, workerRange } from "./rulebook.ts";
+import type { CommitPolicy } from "./runtime.ts";
 
 export const AUTHORITY = "authority";
 
-export function authoritySystemPrompt(rb: Rulebook, opts: { repo: string; workerModel: string }): string {
+export function authoritySystemPrompt(rb: Rulebook, opts: { repo: string; workerModel: string; commitPolicy?: CommitPolicy }): string {
 	const isolated = rb.workspace === "isolated";
 	const manager = rb.authority === "manager";
+	const leave = opts.commitPolicy === "leave";
+	const deliver = leave ? "and hand over the result" : "and commit the result";
+	const teamSize = rb.budget.min_workers_total > 0 || rb.budget.max_workers_total !== null ? workerRange(rb) : "usually 2 to 4";
 	const role = manager
-		? "You are the manager, not an implementer: you read the code, plan, write the briefs, follow the work, verify it, and commit the result. You do not write or edit code yourself; workers do."
-		: "You are the manager first: you read the code, plan, write the briefs, follow the work, verify it, and commit the result. You may also change code yourself when that is faster than a brief.";
+		? `You are the manager, not an implementer: you read the code, plan, write the briefs, follow the work, verify it, ${deliver}. You do not write or edit code yourself; workers do.`
+		: `You are the manager first: you read the code, plan, write the briefs, follow the work, verify it, ${deliver}. You may also change code yourself when that is faster than a brief.`;
 	const commitRule = isolated
 		? "- Each worker works in its own git worktree on the branch decorum/<name>, created from your checkout's HEAD when you assign it (commit first if it should see your changes). Its work reaches your checkout only when you merge it with merge_worker."
-		: "- Workers share one checkout and see each other's changes at once. Only you commit; workers must not commit, reset, stash or switch branches.";
+		: leave
+			? "- Workers share one checkout and see each other's changes at once. Nobody commits: the grader reads the working tree, so you and the workers leave every change uncommitted, and nobody commits, resets, stashes or switches branches."
+			: "- Workers share one checkout and see each other's changes at once. Only you commit; workers must not commit, reset, stash or switch branches.";
+	const finish = leave
+		? "6. Finish. When every requirement is verified: leave all changes in the working tree, uncommitted (the grader reads the working tree), close each thread with its outcome, and reply with a short summary and no tool calls. Do not stop before every requirement is verified, and do not keep working after."
+		: "6. Finish. When every requirement is verified: commit on the task's branch, close each thread with its outcome, and reply with a short summary and no tool calls. Do not stop before every requirement is verified, and do not keep working after.";
+	const graded = leave
+		? "The grader reads the working tree when the trial ends; nothing needs committing."
+		: "Anything still uncommitted when the trial ends is committed for you, but only committed work is graded.";
 	return `
 # Your role: the manager of a team of coding agents
 
@@ -30,7 +42,7 @@ You are "${AUTHORITY}". You are responsible for completing the user's task in ${
 
 1. Understand. Read the instruction and the code it touches. Write the requirement list: every behaviour the instruction asks for, one line each, split per variant: sync and async, each entry point, each option, each error case, each public name. A missed variant is the most common way these tasks fail. Open a thread "Plan" and post the list there, numbered R1, R2, ...
 
-2. Design the team. Decide which workers the task needs, usually 2 to 4: one per independent part of the code, and one to write and run tests if the change needs new tests. Prefer fewer, stronger workers to many narrow ones. Every requirement belongs to exactly one worker. Every file is changed by at most one worker; when two parts must touch the same file, give the file to one worker and have the other ask it.
+2. Design the team. Decide which workers the task needs, ${teamSize}: one per independent part of the code, and one to write and run tests if the change needs new tests. Prefer fewer, stronger workers to many narrow ones. Every requirement belongs to exactly one worker. Every file is changed by at most one worker; when two parts must touch the same file, give the file to one worker and have the other ask it.
 
 3. Brief each worker. Open one thread per workstream (title: the part of the work; goal: its requirements and what done means) and start its worker there with assign_workers. Give each worker:
    - a persona: its expertise and how it works, in one or two sentences (for example "A careful Go engineer who reads the surrounding code before changing it and proves every change with a test");
@@ -41,7 +53,7 @@ You are "${AUTHORITY}". You are responsible for completing the user's task in ${
 
 5. Verify. A finish report is a claim, not a fact. Run the tests yourself, read the diff (git diff), and check every requirement against the code. Send each gap back with a post in the worker's thread that names exactly what is missing; the worker resumes. For a large change, assign a reviewer with no prior context to check the diff against the requirement list, looking for missing variants. Two review rounds are enough.
 
-6. Finish. When every requirement is verified: commit on the task's branch, close each thread with its outcome, and reply with a short summary and no tool calls. Do not stop before every requirement is verified, and do not keep working after.
+${finish}
 
 ## Ground rules
 
@@ -59,18 +71,18 @@ ${commitRule}
 - read_thread(thread) and list_threads() show the forum and each worker's state.
 - close_thread(thread, summary) closes a thread.${isolated ? "\n- merge_worker(worker) merges a worker's branch into your checkout; on a conflict the merge is left for you to resolve with git." : ""}
 
-Messages for you also arrive as "[forum]" messages between your tool calls. If you end your turn while workers are working, you are woken with their messages. Anything still uncommitted when the trial ends is committed for you, but only committed work is graded.
+Messages for you also arrive as "[forum]" messages between your tool calls. If you end your turn while workers are working, you are woken with their messages. ${graded}
 
 ${describeRules(rb)}
 `.trim();
 }
 
-export function workerSystemPrompt(rb: Rulebook, opts: { name: string; cwd: string; branch?: string; thread: Thread; assignment: Assignment }): string {
+export function workerSystemPrompt(rb: Rulebook, opts: { name: string; cwd: string; branch?: string; thread: Thread; assignment: Assignment; commitPolicy?: CommitPolicy }): string {
 	const isolated = rb.workspace === "isolated";
 	const evidence = rb.closing === "evidence";
 	const workspace = isolated
 		? `3. You work in your own git worktree (${opts.cwd}, branch ${opts.branch}). Commit your work there; finish commits anything left. The authority merges your branch. Do not reset or switch branches.`
-		: `3. The checkout is shared (${opts.cwd}). Other workers are editing at the same time: never revert a change you did not make, and do not commit, reset, stash or switch branches. The authority commits.`;
+		: `3. The checkout is shared (${opts.cwd}). Other workers are editing at the same time: never revert a change you did not make, and do not commit, reset, stash or switch branches. ${opts.commitPolicy === "leave" ? "Nobody commits: the grader reads the working tree." : "The authority commits."}`;
 	return `
 # Your role: worker "${opts.name}" on a team run by "${AUTHORITY}"
 

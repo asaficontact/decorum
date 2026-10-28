@@ -18,6 +18,8 @@ export interface Budget {
 	max_live_workers: number;
 	/** Workers started over the whole trial. null = no cap. */
 	max_workers_total: number | null;
+	/** Workers the authority must have started before it may end the trial (forum mode). 0 = none required. */
+	min_workers_total: number;
 	/** Seconds from start to forced finish. null = no cap. */
 	wall_clock_sec: number | null;
 }
@@ -56,7 +58,7 @@ export const BASE_RULEBOOK: Rulebook = {
 	workspace: "shared",
 	closing: "self",
 	authority: "manager",
-	budget: { usd_per_trial: 10, max_live_workers: 4, max_workers_total: null, wall_clock_sec: 9000 },
+	budget: { usd_per_trial: 10, max_live_workers: 4, max_workers_total: 6, min_workers_total: 3, wall_clock_sec: 9000 },
 	norms: "",
 };
 
@@ -92,7 +94,7 @@ export function parseRulebook(text: string, source = "rulebook"): Rulebook {
 		throw new RulebookError(`${source}: budget must be a mapping`);
 	}
 	const b = budgetRaw as Record<string, unknown>;
-	const budgetKeys = new Set(["usd_per_trial", "max_live_workers", "max_workers_total", "wall_clock_sec"]);
+	const budgetKeys = new Set(["usd_per_trial", "max_live_workers", "max_workers_total", "min_workers_total", "wall_clock_sec"]);
 	for (const key of Object.keys(b)) {
 		if (!budgetKeys.has(key)) throw new RulebookError(`${source}: unknown budget key "${key}" (known: ${[...budgetKeys].join(", ")})`);
 	}
@@ -100,6 +102,10 @@ export function parseRulebook(text: string, source = "rulebook"): Rulebook {
 	const pick = (key: string, fallback: unknown) => (key in b ? b[key] : fallback);
 	const maxLive = numberOrNull("max_live_workers", pick("max_live_workers", base.budget.max_live_workers), source, { min: 0, integer: true });
 	if (maxLive === null) throw new RulebookError(`${source}: budget.max_live_workers cannot be null`);
+	const maxTotal = numberOrNull("max_workers_total", pick("max_workers_total", base.budget.max_workers_total), source, { min: 0, integer: true });
+	const minTotal = numberOrNull("min_workers_total", pick("min_workers_total", base.budget.min_workers_total), source, { min: 0, integer: true });
+	if (minTotal === null) throw new RulebookError(`${source}: budget.min_workers_total cannot be null (use 0 for none)`);
+	if (maxTotal !== null && minTotal > maxTotal) throw new RulebookError(`${source}: budget.min_workers_total (${minTotal}) is more than budget.max_workers_total (${maxTotal})`);
 	const str = (key: string, fallback: string) => {
 		const v = key in data ? data[key] : fallback;
 		if (typeof v !== "string") throw new RulebookError(`${source}: ${key} must be a string`);
@@ -116,11 +122,21 @@ export function parseRulebook(text: string, source = "rulebook"): Rulebook {
 		budget: {
 			usd_per_trial: numberOrNull("usd_per_trial", pick("usd_per_trial", base.budget.usd_per_trial), source, { min: 0, integer: false }),
 			max_live_workers: maxLive,
-			max_workers_total: numberOrNull("max_workers_total", pick("max_workers_total", base.budget.max_workers_total), source, { min: 0, integer: true }),
+			max_workers_total: maxTotal,
+			min_workers_total: minTotal,
 			wall_clock_sec: numberOrNull("wall_clock_sec", pick("wall_clock_sec", base.budget.wall_clock_sec), source, { min: 1, integer: false }),
 		},
 		norms: str("norms", base.norms),
 	};
+}
+
+/** "between 3 and 6 workers in the trial", "at least 3 workers", "at most 6 workers", or "any number of workers". */
+export function workerRange(rb: Rulebook): string {
+	const { min_workers_total: min, max_workers_total: max } = rb.budget;
+	if (min > 0 && max !== null) return min === max ? `exactly ${min} workers in the trial` : `between ${min} and ${max} workers in the trial`;
+	if (min > 0) return `at least ${min} workers in the trial`;
+	if (max !== null) return `at most ${max} workers in the trial`;
+	return "any number of workers";
 }
 
 export function loadRulebook(path: string): Rulebook {
@@ -142,7 +158,7 @@ export function describeRules(rb: Rulebook): string {
 		rb.closing === "self"
 			? "- Closing: a worker finishes its own assignment with a summary."
 			: "- Closing: a worker finishes only with evidence: the commands it ran to check the work and what they printed.",
-		`- Budget: ${rb.budget.usd_per_trial === null ? "no dollar cap" : `$${rb.budget.usd_per_trial} for the whole trial, all agents together`}; at most ${rb.budget.max_live_workers} workers at a time${rb.budget.max_workers_total === null ? "" : `, ${rb.budget.max_workers_total} in total`}; ${rb.budget.wall_clock_sec === null ? "no time limit" : `${Math.round(rb.budget.wall_clock_sec / 60)} minutes of wall clock`}. When the budget runs out every agent is stopped and whatever is committed is graded.`,
+		`- Budget: ${rb.budget.usd_per_trial === null ? "no dollar cap" : `$${rb.budget.usd_per_trial} for the whole trial, all agents together`}; ${workerRange(rb)}, at most ${rb.budget.max_live_workers} at a time; ${rb.budget.wall_clock_sec === null ? "no time limit" : `${Math.round(rb.budget.wall_clock_sec / 60)} minutes of wall clock`}. When the budget runs out every agent is stopped and whatever is committed is graded.`,
 	];
 	if (rb.norms.trim()) lines.push(`Norms (not enforced, but expected):\n${rb.norms.trim()}`);
 	return lines.join("\n");

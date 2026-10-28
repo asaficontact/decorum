@@ -53,11 +53,12 @@ function smoke(ctx: Context) {
 					workers: [
 						{ name: "w1", persona: "A careful writer.", instructions: "Write DECORUM_SMOKE_w1.md, post in T1, then finish." },
 						{ name: "w2", persona: "A terse writer.", instructions: "Write DECORUM_SMOKE_w2.md, post in T1, then finish." },
+						{ name: "w3", persona: "A quiet writer.", instructions: "Write DECORUM_SMOKE_w3.md, post in T1, then finish." },
 					],
 				}),
 				{ stopReason: "toolUse" },
 			);
-		const bothDone = seen.includes("w1 finished its assignment") && seen.includes("w2 finished its assignment");
+		const bothDone = ["w1", "w2", "w3"].every((w) => seen.includes(`${w} finished its assignment`));
 		if (!bothDone) return fauxAssistantMessage(fauxToolCall("wait", { timeout_sec: 60 }), { stopReason: "toolUse" });
 		if (!seen.includes("authority: smoke")) {
 			return fauxAssistantMessage(fauxToolCall("bash", { command: "git add -A && git commit -qm 'authority: smoke' && git log --oneline -1" }), { stopReason: "toolUse" });

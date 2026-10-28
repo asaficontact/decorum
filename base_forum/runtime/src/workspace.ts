@@ -118,6 +118,15 @@ export function createIsolatedWorkspace(repo: string, baseDir: string, worker: s
 	return { dir, branch, linked };
 }
 
+/** Move HEAD back to the base commit, keeping every change in the working tree (git reset --mixed). */
+export function resetToBase(repo: string, base: string): GitResult & { commitsUndone: number } {
+	const count = git(repo, ["rev-list", "--count", `${base}..HEAD`]);
+	const n = count.ok ? Number(count.output) || 0 : 0;
+	if (n === 0) return { ok: true, output: "HEAD is the base", commitsUndone: 0 };
+	const r = git(repo, ["reset", "--mixed", "-q", base]);
+	return { ...r, commitsUndone: r.ok ? n : 0 };
+}
+
 /** Merge a worker's branch into the checkout's current branch. A conflict is left for the caller to resolve. */
 export function mergeBranch(repo: string, branch: string): GitResult {
 	return git(repo, ["merge", "--no-edit", branch]);

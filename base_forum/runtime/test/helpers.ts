@@ -82,7 +82,8 @@ export async function runTrial(
 	const { rt, authority, worker, calls } = await scriptedRuntime(policies, opts.cost);
 	const repo = opts.repo ?? gitRepo();
 	const outDir = tempDir("decorum-out-");
-	const rulebook: Rulebook = { ...BASE_RULEBOOK, ...opts.rulebook, budget: { ...BASE_RULEBOOK.budget, ...opts.rulebook?.budget } };
+	// Tests of other behaviour run without base-0's minimum team (3 workers); the minimum has its own tests.
+	const rulebook: Rulebook = { ...BASE_RULEBOOK, ...opts.rulebook, budget: { ...BASE_RULEBOOK.budget, min_workers_total: 0, ...opts.rulebook?.budget } };
 	const runtime = new ForumRuntime({
 		instruction: "Do the task.",
 		repo,

@@ -33,6 +33,12 @@ test("an unknown model, a bad rulebook and a missing flag exit 2 with the reason
 	const noRepo = cli(["run", "--instruction", "x", "--out", tempDir()]);
 	assert.equal(noRepo.code, 2);
 	assert.match(noRepo.err, /--repo is required/);
+	const badPolicy = cli([...base, "--faux", "smoke", "--commit-policy", "squash"]);
+	assert.equal(badPolicy.code, 2);
+	assert.match(badPolicy.err, /--commit-policy must be commit or leave/);
+	const badClock = cli([...base, "--faux", "smoke", "--wall-clock-sec", "0"]);
+	assert.equal(badClock.code, 2);
+	assert.match(badClock.err, /--wall-clock-sec must be a positive number/);
 	const noWorker = cli([...base, "--authority-model", "moonshotai/kimi-k3"], { MOONSHOT_API_KEY: "sk-test" });
 	assert.equal(noWorker.code, 2);
 	assert.match(noWorker.err, /--worker-model is required in forum mode/);
@@ -46,6 +52,6 @@ test("--faux smoke runs a whole forum trial from the command line and writes the
 	for (const f of ["forum.jsonl", "summary.json", "runtime.log"]) assert.ok(existsSync(join(out, f)), f);
 	const s = JSON.parse(readFileSync(join(out, "summary.json"), "utf8"));
 	assert.equal(s.end_reason, "authority_done");
-	assert.equal(s.agents.length, 3);
+	assert.equal(s.agents.length, 4);
 	assert.match(gitOut(repo, "ls-files"), /DECORUM_SMOKE_w1.md/);
 });

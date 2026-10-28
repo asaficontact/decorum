@@ -55,6 +55,13 @@ export function checkAuthorityTool(rb: Rulebook, tool: string): Decision {
 	return OK;
 }
 
+/** Budget: may the authority end the trial yet? Not before it has started min_workers_total workers. */
+export function checkFinishTrial(rb: Rulebook, s: TrialState): Decision {
+	const min = rb.budget.min_workers_total;
+	if (s.totalWorkers >= min) return OK;
+	return { ok: false, rule: "budget.min_workers_total", reason: `Under this rulebook the task is done by a team of at least ${min} workers, and you have started ${s.totalWorkers}. Design the team, open threads, assign the workers, and finish only when their work is verified.`, terminate: false };
+}
+
 /** Visibility: may this agent read this thread? The authority owns every thread, so it always may. */
 export function checkRead(rb: Rulebook, agent: string, participants: readonly string[]): Decision {
 	if (rb.visibility === "all" || participants.includes(agent)) return OK;

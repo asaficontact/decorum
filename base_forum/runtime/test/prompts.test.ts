@@ -13,7 +13,7 @@ test("the authority prompt makes it the manager and carries the whole procedure"
 		"You do not write or edit code yourself; workers do.",
 		"Workers run on moonshotai/kimi-k2.7-code",
 		'Open a thread "Plan" and post the list there, numbered R1, R2',
-		"usually 2 to 4",
+		"Decide which workers the task needs, between 3 and 6 workers in the trial:",
 		"Every file is changed by at most one worker",
 		"a persona: its expertise and how it works",
 		"the exact commands that verify its work",

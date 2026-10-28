@@ -29,6 +29,7 @@ test("an unknown rule, an unknown value or a bad number is refused, naming it", 
 	assert.throws(() => parseRulebook("budget:\n  max_live_workers: 1.5\n"), /max_live_workers must be an integer/);
 	assert.throws(() => parseRulebook("budget:\n  max_live_workers: null\n"), /cannot be null/);
 	assert.throws(() => parseRulebook("budget:\n  tokens: 5\n"), /unknown budget key "tokens"/);
+	assert.throws(() => parseRulebook("budget:\n  min_workers_total: 7\n  max_workers_total: 6\n"), /min_workers_total \(7\) is more than budget.max_workers_total \(6\)/);
 	assert.throws(() => parseRulebook("- a\n- b\n"), /must be a YAML mapping/);
 });
 
@@ -74,7 +75,7 @@ test("visibility, posting and closing follow their values", () => {
 test("describeRules says what is enforced, and the norms when there are any", () => {
 	const text = describeRules(parseRulebook('norms: "Prefer small diffs."\n'));
 	assert.match(text, /\$10 for the whole trial/);
-	assert.match(text, /at most 4 workers at a time/);
+	assert.match(text, /between 3 and 6 workers in the trial, at most 4 at a time/);
 	assert.match(text, /Norms \(not enforced/);
 	assert.doesNotMatch(describeRules(BASE_RULEBOOK), /Norms/);
 });

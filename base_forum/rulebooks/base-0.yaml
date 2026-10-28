@@ -15,7 +15,8 @@ authority: manager       # manager | player   — manager: the authority's write
 budget:
   usd_per_trial: 10      # dollars for the whole trial, all agents; null = no cap
   max_live_workers: 4    # workers working at the same time
-  max_workers_total: null # workers started over the trial; null = no cap
+  max_workers_total: 6   # workers started over the trial (Tawab, 2026-10-27); null = no cap
+  min_workers_total: 3   # workers the authority must start before it may finish (Tawab, 2026-10-27); 0 = none
   wall_clock_sec: 9000   # the DeepSWE leaderboard's 2.5 h; null = no cap
 
 norms: ""                # prompt-only text every agent reads; enforced by nothing
