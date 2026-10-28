@@ -42,7 +42,9 @@ from pathlib import Path
 BASE = Path(__file__).resolve().parents[1]
 ATTEMPTS = ".attempts"
 LOCK = "retry.lock"
-STALE_SEC = 600  # a job with no file written for this long is not running (as in the viewer)
+STALE_SEC = (
+    600  # a job with no file written for this long is not running (as in the viewer)
+)
 KEYS = {  # provider prefix of a model -> the key it needs (as in run_baseline.sh)
     "moonshotai": "MOONSHOT_API_KEY",
     "moonshotai-cn": "MOONSHOT_API_KEY",
@@ -90,7 +92,11 @@ def planned_tasks(config: dict) -> list[str]:
     names: list[str] = []
     for ds in config.get("datasets") or []:
         names += [str(n).split("/")[-1] for n in ds.get("task_names") or []]
-    names += [Path(str(t.get("path"))).name for t in config.get("tasks") or [] if t.get("path")]
+    names += [
+        Path(str(t.get("path"))).name
+        for t in config.get("tasks") or []
+        if t.get("path")
+    ]
     return names * max(1, int(config.get("n_attempts") or 1))
 
 
@@ -137,16 +143,23 @@ def is_running(job: Path, now: float | None = None) -> bool:
         return now - last_write(job) < STALE_SEC
     # Finished once. A resume started by hand keeps the old finished_at while it runs: look for a trial still being
     # written that has no result yet.
-    for trial in job.iterdir():
-        if trial.is_dir() and trial.name != ATTEMPTS and (trial / "config.json").exists() and not (trial / "result.json").exists():
-            if now - last_write_of(trial) < STALE_SEC:
-                return True
-    return False
+    return any(
+        trial.is_dir()
+        and trial.name != ATTEMPTS
+        and (trial / "config.json").exists()
+        and not (trial / "result.json").exists()
+        and now - last_write_of(trial) < STALE_SEC
+        for trial in job.iterdir()
+    )
 
 
 def last_write_of(trial: Path) -> float:
     times = [trial.stat().st_mtime]
-    for p in (trial / "trial.log", trial / "agent" / "decorum" / "forum.jsonl", trial / "agent"):
+    for p in (
+        trial / "trial.log",
+        trial / "agent" / "decorum" / "forum.jsonl",
+        trial / "agent",
+    ):
         try:
             times.append(p.stat().st_mtime)
         except OSError:
@@ -158,13 +171,27 @@ def classify(job: Path) -> list[dict]:
     """Every task of the job with its state: graded, failed, interrupted or not started (one row per planned attempt)."""
     config = read_json(job / "config.json")
     if config is None:
-        raise SystemExit(f"retry_failed: {job} has no config.json; is it a Pier job folder?")
+        raise SystemExit(
+            f"retry_failed: {job} has no config.json; is it a Pier job folder?"
+        )
     rows: list[dict] = []
-    for trial in sorted(p for p in job.iterdir() if p.is_dir() and p.name != ATTEMPTS and (p / "config.json").exists()):
+    for trial in sorted(
+        p
+        for p in job.iterdir()
+        if p.is_dir() and p.name != ATTEMPTS and (p / "config.json").exists()
+    ):
         result = read_json(trial / "result.json")
         task = task_of(trial)
         if result is None:
-            rows.append({"task": task, "trial": trial.name, "state": "interrupted", "reason": "no result.json: the trial was stopped before it finished", "reward": None})
+            rows.append(
+                {
+                    "task": task,
+                    "trial": trial.name,
+                    "state": "interrupted",
+                    "reason": "no result.json: the trial was stopped before it finished",
+                    "reward": None,
+                }
+            )
             continue
         exc = result.get("exception_info") or None
         reward = reward_of(trial, result)
@@ -173,9 +200,28 @@ def classify(job: Path) -> list[dict]:
         if exc and not regraded and not (reward is not None and reward >= 1):
             msg = " ".join(str(exc.get("exception_message") or "").split())[:300]
             state = "failed" if reward is None else "graded, with an error"
-            rows.append({"task": task, "trial": trial.name, "state": state, "reason": f"{exc.get('exception_type') or 'error'}: {msg}".rstrip(": "), "exception_type": exc.get("exception_type"), "reward": reward})
+            rows.append(
+                {
+                    "task": task,
+                    "trial": trial.name,
+                    "state": state,
+                    "reason": f"{exc.get('exception_type') or 'error'}: {msg}".rstrip(
+                        ": "
+                    ),
+                    "exception_type": exc.get("exception_type"),
+                    "reward": reward,
+                }
+            )
         else:
-            rows.append({"task": task, "trial": trial.name, "state": "graded", "reason": "", "reward": reward})
+            rows.append(
+                {
+                    "task": task,
+                    "trial": trial.name,
+                    "state": "graded",
+                    "reason": "",
+                    "reward": reward,
+                }
+            )
     have: dict[str, int] = {}
     for r in rows:
         have[r["task"]] = have.get(r["task"], 0) + 1
@@ -183,7 +229,15 @@ def classify(job: Path) -> list[dict]:
         if have.get(task, 0) > 0:
             have[task] -= 1
         else:
-            rows.append({"task": task, "trial": None, "state": "not started", "reason": "planned, but no trial folder", "reward": None})
+            rows.append(
+                {
+                    "task": task,
+                    "trial": None,
+                    "state": "not started",
+                    "reason": "planned, but no trial folder",
+                    "reward": None,
+                }
+            )
     return rows
 
 
@@ -193,18 +247,29 @@ ALWAYS = ("interrupted", "not started")  # Pier runs these on any resume
 
 def retryable(rows: list[dict], graded_errors: bool = False) -> list[dict]:
     """The attempts a retry runs again by default (and, with graded_errors, the ones graded after an error)."""
-    return [r for r in rows if r["state"] in RETRIED or (graded_errors and r["state"] == "graded, with an error")]
+    return [
+        r
+        for r in rows
+        if r["state"] in RETRIED
+        or (graded_errors and r["state"] == "graded, with an error")
+    ]
 
 
-def pick(rows: list[dict], tasks: list[str], graded_errors: bool = False) -> tuple[list[dict], list[str]]:
+def pick(
+    rows: list[dict], tasks: list[str], graded_errors: bool = False
+) -> tuple[list[dict], list[str]]:
     """What a retry of `tasks` (all when empty) runs, and why it refuses (unknown or graded task ids)."""
     if not tasks:
         return retryable(rows, graded_errors), []
     known = {r["task"] for r in rows}
     ok = {r["task"] for r in retryable(rows, graded_errors=True)}
     errors = [f"not in this job: {t}" for t in tasks if t not in known]
-    errors += [f"already graded, not retried: {t}" for t in tasks if t in known and t not in ok]
-    picked = [r for r in rows if r["task"] in tasks and r["task"] in ok]
+    errors += [
+        f"already graded, not retried: {t}" for t in tasks if t in known and t not in ok
+    ]
+    # only the named task's attempts that have no result (or a graded error): with n_attempts > 1 a task can also
+    # have an attempt that was graded, and that one stays
+    picked = [r for r in retryable(rows, graded_errors=True) if r["task"] in tasks]
     picked += [r for r in rows if r["state"] in ALWAYS and r not in picked]
     return picked, errors
 
@@ -215,13 +280,17 @@ def run_dir(job: Path, config: dict) -> Path:
     name = str(config.get("job_name") or job.name)
     if jobs_dir.is_absolute():
         if (jobs_dir / name).resolve() != job.resolve():
-            raise SystemExit(f"retry_failed: the job's config says it lives in {jobs_dir / name}, not {job}; move it back or run Pier by hand")
+            raise SystemExit(
+                f"retry_failed: the job's config says it lives in {jobs_dir / name}, not {job}; move it back or run Pier by hand"
+            )
         return job.parent
     base = job.resolve()
     for _ in range(len(Path(name).parts) + len(jobs_dir.parts)):
         base = base.parent
     if (base / jobs_dir / name).resolve() != job.resolve():
-        raise SystemExit(f"retry_failed: cannot place {jobs_dir / name} relative to {job}")
+        raise SystemExit(
+            f"retry_failed: cannot place {jobs_dir / name} relative to {job}"
+        )
     return base
 
 
@@ -237,7 +306,9 @@ def read_env_file(path: Path) -> dict[str, str]:
         k, v = s.split("=", 1)
         k, v = k.strip(), v.strip()
         if v[:1] in ("'", '"') and v[0] in v[1:]:
-            v = v[1 : v.index(v[0], 1)]  # a quoted value ends at its closing quote; a comment may follow
+            v = v[
+                1 : v.index(v[0], 1)
+            ]  # a quoted value ends at its closing quote; a comment may follow
         elif " #" in v:
             v = v.split(" #", 1)[0].rstrip()
         if k:
@@ -251,7 +322,13 @@ def needed_keys(config: dict) -> list[str]:
     if kw.get("faux"):
         return []
     models = [agent.get("model_name"), kw.get("worker_model")]
-    return sorted({KEYS[m.split("/")[0]] for m in models if isinstance(m, str) and m.split("/")[0] in KEYS})
+    return sorted(
+        {
+            KEYS[m.split("/")[0]]
+            for m in models
+            if isinstance(m, str) and m.split("/")[0] in KEYS
+        }
+    )
 
 
 def take_lock(job: Path, tasks: list[str]) -> bool:
@@ -268,7 +345,17 @@ def take_lock(job: Path, tasks: list[str]) -> bool:
             lock.unlink(missing_ok=True)  # its process is gone
             continue
         with os.fdopen(fd, "w") as f:
-            f.write(json.dumps({"pid": os.getpid(), "started_at": datetime.now(timezone.utc).isoformat(timespec="seconds"), "tasks": tasks}))
+            f.write(
+                json.dumps(
+                    {
+                        "pid": os.getpid(),
+                        "started_at": datetime.now(timezone.utc).isoformat(
+                            timespec="seconds"
+                        ),
+                        "tasks": tasks,
+                    }
+                )
+            )
         return True
     return False
 
@@ -280,7 +367,14 @@ def archive(job: Path, picked: list[dict]) -> list[dict]:
     rows = []
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
     for r in picked:
-        row = {"at": now, "task": r["task"], "state": r["state"], "reason": r["reason"], "trial": r["trial"], "moved_to": None}
+        row = {
+            "at": now,
+            "task": r["task"],
+            "state": r["state"],
+            "reason": r["reason"],
+            "trial": r["trial"],
+            "moved_to": None,
+        }
         if r["trial"]:
             dest = att / r["trial"]
             n = 2
@@ -297,14 +391,41 @@ def archive(job: Path, picked: list[dict]) -> list[dict]:
 
 
 def main(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("job", type=Path, help="the job folder, e.g. base_forum/jobs/swebenchpro-forum-base-0-20261028T101500Z")
-    ap.add_argument("--task", action="append", default=[], help="retry this task id (repeatable); interrupted and not-started tasks run too, since Pier runs them on any resume")
-    ap.add_argument("--graded-errors", action="store_true", help="also retry attempts Pier graded after an error (a timeout graded 0): this raises the pass rate")
-    ap.add_argument("--dry-run", action="store_true", help="list what would be retried and the command, and stop")
-    ap.add_argument("--yes", "-y", action="store_true", help="do not ask before starting")
-    ap.add_argument("--force", action="store_true", help="retry even if the job looks like it is still running")
-    ap.add_argument("--env-file", type=Path, default=Path(os.environ.get("ENV_FILE", BASE / ".env")))
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    ap.add_argument(
+        "job",
+        type=Path,
+        help="the job folder, e.g. base_forum/jobs/swebenchpro-forum-base-0-20261028T101500Z",
+    )
+    ap.add_argument(
+        "--task",
+        action="append",
+        default=[],
+        help="retry this task id (repeatable); interrupted and not-started tasks run too, since Pier runs them on any resume",
+    )
+    ap.add_argument(
+        "--graded-errors",
+        action="store_true",
+        help="also retry attempts Pier graded after an error (a timeout graded 0): this raises the pass rate",
+    )
+    ap.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="list what would be retried and the command, and stop",
+    )
+    ap.add_argument(
+        "--yes", "-y", action="store_true", help="do not ask before starting"
+    )
+    ap.add_argument(
+        "--force",
+        action="store_true",
+        help="retry even if the job looks like it is still running",
+    )
+    ap.add_argument(
+        "--env-file", type=Path, default=Path(os.environ.get("ENV_FILE", BASE / ".env"))
+    )
     a = ap.parse_args(argv)
 
     job = a.job.resolve()
@@ -313,7 +434,10 @@ def main(argv: list[str]) -> int:
         return 2
     config = read_json(job / "config.json")
     if config is None:
-        print(f"retry_failed: {a.job} has no config.json; is it a Pier job folder?", file=sys.stderr)
+        print(
+            f"retry_failed: {a.job} has no config.json; is it a Pier job folder?",
+            file=sys.stderr,
+        )
         return 2
     rows = classify(job)
     todo, errors = pick(rows, a.task, a.graded_errors)
@@ -324,44 +448,77 @@ def main(argv: list[str]) -> int:
     print(f"job {job.name}: {len(rows)} tasks, {graded_n} graded, {len(todo)} to retry")
     for r in todo:
         also = " (runs on any resume)" if a.task and r["task"] not in a.task else ""
-        print(f"  {r['state']:<12} {r['task']}{also}" + (f"\n               {r['reason']}" if r["reason"] and r["state"] not in ALWAYS else ""))
+        print(
+            f"  {r['state']:<12} {r['task']}{also}"
+            + (
+                f"\n               {r['reason']}"
+                if r["reason"] and r["state"] not in ALWAYS
+                else ""
+            )
+        )
     left = [r for r in rows if r["state"] == "graded, with an error" and r not in todo]
     if left:
-        print(f"not retried: {len(left)} graded after an error ({', '.join(r['task'] for r in left)}); name one with --task, or pass --graded-errors")
+        print(
+            f"not retried: {len(left)} graded after an error ({', '.join(r['task'] for r in left)}); name one with --task, or pass --graded-errors"
+        )
     if not todo:
         print("nothing to retry")
         return 2
     if not a.force and is_running(job):
         holder = lock_holder(job)
-        print(f"retry_failed: the job looks like it is still running{f' (a retry, pid {holder})' if holder else ''}; wait for it, or pass --force", file=sys.stderr)
+        print(
+            f"retry_failed: the job looks like it is still running{f' (a retry, pid {holder})' if holder else ''}; wait for it, or pass --force",
+            file=sys.stderr,
+        )
         return 3
 
     cwd = run_dir(job, config)
-    cmd = ["pier", "job", "resume", "-p", str(job.relative_to(cwd) if job.is_relative_to(cwd) else job)]
+    cmd = [
+        "pier",
+        "job",
+        "resume",
+        "-p",
+        str(job.relative_to(cwd) if job.is_relative_to(cwd) else job),
+    ]
     print(f"command: (cd {cwd} && {' '.join(cmd)})")
     if a.dry_run:
         return 0
     if shutil.which("pier") is None:
-        print('retry_failed: pier is not installed: uv tool install datacurve-pier --with-editable "base_forum/pier_adapter"', file=sys.stderr)
+        print(
+            'retry_failed: pier is not installed: uv tool install datacurve-pier --with-editable "base_forum/pier_adapter"',
+            file=sys.stderr,
+        )
         return 2
     env = dict(os.environ)
     if a.env_file.is_file():
         env.update(read_env_file(a.env_file))
     missing = [k for k in needed_keys(config) if not env.get(k)]
     if missing:
-        print(f"retry_failed: {', '.join(missing)} is not set; put it in {a.env_file} (as for run_baseline.sh)", file=sys.stderr)
+        print(
+            f"retry_failed: {', '.join(missing)} is not set; put it in {a.env_file} (as for run_baseline.sh)",
+            file=sys.stderr,
+        )
         return 2
-    env.setdefault("DOCKER_DEFAULT_PLATFORM", "linux/amd64")  # as run_baseline.sh: the task images are linux/amd64
+    env.setdefault(
+        "DOCKER_DEFAULT_PLATFORM", "linux/amd64"
+    )  # as run_baseline.sh: the task images are linux/amd64
     if not a.yes:
         if not sys.stdin.isatty():
-            print("retry_failed: pass --yes to retry without a question", file=sys.stderr)
+            print(
+                "retry_failed: pass --yes to retry without a question", file=sys.stderr
+            )
             return 2
-        if input(f"Retry {len(todo)} task{'s' if len(todo) != 1 else ''}? This runs them again with the same models. [y/N] ").strip().lower() not in ("y", "yes"):
+        if input(
+            f"Retry {len(todo)} task{'s' if len(todo) != 1 else ''}? This runs them again with the same models. [y/N] "
+        ).strip().lower() not in ("y", "yes"):
             print("not retried")
             return 2
 
     if not take_lock(job, [r["task"] for r in todo]):
-        print(f"retry_failed: another retry is running on this job (pid {lock_holder(job)})", file=sys.stderr)
+        print(
+            f"retry_failed: another retry is running on this job (pid {lock_holder(job)})",
+            file=sys.stderr,
+        )
         return 3
     lock = job / ATTEMPTS / LOCK
     try:
@@ -373,8 +530,17 @@ def main(argv: list[str]) -> int:
     print("\nafter the retry:")
     for r in todo:
         now = after.get(r["task"])
-        word = "not run" if now is None else now["state"] if now["state"] != "graded" else ("passed" if (now["reward"] or 0) >= 1 else "did not pass")
-        print(f"  {r['task']}: {word}" + (f" ({now['reason']})" if now and now["state"] == "failed" else ""))
+        word = (
+            "not run"
+            if now is None
+            else now["state"]
+            if now["state"] != "graded"
+            else ("passed" if (now["reward"] or 0) >= 1 else "did not pass")
+        )
+        print(
+            f"  {r['task']}: {word}"
+            + (f" ({now['reason']})" if now and now["state"] == "failed" else "")
+        )
     return code
 
 

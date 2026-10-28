@@ -77,7 +77,7 @@ function humanTask(t) {
 function repoOf(t) { return t.repository || t.task.split("-")[0]; }
 function outcome(t) {
   if (t.status !== "finished") return null;
-  if (t.reward == null) return { word: "not graded yet", cls: "finished" };
+  if (t.reward == null) return t.problem ? { word: "failed to run", cls: "failed" } : { word: "not graded yet", cls: "finished" };
   const tests = t.tests || {};
   const detail = tests.f2p_total ? ` · ${tests.f2p_passed} of ${tests.f2p_total} new tests` : "";
   return t.reward >= 1 ? { word: `passed${detail}`, cls: "passed" } : { word: `did not pass${detail}`, cls: "not-passed" };
@@ -328,7 +328,7 @@ function renderRunOverview() {
     const tests = t.tests?.f2p_total ? `${t.tests.f2p_passed} / ${t.tests.f2p_total}` : "";
     tr.append(
       c1,
-      cell(el("span", `st ${o ? o.cls : t.status}`, o ? (t.reward >= 1 ? "passed" : t.reward == null ? "not graded" : "did not pass") : STATUS_WORD[t.status] || t.status)),
+      cell(el("span", `st ${o ? o.cls : t.status}`, o ? (t.reward >= 1 ? "passed" : t.reward == null ? (t.problem ? "failed to run" : "not graded") : "did not pass") : STATUS_WORD[t.status] || t.status)),
       el("td", "num", tests),
       el("td", "num", t.workers ? String(t.workers) : "–"),
       el("td", "num", t.posts ? String(t.posts) : "–"),
