@@ -5,3 +5,4 @@ __pycache__/
 *.egg-info/
 .venv/
 .swebench-pro/
+tasks/runs/

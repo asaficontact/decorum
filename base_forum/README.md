@@ -135,6 +135,29 @@ Results: `base_forum/jobs/<job>/`; `python3 base_forum/scripts/summarize.py base
 base_forum/tasks/baseline-10.tsv` prints one line per trial (reward, cost, time, workers, posts, end reason) beside the
 leaderboard's Kimi K3 pass rate for that task. `pier view base_forum/jobs/<job>` opens the trajectories.
 
+## Starting a run from the viewer
+
+**＋ New run** (top of the left column) opens the run sheet:
+1. **Benchmark:** SWE-bench Pro V2 (642 tasks) or DeepSWE v1.1 (113).
+2. **Tasks:** chosen at random with a seed (the default), by difficulty (four bands, from how often published attempts
+   solved each task), the same tasks as an earlier run, picked by hand, pasted ids, or the first N. You can narrow
+   them to a repository, a language or HARD-51, and load the saved lists (`tasks/*.tsv`).
+3. **Team:** the authority's and the workers' models and thinking, the fewest and most workers per task, and how
+   many at once. Or one agent instead of the forum.
+4. **Run:** a name, tasks at once, the spend cap per task, retries on a crash, and **scripted agents** (no model
+   calls, no cost: checks Docker, Pier and the tasks).
+
+The sheet on the right shows what the run will be and the most it can spend and take. It also says how hard the
+chosen tasks are against the whole benchmark, and how uncertain a pass rate is at that many tasks. **Start** writes
+the list to `tasks/runs/<run>.tsv` and starts `run_baseline.sh` with the settings shown under "What it runs"; the run
+appears in the list at once. A model's key must be in `base_forum/.env`: the page says which one is missing and never
+sees it. Start the viewer with `--no-start` to hide the button.
+
+The catalogues the page chooses from are in `tasks/catalog/`, built by `scripts/build_catalog.py` from the public
+data (sources in the script). The worker range and the spend cap reach the runtime as `MIN_WORKERS`, `MAX_WORKERS`,
+`MAX_LIVE_WORKERS` and `BUDGET_USD` (also usable with `run_baseline.sh` directly). They override the rulebook's
+budget for that run only, and are checked the same way.
+
 ## When a task fails: retrying it
 
 A task can end without a result of its own: Pier's time limit stopped the agent (`AgentTimeoutError`), Docker or the
@@ -162,6 +185,7 @@ cd base_forum/runtime && npm ci && npm test && npx tsc --noEmit      # 45 tests,
 cd base_forum/pier_adapter && uv run --with pytest --with-editable . pytest -q
 cd base_forum/viewer && uv run --no-project --with pytest pytest -q
 cd base_forum && uv run --no-project --with pytest pytest -q scripts/tests
+python3 base_forum/scripts/build_catalog.py      # rebuild tasks/catalog/ from the public sources
 node base_forum/runtime/src/main.ts run --instruction "..." --repo /tmp/repo --out /tmp/out --faux smoke   # no model
 pier run -p <task> --agent-import-path decorum_pier:DecorumForum --ak faux=smoke --env docker   # Pier + Docker, no model
 ```

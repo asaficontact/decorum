@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import sys
 import threading
@@ -1086,5 +1087,248 @@ def test_requests_under_another_host_name_are_refused(jobs: Path) -> None:
         with pytest.raises(urllib.error.HTTPError) as e:
             urllib.request.urlopen(req)
         assert e.value.code == 421
+    finally:
+        server.shutdown()
+
+
+# ---------- starting a run ----------
+
+
+def start_body(**kw) -> dict:
+    body = {
+        "benchmark": "swebenchpro",
+        "tasks": [
+            "instance_ansible__ansible-83fb24b923064d3576d473747ebbe62e4535c9e3-vba6da65a0f3baefda7a058ebbd0a8dcafb8512f5",
+            "instance_ansible__ansible-12734fa21c08a0ce8c84e533abdc560db2eb1955-v7eee2454f617569fd6889f2211f75bc02a35f9f8",
+        ],
+        "mode": "forum",
+        "scripted": True,
+        "authority_model": "moonshotai/kimi-k3",
+        "authority_thinking": "max",
+        "worker_model": "moonshotai/kimi-k2.7-code",
+        "worker_thinking": "high",
+        "min_workers": 2,
+        "max_workers": 5,
+        "max_live_workers": 3,
+        "concurrency": 2,
+        "retries": 1,
+        "budget_usd": 7,
+        "name": "Pro smoke from the page",
+    }
+    body.update(kw)
+    return body
+
+
+class Running:
+    def poll(self):
+        return None
+
+
+def starter(jobs: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[fv.Store, list]:
+    monkeypatch.setattr(fv, "RUN_LISTS", jobs / "runlists")
+    store = fv.Store([jobs])
+    store.launch_grace = 0
+    calls: list = []
+
+    def launch(env: dict, log: Path) -> Running:
+        calls.append((env, log))
+        log.write_text("job …\n")
+        return Running()
+
+    store.start_launch = launch
+    return store, calls
+
+
+def test_the_catalog_has_both_benchmarks_with_their_saved_lists(jobs: Path) -> None:
+    d = fv.Store([jobs]).catalog()
+    assert d["start"] is True
+    pro, ds = d["benchmarks"]["swebenchpro"], d["benchmarks"]["deepswe"]
+    assert (len(pro["tasks"]), len(ds["tasks"])) == (642, 113)
+    assert [(p["name"], len(p["ids"])) for p in pro["presets"]] == [
+        ("Collaborator's 10", 10),
+        ("HARD-51", 51),
+    ]
+    assert [(p["name"], len(p["ids"])) for p in ds["presets"]] == [("Baseline 10", 10)]
+
+
+def test_a_run_started_from_the_page_writes_its_tasks_and_hands_run_baseline_its_settings(
+    jobs: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store, calls = starter(jobs, monkeypatch)
+    r = store.start(start_body())
+    assert r["tasks"] == 2 and r["job"].startswith("pro-smoke-from-the-page-")
+    [(env, log)] = calls
+    assert {
+        k: env[k]
+        for k in (
+            "BENCHMARK",
+            "MODE",
+            "AUTHORITY_MODEL",
+            "AUTHORITY_THINKING",
+            "WORKER_MODEL",
+            "WORKER_THINKING",
+            "MIN_WORKERS",
+            "MAX_WORKERS",
+            "MAX_LIVE_WORKERS",
+            "CONCURRENCY",
+            "RETRIES",
+            "BUDGET_USD",
+            "FAUX",
+        )
+    } == {
+        "BENCHMARK": "swebenchpro",
+        "MODE": "forum",
+        "AUTHORITY_MODEL": "moonshotai/kimi-k3",
+        "AUTHORITY_THINKING": "max",
+        "WORKER_MODEL": "moonshotai/kimi-k2.7-code",
+        "WORKER_THINKING": "high",
+        "MIN_WORKERS": "2",
+        "MAX_WORKERS": "5",
+        "MAX_LIVE_WORKERS": "3",
+        "CONCURRENCY": "2",
+        "RETRIES": "1",
+        "BUDGET_USD": "7",
+        "FAUX": "smoke",
+    }
+    assert env["JOB_NAME"] == r["job"] and env["JOBS_DIR"] == str(jobs)
+    assert Path(env["TASKS"]).read_text().splitlines() == [
+        "task",
+        *start_body()["tasks"],
+    ]
+    assert log.parent == jobs / ".decorum-start"
+    # it is listed at once, named, before Pier has made its folder
+    [run] = store.runs()
+    assert (
+        run["job"],
+        run["status"],
+        run["name"],
+        run["benchmark"],
+        run["planned"],
+        run["faux"],
+    ) == (r["job"], "starting", "Pro smoke from the page", "SWE-bench Pro", 2, True)
+    assert run["task_ids"] == start_body()["tasks"]
+
+
+def test_a_single_agent_run_sends_no_worker_settings(
+    jobs: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store, calls = starter(jobs, monkeypatch)
+    store.start(start_body(mode="single", worker_model=None, name=""))
+    env = calls[0][0]
+    assert env["MODE"] == "single" and not {
+        "WORKER_MODEL",
+        "MIN_WORKERS",
+        "MAX_WORKERS",
+    } & set(env)
+    assert calls[0][0]["JOB_NAME"].startswith("swebenchpro-single-")
+
+
+@pytest.mark.parametrize(
+    "change, message",
+    [
+        ({"benchmark": "swe-bench"}, "benchmark must be one of"),
+        ({"tasks": []}, "non-empty list"),
+        ({"tasks": ["instance_nope"]}, "not in SWE-bench Pro: instance_nope"),
+        ({"authority_model": "kimi; rm -rf /"}, "must look like provider/model"),
+        ({"worker_model": None}, "worker_model in forum mode"),
+        ({"authority_thinking": "huge"}, "authority_thinking must be one of"),
+        (
+            {"min_workers": 6, "max_workers": 3},
+            "min_workers (6) is more than max_workers (3)",
+        ),
+        ({"max_workers": 9}, "max_workers must be a whole number from 1 to 8"),
+        ({"concurrency": "3"}, "concurrency must be a whole number"),
+        ({"budget_usd": 0}, "budget_usd must be from 1 to 1000"),
+        ({"mode": "swarm"}, "mode must be forum or single"),
+        ({"name": "x" * 81}, "at most 80 characters"),
+    ],
+)
+def test_a_bad_request_is_refused_before_anything_is_written(
+    jobs: Path, monkeypatch: pytest.MonkeyPatch, change: dict, message: str
+) -> None:
+    store, calls = starter(jobs, monkeypatch)
+    with pytest.raises(ValueError, match=re.escape(message)):
+        store.start(start_body(**change))
+    assert calls == [] and not (jobs / "runlists").exists()
+
+
+def test_real_models_need_their_key(
+    jobs: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store, calls = starter(jobs, monkeypatch)
+    monkeypatch.delenv("MOONSHOT_API_KEY", raising=False)
+    monkeypatch.setattr(fv, "HERE", jobs / "nowhere" / "viewer")  # no base_forum/.env
+    with pytest.raises(ValueError, match="MOONSHOT_API_KEY is not set"):
+        store.start(start_body(scripted=False))
+    monkeypatch.setenv("MOONSHOT_API_KEY", "sk-test")
+    assert (
+        store.start(start_body(scripted=False))["tasks"] == 2
+        and "FAUX" not in calls[0][0]
+    )
+
+
+def test_a_start_that_fails_at_once_says_why_and_the_run_shows_stopped(
+    jobs: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store, _ = starter(jobs, monkeypatch)
+
+    class Failed:
+        def poll(self):
+            return 2
+
+    def launch(env: dict, log: Path) -> Failed:
+        log.write_text("run_baseline: Docker is not running\n")
+        return Failed()
+
+    store.start_launch = launch
+    with pytest.raises(
+        RuntimeError, match="the run did not start: run_baseline: Docker is not running"
+    ):
+        store.start(start_body())
+    [run] = store.runs()
+    assert run["status"] == "stopped" and "Docker is not running" in run["problem"]
+
+
+def test_the_start_endpoint_needs_the_page_header_and_can_be_switched_off(
+    jobs: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store, _ = starter(jobs, monkeypatch)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), fv.make_handler(store))
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+
+    def post(body: object, headers: dict | None = None) -> tuple[int, dict]:
+        h = (
+            {"Content-Type": "application/json", "X-Decorum-Viewer": "1"}
+            if headers is None
+            else headers
+        )
+        req = urllib.request.Request(
+            f"{base}/api/runs/start",
+            data=json.dumps(body).encode(),
+            headers=h,
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req) as r:
+                return r.status, json.load(r)
+        except urllib.error.HTTPError as e:
+            return e.code, json.load(e)
+
+    try:
+        assert post(start_body(), {"Content-Type": "application/json"})[0] == 403
+        big = start_body(
+            tasks=[
+                t["id"] for t in store.catalog()["benchmarks"]["swebenchpro"]["tasks"]
+            ]
+        )  # all 642: about 70 KB
+        code, body = post(big)
+        assert code == 200 and body["tasks"] == 642, body
+        assert post(start_body(budget_usd=0))[0] == 400
+        store.start_enabled = False
+        assert post(start_body())[0] == 403
+        assert (
+            json.load(urllib.request.urlopen(f"{base}/api/catalog"))["start"] is False
+        )
     finally:
         server.shutdown()

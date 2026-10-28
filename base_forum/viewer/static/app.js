@@ -265,7 +265,7 @@ function toast(text) {
 // ---------- one run ----------
 
 function selectRun(job) {
-  if (S.page === "insights") { S.page = "runs"; $("insights").hidden = true; $("nav-runs").setAttribute("aria-selected", "true"); $("nav-insights").setAttribute("aria-selected", "false"); }
+  if (S.page !== "runs") setPage("runs");
   if (S.runSel !== job) S.teams = null;
   S.runSel = job;
   S.sel = null;
@@ -354,7 +354,7 @@ function renderRunOverview() {
 // ---------- one trial ----------
 
 function select(t) {
-  if (S.page === "insights") { S.page = "runs"; $("insights").hidden = true; $("nav-runs").setAttribute("aria-selected", "true"); $("nav-insights").setAttribute("aria-selected", "false"); }
+  if (S.page !== "runs") setPage("runs");
   S.sel = { job: t.job, trial: t.trial };
   S.runSel = t.job;
   $("run").hidden = true;
@@ -824,6 +824,7 @@ function fromHash() {
 let firstLoad = true;
 function followHash() {
   if (location.hash === "#insights") { if (S.page !== "insights") setPage("insights"); return; }
+  if (location.hash === "#new") { if (S.page !== "new") setPage("new"); return; }
   const want = fromHash();
   if (!want?.job) return;
   const t = want.trial ? S.trials.find((x) => x.job === want.job && x.trial === want.trial) : null;
@@ -843,6 +844,7 @@ async function pollTrials() {
     if (firstLoad) {
       firstLoad = false;
       if (location.hash === "#insights") { setPage("insights"); return; }
+      if (location.hash === "#new") { setPage("new"); return; }
       const want = fromHash();
       const t = want?.trial ? S.trials.find((x) => x.job === want.job && x.trial === want.trial) : null;
       if (t) select(t);
