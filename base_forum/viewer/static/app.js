@@ -11,8 +11,13 @@ const el = (tag, cls, text) => {
 const HUES = 8;
 
 const S = {
+  runs: [],
   trials: [],
   sel: null, // {job, trial}
+  runSel: null, // job of the run whose overview is open
+  openRuns: new Set(JSON.parse(localStorage.getItem("decorum.openRuns") || "[]")),
+  closedRuns: new Set(JSON.parse(localStorage.getItem("decorum.closedRuns") || "[]")),
+  renaming: null, // job being renamed
   events: [],
   next: 0,
   epoch: null,
@@ -79,60 +84,281 @@ function outcome(t) {
 const STATUS_WORD = { running: "running", starting: "starting", stalled: "no activity for 10 min", finished: "finished", failed: "failed to start" };
 const AGENT_WORD = { working: "working", waiting: "waiting", finished: "finished", stopped: "stopped" };
 
-// ---------- the rail ----------
+// ---------- runs ----------
 
-function renderTrials() {
+const BENCH_WORD = { "SWE-bench Pro": "SWE-bench Pro V2", DeepSWE: "DeepSWE", Replay: "Replay" };
+function runOf(job) { return S.runs.find((r) => r.job === job); }
+function shortDate(iso) {
+  const t = ts(iso);
+  if (!isFinite(t)) return "";
+  const d = new Date(t);
+  const sameYear = d.getFullYear() === new Date().getFullYear();
+  return d.toLocaleString(undefined, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit", ...(sameYear ? {} : { year: "numeric" }) });
+}
+function defaultLabel(r) {
+  const parts = [BENCH_WORD[r.benchmark] || r.benchmark || "Run"];
+  if (r.mode === "single") parts.push("single agent");
+  if (r.faux) parts.push("scripted");
+  parts.push(shortDate(r.started_at) || r.job);
+  return parts.join(" · ");
+}
+function runLabel(r) { return r.name || defaultLabel(r); }
+function runCounts(r) {
+  const c = r.counts;
+  const parts = [];
+  if (c.passed) parts.push(`${c.passed} passed`);
+  if (c.not_passed) parts.push(`${c.not_passed} did not pass`);
+  if (c.failed) parts.push(`${c.failed} failed to run`);
+  if (c.running) parts.push(`${c.running} running`);
+  if (c.ungraded) parts.push(`${c.ungraded} not graded`);
+  if (r.pending) parts.push(`${r.pending} ${r.status === "running" ? "waiting to start" : "never started"}`);
+  return parts.join(" · ") || "no tasks yet";
+}
+function runBar(r, big) {
+  const bar = el("div", `bar${big ? " big" : ""}`);
+  bar.setAttribute("role", "img");
+  bar.setAttribute("aria-label", runCounts(r));
+  const total = Math.max(r.planned, r.trials.length, 1);
+  const segs = [["passed", r.counts.passed], ["not-passed", r.counts.not_passed], ["failed", r.counts.failed], ["running", r.counts.running], ["ungraded", r.counts.ungraded], ["pending", r.pending]];
+  for (const [cls, n] of segs) {
+    if (!n) continue;
+    const seg = el("span", `seg ${cls}`);
+    seg.style.flexGrow = String(n);
+    seg.title = `${n} ${cls.replace("-", " ")}`;
+    bar.append(seg);
+  }
+  bar.style.setProperty("--total", String(total));
+  return bar;
+}
+function isOpen(r, i) {
+  if (S.openRuns.has(r.job)) return true;
+  if (S.closedRuns.has(r.job)) return false;
+  return r.status === "running" || i === 0 || S.sel?.job === r.job;
+}
+function toggleRun(job, open) {
+  (open ? S.openRuns : S.closedRuns).add(job);
+  (open ? S.closedRuns : S.openRuns).delete(job);
+  localStorage.setItem("decorum.openRuns", JSON.stringify([...S.openRuns]));
+  localStorage.setItem("decorum.closedRuns", JSON.stringify([...S.closedRuns]));
+  renderRail();
+}
+
+function renderRail() {
   const nav = $("trials");
+  if (S.renaming && nav.contains(document.activeElement)) return; // never redraw under someone typing a name
   const keep = nav.scrollTop;
   nav.replaceChildren();
-  const groups = [
-    ["Running now", S.trials.filter((t) => t.status === "running" || t.status === "starting")],
-    ["Finished", S.trials.filter((t) => !(t.status === "running" || t.status === "starting"))],
-  ];
-  for (const [label, items] of groups) {
-    if (!items.length) continue;
-    nav.append(el("p", "group-label", label));
-    for (const t of items) {
-      const b = el("button", "trial-item");
-      b.type = "button";
-      b.setAttribute("aria-current", String(S.sel?.job === t.job && S.sel?.trial === t.trial));
-      b.append(el("div", "ti-name", humanTask(t)));
-      b.append(el("div", "ti-repo", `${repoOf(t)} · ${t.replay ? "replay of a recorded trial" : t.job}`));
-      const line = el("div", "ti-line");
-      const o = outcome(t);
-      const word = o ? o.word : t.status === "running" && t.started_at ? `running · ${clock((Date.now() - ts(t.started_at)) / 1000)}` : STATUS_WORD[t.status] || t.status;
-      const st = el("span", `st ${o ? o.cls : t.status}`, word);
-      line.append(st);
-      if (t.workers) line.append(el("span", "", `${t.workers} worker${t.workers > 1 ? "s" : ""}`));
-      else if (t.status !== "starting") line.append(el("span", "", "no workers"));
-      if (t.cost_usd) line.append(el("span", "", money(t.cost_usd)));
-      b.append(line);
-      b.addEventListener("click", () => select(t));
-      nav.append(b);
+  if (!S.runs.length) nav.append(el("p", "group-label", "No decorum runs in the job folders yet."));
+  S.runs.forEach((r, i) => {
+    const open = isOpen(r, i);
+    const card = el("section", `run-card${S.runSel === r.job && !S.sel ? " current" : ""}${r.status === "running" ? " live" : ""}`);
+    const head = el("div", "run-head-row");
+    const tog = el("button", "run-toggle");
+    tog.type = "button";
+    tog.setAttribute("aria-expanded", String(open));
+    tog.setAttribute("aria-label", `${open ? "Hide" : "Show"} the tasks of ${runLabel(r)}`);
+    tog.textContent = open ? "▾" : "▸";
+    tog.addEventListener("click", () => toggleRun(r.job, !open));
+    const name = el("button", "run-name", runLabel(r));
+    name.type = "button";
+    name.title = "Open this run";
+    name.addEventListener("click", () => selectRun(r.job));
+    const ren = el("button", "rename-btn", "✎");
+    ren.title = "Rename this run";
+    ren.type = "button";
+    ren.setAttribute("aria-label", `Rename ${runLabel(r)}`);
+    ren.addEventListener("click", () => startRename(r.job, name));
+    head.append(tog, name, ren);
+    card.append(head);
+    const meta = el("div", "run-meta");
+    const st = el("span", `st ${r.status === "running" ? "running" : r.status === "stopped" ? "stopped" : "finished"}`, r.status === "running" ? "running" : r.status === "stopped" ? "stopped" : "finished");
+    meta.append(st, el("span", "", [r.name ? defaultLabel(r) : r.job, r.cost_usd ? money(r.cost_usd) : ""].filter(Boolean).join(" · ")));
+    card.append(meta, runBar(r, false), el("div", "run-counts", runCounts(r)));
+    if (open) {
+      const list = el("div", "run-trials");
+      for (const t of r.trials) list.append(trialItem(t));
+      if (!r.trials.length) list.append(el("p", "run-empty", r.status === "running" ? "Building the first tasks…" : "No task started in this run."));
+      card.append(list);
     }
-  }
-  if (!S.trials.length) nav.append(el("p", "group-label", "No decorum trials in the job folders yet."));
+    nav.append(card);
+  });
   nav.scrollTop = keep;
+}
+
+function trialItem(t) {
+  const b = el("button", "trial-item");
+  b.type = "button";
+  b.setAttribute("aria-current", String(S.sel?.job === t.job && S.sel?.trial === t.trial));
+  b.append(el("div", "ti-name", humanTask(t)));
+  const line = el("div", "ti-line");
+  const o = outcome(t);
+  const word = o ? o.word : t.status === "running" && t.started_at ? `running · ${clock((Date.now() - ts(t.started_at)) / 1000)}` : STATUS_WORD[t.status] || t.status;
+  line.append(el("span", `st ${o ? o.cls : t.status}`, word));
+  if (t.workers) line.append(el("span", "", `${t.workers} worker${t.workers > 1 ? "s" : ""}`));
+  if (t.cost_usd) line.append(el("span", "", money(t.cost_usd)));
+  b.append(line);
+  b.addEventListener("click", () => select(t));
+  return b;
+}
+
+// ---------- renaming ----------
+
+function startRename(job, anchor) {
+  const r = runOf(job);
+  if (!r || S.renaming) return;
+  S.renaming = job;
+  const input = el("input", "rename-input");
+  input.type = "text";
+  input.maxLength = 80;
+  input.value = r.name || "";
+  input.placeholder = defaultLabel(r);
+  input.setAttribute("aria-label", "Run name (empty restores the default)");
+  const parent = anchor.parentNode;
+  parent.replaceChild(input, anchor);
+  input.focus();
+  input.select();
+  let done = false;
+  const finish = async (save) => {
+    if (done) return;
+    done = true;
+    if (save && input.value.trim() !== (r.name || "")) {
+      try {
+        const res = await fetch("api/runs/rename", { method: "POST", headers: { "Content-Type": "application/json", "X-Decorum-Viewer": "1" }, body: JSON.stringify({ job, name: input.value }) });
+        const body = await res.json();
+        if (!res.ok) throw new Error(body.error || res.status);
+        for (const x of S.runs) if (x.job === job) x.name = body.name; // S.runs may have been replaced while typing
+        toast(body.name ? `Renamed to “${body.name}”` : "Name cleared");
+      } catch (e) {
+        toast(`Could not rename: ${e.message}`);
+      }
+    }
+    S.renaming = null;
+    if (input.parentNode) input.parentNode.replaceChild(anchor, input);
+    renderRail();
+    if (S.runSel === job && !S.sel) renderRunOverview();
+    if (S.sel?.job === job && S.trial) renderHead();
+  };
+  input.addEventListener("keydown", (e) => {
+    e.stopPropagation();
+    if (e.key === "Enter") finish(true);
+    if (e.key === "Escape") finish(false);
+  });
+  input.addEventListener("blur", () => finish(true));
+}
+$("r-rename").addEventListener("click", () => { if (S.runSel) startRename(S.runSel, $("r-title")); });
+$("r-title").addEventListener("dblclick", () => { if (S.runSel) startRename(S.runSel, $("r-title")); });
+
+function toast(text) {
+  const t = $("toast");
+  t.textContent = text;
+  t.hidden = false;
+  clearTimeout(toast.timer);
+  toast.timer = setTimeout(() => { t.hidden = true; }, 2600);
+}
+
+// ---------- one run ----------
+
+function selectRun(job) {
+  S.runSel = job;
+  S.sel = null;
+  history.replaceState(null, "", `#run=${encodeURIComponent(job)}`);
+  $("empty").hidden = true;
+  $("trial").hidden = true;
+  $("run").hidden = false;
+  closeDrawer();
+  renderRail();
+  renderRunOverview();
+}
+
+function cell(child) {
+  const td = el("td");
+  td.append(child);
+  return td;
+}
+
+function renderRunOverview() {
+  const r = runOf(S.runSel);
+  if (!r) return;
+  $("r-eyebrow").textContent = [BENCH_WORD[r.benchmark] || r.benchmark || "Run", r.mode === "single" ? "single agent" : "forum", r.job].join(" · ");
+  if (S.renaming !== r.job) $("r-title").textContent = runLabel(r);
+  const facts = $("r-facts");
+  facts.replaceChildren();
+  const fact = (label, value) => { if (!value) return; const s = el("span"); s.append(`${label} `); s.append(el("b", "", value)); facts.append(s); };
+  fact("Started", shortDate(r.started_at));
+  if (r.finished_at) fact("Took", clock((ts(r.finished_at) - ts(r.started_at)) / 1000));
+  else if (r.status === "running") fact("Running for", clock((Date.now() - ts(r.started_at)) / 1000));
+  fact(r.status === "running" ? "Spent so far" : "Cost", money(r.cost_usd));
+  if (r.faux) fact("Agents", "scripted, no model calls");
+  else {
+    fact("Authority", r.authority_model);
+    fact("Workers", r.mode === "forum" ? r.worker_model : null);
+  }
+  fact("Rulebook", r.rulebook);
+  const graded = r.counts.passed + r.counts.not_passed;
+  $("r-score").textContent = graded ? `${r.counts.passed} of ${graded} graded tasks passed` : r.status === "running" ? "No task graded yet" : "No task was graded";
+  $("r-bar").replaceChildren(runBar(r, true));
+  $("r-legend").textContent = runCounts(r);
+  const body = $("r-rows");
+  body.replaceChildren();
+  for (const t of r.trials) {
+    const tr = el("tr");
+    const c1 = el("td");
+    const b = el("button", "row-link", humanTask(t));
+    b.type = "button";
+    b.addEventListener("click", () => select(t));
+    c1.append(b, el("div", "row-sub", repoOf(t)));
+    const o = outcome(t);
+    const tests = t.tests?.f2p_total ? `${t.tests.f2p_passed} / ${t.tests.f2p_total}` : "";
+    tr.append(
+      c1,
+      cell(el("span", `st ${o ? o.cls : t.status}`, o ? (t.reward >= 1 ? "passed" : t.reward == null ? "not graded" : "did not pass") : STATUS_WORD[t.status] || t.status)),
+      el("td", "num", tests),
+      el("td", "num", t.workers ? String(t.workers) : "–"),
+      el("td", "num", t.posts ? String(t.posts) : "–"),
+      el("td", "num", t.duration_sec ? clock(t.duration_sec) : t.status === "running" && t.started_at ? clock((Date.now() - ts(t.started_at)) / 1000) : "–"),
+      el("td", "num", t.cost_usd ? money(t.cost_usd) : "–"),
+    );
+    if (t.problem) {
+      tr.title = t.problem;
+      tr.classList.add("has-problem");
+    }
+    body.append(tr);
+  }
+  if (r.pending) {
+    const tr = el("tr", "pending-row");
+    const td = el("td", "", `${r.pending} more task${r.pending > 1 ? "s" : ""} ${r.status === "running" ? "waiting to start" : "never started"}`);
+    td.colSpan = 7;
+    tr.append(td);
+    body.append(tr);
+  }
 }
 
 // ---------- one trial ----------
 
 function select(t) {
   S.sel = { job: t.job, trial: t.trial };
+  S.runSel = t.job;
+  $("run").hidden = true;
   S.events = []; S.next = 0; S.epoch = null; S.agents = []; S.seenSeq = 0; S.colors = new Map(); S.sig = ""; S.expanded = new Set(); S.firstPaint = true;
-  history.replaceState(null, "", `#${encodeURIComponent(t.job)}/${encodeURIComponent(t.trial)}`);
+  history.replaceState(null, "", `#run=${encodeURIComponent(t.job)}&trial=${encodeURIComponent(t.trial)}`);
   $("empty").hidden = true;
   $("trial").hidden = false;
   $("threads").replaceChildren();
   $("timeline-log").replaceChildren();
   closeDrawer();
-  renderTrials();
+  renderRail();
   pollTrial(true);
 }
 
 function renderHead() {
   const t = S.trial;
-  $("t-eyebrow").textContent = `${repoOf(t)}${t.language ? ` · ${t.language}` : ""} · ${t.job}`;
+  const run = runOf(t.job);
+  $("t-eyebrow").replaceChildren();
+  const back = el("button", "crumb", run ? runLabel(run) : t.job);
+  back.type = "button";
+  back.title = "Back to this run";
+  back.addEventListener("click", () => selectRun(t.job));
+  $("t-eyebrow").append(back, ` · ${repoOf(t)}${t.language ? ` · ${t.language}` : ""}`);
   $("t-title").textContent = humanTask(t);
   const o = outcome(t);
   const st = $("t-state");
@@ -416,16 +642,41 @@ async function getJSON(url) {
   return r.json();
 }
 
+function fromHash() {
+  const h = location.hash.slice(1);
+  if (!h) return null;
+  if (h.startsWith("run=")) {
+    const q = new URLSearchParams(h);
+    return { job: q.get("run"), trial: q.get("trial") };
+  }
+  const [job, trial] = h.split("/").map(decodeURIComponent); // the older #job/trial links
+  return { job, trial };
+}
+
+let firstLoad = true;
+function followHash() {
+  const want = fromHash();
+  if (!want?.job) return;
+  const t = want.trial ? S.trials.find((x) => x.job === want.job && x.trial === want.trial) : null;
+  if (t) { if (S.sel?.job !== t.job || S.sel?.trial !== t.trial) select(t); }
+  else if (runOf(want.job) && (S.sel || S.runSel !== want.job)) selectRun(want.job);
+}
+window.addEventListener("hashchange", followHash); // a pasted link, or back and forward
 async function pollTrials() {
   try {
-    const d = await getJSON("api/trials");
-    S.trials = d.trials;
-    renderTrials();
+    const d = await getJSON("api/runs");
+    S.runs = d.runs;
+    S.trials = d.runs.flatMap((r) => r.trials);
+    renderRail();
+    if (S.runSel && !S.sel) renderRunOverview();
     $("updated").textContent = S.paused ? "Updates paused" : `Updated ${new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}`;
-    if (!S.sel && location.hash.length > 1) {
-      const [job, trial] = location.hash.slice(1).split("/").map(decodeURIComponent);
-      const t = S.trials.find((x) => x.job === job && x.trial === trial);
+    if (firstLoad) {
+      firstLoad = false;
+      const want = fromHash();
+      const t = want?.trial ? S.trials.find((x) => x.job === want.job && x.trial === want.trial) : null;
       if (t) select(t);
+      else if (want?.job && runOf(want.job)) selectRun(want.job);
+      else if (S.runs.length) selectRun(S.runs[0].job);
     }
   } catch (e) {
     $("updated").textContent = "Cannot reach the viewer server";
@@ -482,6 +733,7 @@ $("pause").addEventListener("click", () => {
 $("d-close").addEventListener("click", closeDrawer);
 document.addEventListener("keydown", (e) => {
   if (e.target.closest("input, textarea")) return;
+  if (e.key === "Escape" && !S.drawer && S.sel) { selectRun(S.sel.job); return; }
   if (e.key === "Escape") closeDrawer();
   if (e.key === "t" || e.key === "T") setView("threads");
   if (e.key === "l" || e.key === "L") setView("timeline");

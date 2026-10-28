@@ -111,7 +111,13 @@ to run slower than on the leaderboard.
 Watching live: the runtime writes the forum and every agent's session as it goes, and Docker mounts them on the host.
 
 - **In the browser:** `python3 base_forum/viewer/forum_view.py --open` (http://127.0.0.1:8479/). The left column
-  lists every trial in `base_forum/jobs`, running ones first. A trial shows its task, cost and time, the team (each
+  lists your runs (one per `run_baseline.sh` invocation, i.e. one Pier job), running ones first: benchmark (DeepSWE
+  or SWE-bench Pro V2), status, how many tasks passed, did not pass, failed or are still waiting, and the cost; open a
+  run's arrow to see its tasks. Clicking a run opens its page: the score, a bar of the results, and a table of its
+  tasks. **Rename** (or ✎ in the list, or double-click the title) gives a run your own name, e.g. "Kimi K3 + K2,
+  base-0, try 2"; Enter saves, Escape cancels, an empty name restores the default. Names are kept in
+  `base_forum/jobs/.decorum-viewer.json`, beside the jobs, so they survive restarts; the job folders are never
+  touched. The address bar (`#run=<job>&trial=<trial>`) can be bookmarked. A task shows its task, cost and time, the team (each
   agent's persona, state and current action), and its threads as columns: the plan, workers joining with their
   instructions, every post, finish reports, and each worker's tool calls folded per step. **L** switches to one
   timeline, **T** back; clicking an agent shows everything it did; **Pause updates** freezes the page while you read.

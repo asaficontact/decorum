@@ -4,14 +4,15 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Decorum forum</title>
+<link rel="icon" href="data:,">
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
 <div class="app">
-  <aside class="rail" aria-label="Trials">
+  <aside class="rail" aria-label="Runs">
     <header class="rail-head">
       <h1>Decorum forum</h1>
-      <p class="sub">Every trial in the job folders, live.</p>
+      <p class="sub">Every run in the job folders, live. Name a run with Rename.</p>
     </header>
     <nav id="trials" class="trials"></nav>
     <footer class="rail-foot"><span id="updated">Connecting…</span></footer>
@@ -19,10 +20,32 @@
 
   <main class="main" id="main">
     <div class="empty" id="empty">
-      <h2>Pick a trial</h2>
-      <p>Running trials are at the top of the list. A trial's threads, the agents working in them, and what they say to each other appear here as it happens.</p>
-      <p>In each trial, the <b>authority</b> plans the work and runs it through <b>threads</b>: it assigns <b>workers</b> to them, each with a persona and instructions, and they report back with posts and a finish report. Click an agent to see everything it did.</p>
+      <h2>No runs yet</h2>
+      <p>Start one with <code>base_forum/scripts/run_baseline.sh</code>; it appears on the left as soon as Pier creates its job folder. Each run is one benchmark run of up to ten tasks; open a run to see its results, open a task to watch its forum.</p>
+      <p>In each task, the <b>authority</b> plans the work and runs it through <b>threads</b>: it assigns <b>workers</b> to them, each with a persona and instructions, and they report back with posts and a finish report. Click an agent to see everything it did.</p>
     </div>
+
+    <section id="run" hidden aria-labelledby="r-title">
+      <header class="run-top">
+        <p class="eyebrow" id="r-eyebrow"></p>
+        <div class="run-title-row">
+          <h2 id="r-title"></h2>
+          <button type="button" class="rename-btn big" id="r-rename">Rename</button>
+        </div>
+        <p class="facts" id="r-facts"></p>
+      </header>
+      <section class="run-score" aria-label="Results">
+        <p class="score" id="r-score"></p>
+        <div id="r-bar"></div>
+        <p class="legend" id="r-legend"></p>
+      </section>
+      <div class="table-wrap">
+        <table class="run-table">
+          <thead><tr><th scope="col">Task</th><th scope="col">Result</th><th scope="col" class="num">New tests</th><th scope="col" class="num">Workers</th><th scope="col" class="num">Posts</th><th scope="col" class="num">Time</th><th scope="col" class="num">Cost</th></tr></thead>
+          <tbody id="r-rows"></tbody>
+        </table>
+      </div>
+    </section>
 
     <section id="trial" hidden>
       <header class="trial-head">
@@ -78,6 +101,7 @@
     <ol id="d-actions" class="actions"></ol>
   </aside>
 </div>
+<div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
 <script src="app.js"></script>
 </body>
 </html>

@@ -408,3 +408,186 @@ def test_a_swebench_pro_task_gets_its_title_and_repository_from_the_task(
     [ov] = fv.Store([jobs]).scan()
     assert ov["title"] == "Support multiple destination ports in iptables rules"
     assert ov["repository"] == "ansible/ansible"
+
+
+def make_job(root: Path, job: str, dataset: str, tasks: list[str], **extra) -> Path:
+    d = root / job
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "config.json").write_text(
+        json.dumps(
+            {
+                "datasets": [{"path": dataset, "task_names": tasks}],
+                "agents": [
+                    {
+                        "import_path": "decorum_pier:DecorumForum",
+                        "model_name": "moonshotai/kimi-k3",
+                        "kwargs": {
+                            "rulebook": "base-0",
+                            "worker_model": "moonshotai/kimi-k2.7-code",
+                        },
+                    }
+                ],
+            }
+        )
+    )
+    if extra:
+        (d / "result.json").write_text(json.dumps(extra))
+    return d
+
+
+def finish(trial: Path, reward: float | None) -> None:
+    dec = trial / "agent" / "decorum"
+    append(
+        dec / "forum.jsonl",
+        {
+            "seq": 1,
+            "at": iso(time.time()),
+            "kind": "note",
+            "agent": "runtime",
+            "text": "x",
+        },
+    )
+    (dec / "summary.json").write_text(
+        json.dumps({"cost_usd": 0.5, "duration_sec": 30, "mode": "forum"})
+    )
+    if reward is not None:
+        (trial / "verifier").mkdir()
+        (trial / "verifier" / "reward.json").write_text(json.dumps({"reward": reward}))
+    (trial / "result.json").write_text(
+        json.dumps({"finished_at": "2026-10-27T10:00:00"})
+    )
+
+
+def test_trials_are_grouped_into_runs_with_benchmark_status_and_counts(
+    jobs: Path,
+) -> None:
+    make_job(
+        jobs,
+        "deepswe-forum-base-0-1",
+        "/x/.deep-swe/tasks",
+        ["a-one", "a-two", "a-three"],
+    )
+    finish(make_trial(jobs, "deepswe-forum-base-0-1", "a-one"), 1.0)
+    running = make_trial(jobs, "deepswe-forum-base-0-1", "a-two")
+    append(
+        running / "agent" / "decorum" / "forum.jsonl",
+        {"seq": 1, "at": iso(time.time()), "kind": "note", "agent": "a", "text": "x"},
+    )
+    ids = ["instance_acme__x-1", "instance_acme__y-2"]
+    make_job(
+        jobs,
+        "swebenchpro-forum-base-0-0",
+        "/x/.swebench-pro/pier-tasks",
+        ids,
+        started_at="2026-10-26T09:00:00",
+        finished_at="2026-10-26T10:00:00",
+        stats={},
+    )
+    finish(make_trial(jobs, "swebenchpro-forum-base-0-0", ids[0]), 0.0)
+    finish(make_trial(jobs, "swebenchpro-forum-base-0-0", ids[1]), 1.0)
+
+    live, done = fv.Store([jobs]).runs()
+    assert (live["job"], live["benchmark"], live["status"]) == (
+        "deepswe-forum-base-0-1",
+        "DeepSWE",
+        "running",
+    )
+    assert (
+        live["counts"]["passed"] == 1
+        and live["counts"]["running"] == 1
+        and live["pending"] == 1
+    )
+    assert (live["mode"], live["rulebook"], live["worker_model"]) == (
+        "forum",
+        "base-0",
+        "moonshotai/kimi-k2.7-code",
+    )
+    assert [t["status"] for t in live["trials"]] == ["running", "finished"]
+    assert (done["benchmark"], done["status"], done["pending"]) == (
+        "SWE-bench Pro",
+        "finished",
+        0,
+    )
+    assert done["counts"] == {
+        "running": 0,
+        "passed": 1,
+        "not_passed": 1,
+        "ungraded": 0,
+        "failed": 0,
+    }
+    assert done["cost_usd"] == 1.0 and done["name"] is None
+
+
+def test_a_crashed_run_is_stopped_not_running_forever(jobs: Path) -> None:
+    job = make_job(jobs, "j", "/x/deep-swe/tasks", ["a-one", "a-two"])
+    finish(make_trial(jobs, "j", "a-one"), 1.0)
+    old = time.time() - 3 * 3600
+    for p in job.rglob("*"):
+        os.utime(p, (old, old))
+    os.utime(job, (old, old))
+    [run] = fv.Store([jobs]).runs()
+    assert (run["status"], run["pending"]) == ("stopped", 1)
+
+
+def test_a_run_is_renamed_through_the_api_and_the_name_is_kept_beside_the_jobs(
+    jobs: Path,
+) -> None:
+    make_job(jobs, "j1", "/x/deep-swe/tasks", ["a-one"])
+    finish(make_trial(jobs, "j1", "a-one"), 1.0)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), fv.make_handler(fv.Store([jobs])))
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+
+    def post(body: object, headers: dict | None = None) -> tuple[int, dict]:
+        h = (
+            {"Content-Type": "application/json", "X-Decorum-Viewer": "1"}
+            if headers is None
+            else headers
+        )
+        req = urllib.request.Request(
+            f"{base}/api/runs/rename",
+            data=json.dumps(body).encode(),
+            headers=h,
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req) as r:
+                return r.status, json.load(r)
+        except urllib.error.HTTPError as e:
+            return e.code, json.load(e)
+
+    try:
+        assert post({"job": "j1", "name": "  Kimi baseline\n run 1 "}) == (
+            200,
+            {"job": "j1", "name": "Kimi baseline run 1"},
+        )
+        assert json.loads((jobs / fv.NAMES_FILE).read_text())["names"] == {
+            "j1": "Kimi baseline run 1"
+        }
+        [run] = json.load(urllib.request.urlopen(f"{base}/api/runs"))["runs"]
+        assert run["name"] == "Kimi baseline run 1"
+        assert (
+            fv.Store([jobs]).runs()[0]["name"] == "Kimi baseline run 1"
+        )  # survives a restart
+        assert post({"job": "j1", "name": "x" * 81})[0] == 400
+        assert post({"job": "j1", "name": 5})[0] == 400
+        assert post({"job": "nope", "name": "x"})[0] == 404
+        assert (
+            post({"job": "j1", "name": "x"}, {"Content-Type": "application/json"})[0]
+            == 403
+        )
+        assert (
+            post(
+                {"job": "j1", "name": "x"},
+                {"X-Decorum-Viewer": "1", "Content-Type": "text/plain"},
+            )[0]
+            == 403
+        )
+        assert post({"job": "j1", "name": ""}) == (200, {"job": "j1", "name": None})
+        assert json.loads((jobs / fv.NAMES_FILE).read_text())["names"] == {}
+        assert (
+            json.load(urllib.request.urlopen(f"{base}/api/runs"))["runs"][0]["name"]
+            is None
+        )
+    finally:
+        server.shutdown()

@@ -432,6 +432,40 @@ def task_info(trial: Path) -> dict:
     return info
 
 
+NAMES_FILE = ".decorum-viewer.json"
+NAME_MAX = 80
+
+
+def benchmark_of(dataset_path: str) -> str:
+    p = dataset_path.lower()
+    if "swebench-pro" in p or "swe-bench_pro" in p or "swebenchpro" in p:
+        return "SWE-bench Pro"
+    if "deep-swe" in p or "deepswe" in p:
+        return "DeepSWE"
+    return ""
+
+
+def _local_iso(stamp: str | None) -> str | None:
+    """Pier writes job times without a zone, in the local time of the machine that ran it (this one)."""
+    if not stamp:
+        return None
+    try:
+        dt = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return (dt if dt.tzinfo else dt.astimezone()).isoformat()
+
+
+def clean_name(name: object) -> str:
+    """A run's display name: one line, no control characters, at most NAME_MAX characters. Empty clears it."""
+    if not isinstance(name, str):
+        raise TypeError("name must be a string")
+    text = " ".join("".join(ch if ch.isprintable() else " " for ch in name).split())
+    if len(text) > NAME_MAX:
+        raise ValueError(f"a run name is at most {NAME_MAX} characters")
+    return text
+
+
 class Store:
     def __init__(self, roots: list[Path]) -> None:
         self.roots = roots
@@ -487,6 +521,172 @@ class Store:
                 self._scan()
             return self.trials.get((job, trial))
 
+    # ---------- runs: one Pier job each ----------
+
+    def _job_dirs(self) -> list[tuple[Path, Path]]:
+        out = []
+        for root in self.roots:
+            if root.is_dir():
+                out += [
+                    (root, j)
+                    for j in sorted(p for p in root.iterdir() if p.is_dir())
+                    if (j / "config.json").exists()
+                    or any(
+                        (t / "config.json").exists() for t in j.iterdir() if t.is_dir()
+                    )
+                ]
+        return out
+
+    def _names(self, root: Path) -> dict[str, str]:
+        data = _read_json(root / NAMES_FILE) or {}
+        names = data.get("names")
+        return names if isinstance(names, dict) else {}
+
+    def rename(self, job: str, name: object) -> str:
+        """Give a run a display name (stored beside the jobs, in NAMES_FILE); an empty name restores the default."""
+        text = clean_name(name)
+        with self.lock:
+            for root, j in self._job_dirs():
+                if j.name != job:
+                    continue
+                path = root / NAMES_FILE
+                data = _read_json(path) or {}
+                names = data.get("names") if isinstance(data.get("names"), dict) else {}
+                if text:
+                    names[job] = text
+                else:
+                    names.pop(job, None)
+                data["names"] = names
+                tmp = path.with_suffix(".tmp")
+                tmp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
+                tmp.replace(path)
+                return text
+        raise KeyError(job)
+
+    def runs(self) -> list[dict]:
+        with self.lock:
+            by_job: dict[str, list[dict]] = {}
+            for t in self._scan():
+                by_job.setdefault(t["job"], []).append(t)
+            runs = []
+            for root, job in self._job_dirs():
+                trials = by_job.get(job.name, [])
+                cfg = _read_json(job / "config.json") or {}
+                agent = (cfg.get("agents") or [{}])[0] or {}
+                if not trials and "decorum" not in str(agent.get("import_path") or ""):
+                    continue
+                res = _read_json(job / "result.json") or {}
+                stats = res.get("stats") or {}
+                kw = agent.get("kwargs") or {}
+                ds = (cfg.get("datasets") or [{}])[0] or {}
+                single_tasks = cfg.get("tasks") or []
+                paths = [str(ds.get("path") or "")] + [
+                    str((t or {}).get("path") or "") for t in single_tasks
+                ]
+                task_names = list(ds.get("task_names") or []) + [
+                    Path(p).name for p in paths[1:] if p
+                ]
+                planned = len(task_names) or res.get("n_total_trials") or len(trials)
+                counts = {
+                    "running": 0,
+                    "passed": 0,
+                    "not_passed": 0,
+                    "ungraded": 0,
+                    "failed": 0,
+                }
+                for t in trials:
+                    if t["status"] in ("running", "starting"):
+                        counts["running"] += 1
+                    elif t["reward"] is not None:
+                        counts["passed" if t["reward"] >= 1 else "not_passed"] += 1
+                    elif t["status"] == "failed" or t["problem"]:
+                        counts["failed"] += 1
+                    else:
+                        counts["ungraded"] += 1
+                pending = max(0, planned - len(trials))
+                finished_at = _local_iso(res.get("finished_at"))
+                # A job with no finish time is running only while something in it still moves: a crashed pier
+                # never writes finished_at, and must not look alive forever.
+                touched = [
+                    p.stat().st_mtime for p in (job, job / "result.json") if p.exists()
+                ]
+                touched += [
+                    self.trials[(job.name, t["trial"])].last_activity()
+                    for t in trials
+                    if (job.name, t["trial"]) in self.trials
+                ]
+                alive = time.time() - max(touched, default=0) < STALE_SEC
+                if counts["running"]:
+                    status = "running"
+                elif finished_at:
+                    status = (
+                        "stopped"
+                        if (stats.get("n_cancelled_trials") or pending)
+                        else "finished"
+                    )
+                elif alive and (
+                    stats.get("n_running_trials")
+                    or stats.get("n_pending_trials")
+                    or pending
+                ):
+                    status = "running"
+                elif (
+                    trials
+                    and not pending
+                    and all(t["status"] == "finished" for t in trials)
+                ):
+                    status = "finished"
+                else:
+                    status = "stopped"
+                import_path = str(agent.get("import_path") or "")
+                bench = (
+                    next((b for b in map(benchmark_of, paths) if b), "")
+                    or (
+                        "SWE-bench Pro"
+                        if task_names
+                        and all(n.startswith("instance_") for n in task_names)
+                        else ""
+                    )
+                    or ("Replay" if job.name.startswith("replay-of-") else "")
+                )
+                order = {
+                    "running": 0,
+                    "starting": 1,
+                    "stalled": 2,
+                    "finished": 3,
+                    "failed": 4,
+                }
+                trials.sort(key=lambda t: (order.get(t["status"], 9), t["task"]))
+                runs.append(
+                    {
+                        "job": job.name,
+                        "name": self._names(root).get(job.name) or None,
+                        "benchmark": bench,
+                        "mode": "single" if "Single" in import_path else "forum",
+                        "rulebook": kw.get("rulebook")
+                        or (trials[0]["rulebook"] if trials else None),
+                        "authority_model": agent.get("model_name"),
+                        "worker_model": kw.get("worker_model"),
+                        "faux": bool(kw.get("faux")),
+                        "started_at": _local_iso(res.get("started_at"))
+                        or min(
+                            (t["started_at"] for t in trials if t["started_at"]),
+                            default=None,
+                        ),
+                        "finished_at": finished_at,
+                        "status": status,
+                        "planned": planned,
+                        "pending": pending,
+                        "counts": counts,
+                        "cost_usd": round(sum(t["cost_usd"] or 0 for t in trials), 4),
+                        "trials": trials,
+                    }
+                )
+            runs.sort(
+                key=lambda r: (r["status"] != "running", -(_ts(r["started_at"]) or 0))
+            )
+            return runs
+
 
 def _ts(iso: str | None) -> float | None:
     if not iso:
@@ -510,9 +710,36 @@ def make_handler(store: Store):
         def _json(self, obj: object) -> None:
             self._send(200, json.dumps(obj).encode(), "application/json")
 
+        def do_POST(self) -> None:
+            u = urlparse(self.path)
+            if u.path != "/api/runs/rename":
+                return self._send(404, b'{"error":"not found"}', "application/json")
+            # Only the page itself may write: a custom header forces a CORS preflight that a foreign page cannot pass.
+            if self.headers.get("X-Decorum-Viewer") != "1" or not (
+                self.headers.get("Content-Type") or ""
+            ).startswith("application/json"):
+                return self._send(403, b'{"error":"forbidden"}', "application/json")
+            n = int(self.headers.get("Content-Length") or 0)
+            if n <= 0 or n > 4096:
+                return self._send(400, b'{"error":"bad request"}', "application/json")
+            try:
+                body = json.loads(self.rfile.read(n))
+                name = store.rename(str(body.get("job", "")), body.get("name", ""))
+            except KeyError:
+                return self._send(404, b'{"error":"no such run"}', "application/json")
+            except (ValueError, TypeError, AttributeError) as e:
+                return self._send(
+                    400, json.dumps({"error": str(e)}).encode(), "application/json"
+                )
+            return self._json({"job": body.get("job"), "name": name or None})
+
         def do_GET(self) -> None:
             u = urlparse(self.path)
             q = {k: v[0] for k, v in parse_qs(u.query).items()}
+            if u.path == "/api/runs":
+                return self._json(
+                    {"now": datetime.now(UTC).isoformat(), "runs": store.runs()}
+                )
             if u.path == "/api/trials":
                 return self._json(
                     {"now": datetime.now(UTC).isoformat(), "trials": store.scan()}
