@@ -1,4 +1,4 @@
-// Decorum forum viewer (prototype). Polls the server; keeps your place; never steals the scroll.
+// Forum Decorum viewer. Polls the server; keeps your place; never steals the scroll.
 "use strict";
 
 const $ = (id) => document.getElementById(id);
@@ -14,6 +14,7 @@ const S = {
   runs: [],
   trials: [],
   sel: null, // {job, trial}
+  retryOff: new Set(), // "job/task" the reader unticked in a run's retry list
   runSel: null, // job of the run whose overview is open
   openRuns: new Set(JSON.parse(localStorage.getItem("decorum.openRuns") || "[]")),
   closedRuns: new Set(JSON.parse(localStorage.getItem("decorum.closedRuns") || "[]")),
@@ -79,9 +80,16 @@ function outcome(t) {
   if (t.reward == null) return { word: "not graded yet", cls: "finished" };
   const tests = t.tests || {};
   const detail = tests.f2p_total ? ` · ${tests.f2p_passed} of ${tests.f2p_total} new tests` : "";
-  return t.reward >= 1 ? { word: `passed${detail}`, cls: "passed" } : { word: `did not pass${detail}`, cls: "finished" };
+  return t.reward >= 1 ? { word: `passed${detail}`, cls: "passed" } : { word: `did not pass${detail}`, cls: "not-passed" };
 }
-const STATUS_WORD = { running: "running", starting: "starting", stalled: "no activity for 10 min", finished: "finished", failed: "failed to start" };
+// passed / not-passed / failed / running / ungraded: one word per task result, for colour and counts
+function resultKey(t) {
+  if (t.status === "running" || t.status === "starting") return "running";
+  if (t.reward != null) return t.reward >= 1 ? "passed" : "not-passed";
+  if (t.status === "failed" || t.problem) return "failed";
+  return "ungraded";
+}
+const STATUS_WORD = { running: "running", starting: "starting", stalled: "quiet for 10 minutes", finished: "finished", failed: "failed to start" };
 const AGENT_WORD = { working: "working", waiting: "waiting", finished: "finished", stopped: "stopped" };
 
 // ---------- runs ----------
@@ -96,11 +104,9 @@ function shortDate(iso) {
   return d.toLocaleString(undefined, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit", ...(sameYear ? {} : { year: "numeric" }) });
 }
 function defaultLabel(r) {
-  const parts = [BENCH_WORD[r.benchmark] || r.benchmark || "Run"];
-  if (r.mode === "single") parts.push("single agent");
-  if (r.faux) parts.push("scripted");
-  parts.push(shortDate(r.started_at) || r.job);
-  return parts.join(" · ");
+  const kind = [r.mode === "single" ? "single agent" : null, r.faux ? "scripted" : null].filter(Boolean).join(", ");
+  const when = shortDate(r.started_at);
+  return `${BENCH_WORD[r.benchmark] || r.benchmark || "Run"}${when ? `, ${when}` : ` ${r.job}`}${kind ? ` (${kind})` : ""}`;
 }
 function runLabel(r) { return r.name || defaultLabel(r); }
 function runCounts(r) {
@@ -148,7 +154,7 @@ function renderRail() {
   if (S.renaming && nav.contains(document.activeElement)) return; // never redraw under someone typing a name
   const keep = nav.scrollTop;
   nav.replaceChildren();
-  if (!S.runs.length) nav.append(el("p", "group-label", "No decorum runs in the job folders yet."));
+  if (!S.runs.length) nav.append(el("p", "group-label", "No runs yet."));
   S.runs.forEach((r, i) => {
     const open = isOpen(r, i);
     const card = el("section", `run-card${S.runSel === r.job && !S.sel ? " current" : ""}${r.status === "running" ? " live" : ""}`);
@@ -177,7 +183,7 @@ function renderRail() {
     if (open) {
       const list = el("div", "run-trials");
       for (const t of r.trials) list.append(trialItem(t));
-      if (!r.trials.length) list.append(el("p", "run-empty", r.status === "running" ? "Building the first tasks…" : "No task started in this run."));
+      if (!r.trials.length) list.append(el("p", "run-empty", r.status === "running" ? "Preparing the first tasks…" : "No task started in this run."));
       card.append(list);
     }
     nav.append(card);
@@ -259,9 +265,12 @@ function toast(text) {
 // ---------- one run ----------
 
 function selectRun(job) {
+  if (S.page === "insights") { S.page = "runs"; $("insights").hidden = true; $("nav-runs").setAttribute("aria-selected", "true"); $("nav-insights").setAttribute("aria-selected", "false"); }
+  if (S.runSel !== job) S.teams = null;
   S.runSel = job;
   S.sel = null;
-  history.replaceState(null, "", `#run=${encodeURIComponent(job)}`);
+  history.replaceState(null, "", `#run=${encodeURIComponent(job)}${S.runView === "teams" ? "&view=teams" : ""}`);
+  if (S.runView === "teams") loadTeams(true);
   $("empty").hidden = true;
   $("trial").hidden = true;
   $("run").hidden = false;
@@ -307,6 +316,14 @@ function renderRunOverview() {
     b.type = "button";
     b.addEventListener("click", () => select(t));
     c1.append(b, el("div", "row-sub", repoOf(t)));
+    const before = (r.earlier || []).filter((e) => e.task === t.task);
+    if (before.length) {
+      const prev = el("button", "attempt-link", `attempt ${before.length + 1}; earlier: ${shortReason(before.at(-1).reason)}`);
+      prev.type = "button";
+      prev.title = "Open the earlier attempt";
+      prev.addEventListener("click", () => select(before.at(-1)));
+      c1.append(prev);
+    }
     const o = outcome(t);
     const tests = t.tests?.f2p_total ? `${t.tests.f2p_passed} / ${t.tests.f2p_total}` : "";
     tr.append(
@@ -324,6 +341,7 @@ function renderRunOverview() {
     }
     body.append(tr);
   }
+  renderRetry(r);
   if (r.pending) {
     const tr = el("tr", "pending-row");
     const td = el("td", "", `${r.pending} more task${r.pending > 1 ? "s" : ""} ${r.status === "running" ? "waiting to start" : "never started"}`);
@@ -336,6 +354,7 @@ function renderRunOverview() {
 // ---------- one trial ----------
 
 function select(t) {
+  if (S.page === "insights") { S.page = "runs"; $("insights").hidden = true; $("nav-runs").setAttribute("aria-selected", "true"); $("nav-insights").setAttribute("aria-selected", "false"); }
   S.sel = { job: t.job, trial: t.trial };
   S.runSel = t.job;
   $("run").hidden = true;
@@ -348,6 +367,140 @@ function select(t) {
   closeDrawer();
   renderRail();
   pollTrial(true);
+}
+
+// ---------- retrying failed tasks ----------
+
+const STATE_WORD = { failed: "failed", interrupted: "was interrupted", "not started": "never started" };
+function shortReason(reason) {
+  if (!reason) return "failed";
+  const kind = reason.split(":")[0];
+  return /Error$|^[A-Z][A-Za-z]+$/.test(kind) ? kind : reason.slice(0, 60);
+}
+function renderRetry(r) {
+  const box = $("r-retry");
+  const rt = r.retry;
+  const show = rt && (rt.in_progress || (rt.tasks.length && r.status !== "running"));
+  if (!show) {
+    box.hidden = true;
+    return;
+  }
+  const sig = JSON.stringify([r.job, rt.in_progress, rt.tasks.map((x) => x.task), rt.log]);
+  if (box.dataset.sig === sig) return; // keep the ticks and the focus between polls
+  box.dataset.sig = sig;
+  box.hidden = false;
+  box.replaceChildren();
+  if (rt.in_progress) {
+    box.classList.add("live");
+    box.append(el("h3", "", "Retrying failed tasks"), el("p", "", "They run again in this run, with the same models, rulebook and time limit, and appear in the table below as they start."));
+    if (rt.log) box.append(logDetails(r.job, rt.log));
+    return;
+  }
+  box.classList.remove("live");
+  const n = rt.tasks.length;
+  box.append(el("h3", "", `${plural(n, "task")} without a result`));
+  box.append(el("p", "", "These tasks failed or never finished, so this run has no grade for them. Retry runs only them again, in this run, with the same models, rulebook and time limit. Each failed attempt is kept and can still be opened."));
+  const list = el("ul", "retry-list");
+  for (const x of rt.tasks) {
+    const li = el("li");
+    const label = el("label");
+    const box1 = el("input");
+    box1.type = "checkbox";
+    box1.checked = !S.retryOff.has(`${r.job}/${x.task}`);
+    box1.addEventListener("change", () => {
+      box1.checked ? S.retryOff.delete(`${r.job}/${x.task}`) : S.retryOff.add(`${r.job}/${x.task}`);
+      updateRetryButton(r);
+    });
+    const t = S.trials.find((y) => y.job === r.job && y.trial === x.trial);
+    label.append(box1, el("span", "retry-task", t ? humanTask(t) : x.task));
+    li.append(label, el("span", "retry-why", `${STATE_WORD[x.state] || x.state}${x.state === "failed" && x.reason ? `: ${x.reason}` : ""}`));
+    list.append(li);
+  }
+  const go = el("button", "primary", "");
+  go.type = "button";
+  go.id = "retry-go";
+  go.addEventListener("click", () => askRetry(r));
+  const cmd = el("div", "retry-cmd");
+  const code = el("code", "", rt.command);
+  const copy = el("button", "", "Copy");
+  copy.type = "button";
+  copy.addEventListener("click", async () => {
+    try { await navigator.clipboard.writeText(rt.command); toast("Command copied"); } catch { toast("Select the command and copy it"); }
+  });
+  cmd.append(el("span", "ta-sub", "Or in a terminal:"), code, copy);
+  const actions = el("div", "retry-actions");
+  actions.append(go, cmd);
+  box.append(list, actions);
+  if (rt.log) box.append(logDetails(r.job, rt.log, "The last retry's output"));
+  updateRetryButton(r);
+}
+function pickedTasks(r) { return r.retry.tasks.map((x) => x.task).filter((t) => !S.retryOff.has(`${r.job}/${t}`)); }
+function updateRetryButton(r) {
+  const go = $("retry-go");
+  if (!go) return;
+  const n = pickedTasks(r).length;
+  go.textContent = n ? `Retry ${plural(n, "task")}` : "Retry";
+  go.disabled = !n;
+}
+function logDetails(job, log, label = "Pier's output so far") {
+  const d = el("details", "retry-log");
+  d.append(el("summary", "", `${label} (${log})`));
+  const pre = el("pre", "", "Loading…");
+  d.append(pre);
+  d.addEventListener("toggle", async () => {
+    if (!d.open) return;
+    try { pre.textContent = (await getJSON(`api/runs/retry-log?job=${encodeURIComponent(job)}`)).text || "(empty)"; } catch { pre.textContent = "Could not read the log."; }
+  });
+  return d;
+}
+function askRetry(r) {
+  const tasks = pickedTasks(r);
+  if (!tasks.length) return;
+  const dlg = $("retry-dialog");
+  $("rd-title").textContent = `Retry ${plural(tasks.length, "task")}?`;
+  $("rd-text").textContent = `${tasks.length === 1 ? "It runs" : "They run"} again in “${runLabel(r)}” with the same models, rulebook and time limit, and ${tasks.length === 1 ? "costs" : "cost"} model calls like a first attempt. The failed attempts are kept.`;
+  $("rd-go").textContent = `Retry ${plural(tasks.length, "task")}`;
+  $("rd-go").onclick = async () => {
+    dlg.close();
+    try {
+      const all = tasks.length === r.retry.tasks.length;
+      const res = await fetch("api/runs/retry", { method: "POST", headers: { "Content-Type": "application/json", "X-Decorum-Viewer": "1" }, body: JSON.stringify({ job: r.job, ...(all ? {} : { tasks }) }) });
+      const body = await res.json();
+      if (!res.ok) throw new Error(body.error || res.status);
+      toast(`Retry started: ${plural(body.tasks.length, "task")}`);
+      pollTrials();
+    } catch (e) {
+      toast(`Could not retry: ${e.message}`);
+    }
+  };
+  dlg.showModal();
+}
+$("rd-cancel").addEventListener("click", () => $("retry-dialog").close());
+
+function renderAttempt(t) {
+  const box = $("t-attempt");
+  const run = runOf(t.job);
+  const earlier = run?.earlier || [];
+  const mine = earlier.find((e) => e.trial === t.trial);
+  const before = earlier.filter((e) => e.task === t.task && e.trial !== t.trial);
+  box.replaceChildren();
+  if (mine) {
+    const latest = run.trials.find((x) => x.task === t.task);
+    box.append(`An earlier attempt, set aside when this task was retried${mine.retried_at ? ` on ${shortDate(mine.retried_at)}` : ""}. Why: ${mine.reason || "it failed"}. `);
+    if (latest) {
+      const b = el("button", "linkish", "Open the latest attempt");
+      b.type = "button";
+      b.addEventListener("click", () => select(latest));
+      box.append(b);
+    }
+  } else if (before.length) {
+    box.append(`Attempt ${before.length + 1} of this task. The ${before.length > 1 ? "last earlier attempt" : "first attempt"} ended with ${before.at(-1).reason || "an error"}. `);
+    const b = el("button", "linkish", "Open it");
+    b.type = "button";
+    b.addEventListener("click", () => select(before.at(-1)));
+    box.append(b);
+  }
+  box.hidden = !box.childNodes.length;
 }
 
 function renderHead() {
@@ -379,6 +532,7 @@ function renderHead() {
   const note = $("t-note");
   note.hidden = !t.replay;
   note.textContent = "A replay: a recorded real trial played back at its original pace, so the page has something live to show.";
+  renderAttempt(t);
   const prob = $("t-problem");
   prob.hidden = !t.problem;
   prob.textContent = t.problem || "";
@@ -647,6 +801,7 @@ function fromHash() {
   if (!h) return null;
   if (h.startsWith("run=")) {
     const q = new URLSearchParams(h);
+    if (q.get("view") === "teams" && S.runView !== "teams") { S.runView = "teams"; setTimeout(() => setRunView("teams")); }
     return { job: q.get("run"), trial: q.get("trial") };
   }
   const [job, trial] = h.split("/").map(decodeURIComponent); // the older #job/trial links
@@ -655,6 +810,7 @@ function fromHash() {
 
 let firstLoad = true;
 function followHash() {
+  if (location.hash === "#insights") { if (S.page !== "insights") setPage("insights"); return; }
   const want = fromHash();
   if (!want?.job) return;
   const t = want.trial ? S.trials.find((x) => x.job === want.job && x.trial === want.trial) : null;
@@ -666,12 +822,14 @@ async function pollTrials() {
   try {
     const d = await getJSON("api/runs");
     S.runs = d.runs;
-    S.trials = d.runs.flatMap((r) => r.trials);
+    S.trials = d.runs.flatMap((r) => [...r.trials, ...(r.earlier || [])]);
     renderRail();
-    if (S.runSel && !S.sel) renderRunOverview();
+    if (S.runSel && !S.sel) { renderRunOverview(); loadTeams(false); }
+    if (S.page === "insights") { if (!$("in-runs").contains(document.activeElement)) renderInsightsFilters(); loadInsights(false); }
     $("updated").textContent = S.paused ? "Updates paused" : `Updated ${new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}`;
     if (firstLoad) {
       firstLoad = false;
+      if (location.hash === "#insights") { setPage("insights"); return; }
       const want = fromHash();
       const t = want?.trial ? S.trials.find((x) => x.job === want.job && x.trial === want.trial) : null;
       if (t) select(t);
@@ -739,6 +897,9 @@ document.addEventListener("keydown", (e) => {
   if (e.key === "l" || e.key === "L") setView("timeline");
 });
 
-pollTrials();
-setInterval(pollTrials, 3000);
-setInterval(() => pollTrial(false), 1500);
+// analysis.js loads after this file and defines the analysis pages: start once both are in.
+window.addEventListener("DOMContentLoaded", () => {
+  pollTrials();
+  setInterval(pollTrials, 3000);
+  setInterval(() => pollTrial(false), 1500);
+});

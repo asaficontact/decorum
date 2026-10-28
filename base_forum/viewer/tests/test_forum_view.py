@@ -591,3 +591,401 @@ def test_a_run_is_renamed_through_the_api_and_the_name_is_kept_beside_the_jobs(
         )
     finally:
         server.shutdown()
+
+
+# ---------- team analysis, insights, search ----------
+
+
+def forum_events(trial: Path, at: float) -> None:
+    """A small forum: a plan, two workers (an implementer and a reviewer), a mention, a send-back, a refusal."""
+    f = trial / "agent" / "decorum" / "forum.jsonl"
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text("")
+    seq = iter(range(1, 100))
+
+    def ev(kind: str, t: float, **kw) -> dict:
+        return {"seq": next(seq), "at": iso(at + t), "kind": kind, **kw}
+
+    append(
+        f,
+        ev("thread_opened", 1, thread={"id": "T1", "title": "Plan", "goal": "R1..R3"}),
+        ev(
+            "thread_opened",
+            2,
+            thread={"id": "T2", "title": "Core change", "goal": "Implement R1"},
+        ),
+        ev(
+            "assigned",
+            3,
+            assignment={
+                "worker": "core",
+                "thread": "T2",
+                "persona": "A careful Python engineer",
+            },
+        ),
+        ev(
+            "thread_opened",
+            4,
+            thread={"id": "T3", "title": "Final review", "goal": "Check the diff"},
+        ),
+        ev(
+            "assigned",
+            5,
+            assignment={
+                "worker": "rev",
+                "thread": "T3",
+                "persona": "A reviewer with no prior context",
+            },
+        ),
+        ev(
+            "post",
+            6,
+            post={
+                "thread": "T2",
+                "author": "core",
+                "text": "Added the async variant of fetch()",
+                "mentions": ["rev"],
+            },
+        ),
+        ev(
+            "finished",
+            7,
+            assignment={
+                "worker": "core",
+                "thread": "T2",
+                "summary": "R1 done; pytest -q passed",
+            },
+        ),
+        ev(
+            "post",
+            8,
+            post={
+                "thread": "T2",
+                "author": "authority",
+                "text": "R1 misses the sync variant",
+                "mentions": ["core"],
+            },
+        ),
+        ev(
+            "finished",
+            9,
+            assignment={
+                "worker": "core",
+                "thread": "T2",
+                "summary": "Sync variant added too",
+            },
+        ),
+        ev(
+            "refusal",
+            10,
+            agent="authority",
+            tool="edit",
+            rule="authority",
+            reason="managers do not edit",
+        ),
+        ev("thread_closed", 11, thread={"id": "T3"}),
+    )
+
+
+def test_roles_and_thread_topics_are_read_from_personas_and_titles() -> None:
+    assert fv.role_of("A reviewer with no prior context", "") == "reviewer"
+    assert (
+        fv.role_of("QA engineer", "") == "tester"
+        and fv.role_of("", "tests") == "tester"
+    )
+    assert fv.role_of("An investigator who maps the code", "") == "investigator"
+    assert fv.role_of("A careful Go engineer", "core change") == "implementer"
+    assert fv.kind_of("Plan") == "plan" and fv.kind_of("Final review") == "review"
+    assert (
+        fv.kind_of("README and examples") == "implementation"
+    )  # docs count as implementation
+    assert (
+        fv.kind_of("Core", "write the failing test first") == "tests"
+    )  # the goal decides when the title does not
+
+
+def test_a_runs_team_analysis_names_each_worker_the_threads_and_the_send_backs(
+    jobs: Path,
+) -> None:
+    make_job(jobs, "j", "/x/deep-swe/tasks", ["a-one"])
+    trial = make_trial(jobs, "j", "a-one")
+    forum_events(trial, time.time() - 100)
+    (trial / "agent" / "decorum" / "summary.json").write_text(
+        json.dumps(
+            {
+                "rulebook": {
+                    "name": "base-0",
+                    "budget": {"min_workers_total": 3, "max_workers_total": 6},
+                },
+                "models": {"authority": "a/k3", "worker": "a/k2"},
+                "commit_policy": "leave",
+            }
+        )
+    )
+    d = fv.Store([jobs]).teams("j")
+    assert (
+        d["setup"]["rulebook"]["budget"]["max_workers_total"] == 6
+        and d["setup"]["commit_policy"] == "leave"
+    )
+    [t] = d["tasks"]
+    assert [(w["worker"], w["role"], w["sent_back"]) for w in t["team"]] == [
+        ("core", "implementer", 1),
+        ("rev", "reviewer", 0),
+    ]
+    assert (
+        t["threads"],
+        t["posts_authority"],
+        t["posts_workers"],
+        t["sent_back"],
+        t["refusals"],
+    ) == (3, 1, 1, 1, 1)
+    assert [
+        (th["title"], th["kind"], th["posts"], th["sent_back"])
+        for th in t["thread_list"]
+    ] == [
+        ("Plan", "plan", 0, 0),
+        ("Core change", "implementation", 2, 1),
+        ("Final review", "review", 0, 0),
+    ]
+    assert (
+        t["thread_list"][2]["closed_at"]
+        and {"from": "core", "to": "rev", "n": 1} in t["mentions"]
+    )
+    assert fv.Store([jobs]).teams("nope") is None
+
+
+def test_insights_cover_the_chosen_runs_and_search_finds_posts_and_finish_reports(
+    jobs: Path,
+) -> None:
+    for job, task in (("j1", "a-one"), ("j2", "b-two")):
+        make_job(jobs, job, "/x/deep-swe/tasks", [task])
+        forum_events(make_trial(jobs, job, task), time.time() - 100)
+    store = fv.Store([jobs])
+    assert sorted(r["run"]["job"] for r in store.insights(None)["runs"]) == ["j1", "j2"]
+    assert [r["run"]["job"] for r in store.insights(["j2"])["runs"]] == ["j2"]
+    hits = store.search(
+        "SYNC variant", None
+    )  # words match inside words too: "sync" finds "async"
+    assert hits["total"] == 6 and {h["kind"] for h in hits["hits"]} == {
+        "post",
+        "finish report",
+    }
+    assert {h["role"] for h in hits["hits"]} == {"authority", "implementer"}
+    assert (
+        store.search("variant too", ["j1"])["total"] == 1
+        and store.search("   ", None)["hits"] == []
+    )
+    assert (
+        store.search("async nothing-like-this", None)["total"] == 0
+    )  # every word must match
+
+
+# ---------- retrying failed tasks ----------
+
+
+def failed_attempt(trial: Path, kind: str = "AgentTimeoutError") -> None:
+    (trial / "result.json").write_text(
+        json.dumps(
+            {
+                "exception_info": {
+                    "exception_type": kind,
+                    "exception_message": "timed out after 3000 s",
+                }
+            }
+        )
+    )
+    append(
+        trial / "agent" / "decorum" / "forum.jsonl",
+        {
+            "seq": 1,
+            "at": iso(time.time() - 4000),
+            "kind": "note",
+            "agent": "runtime",
+            "text": "x",
+        },
+    )
+    old = time.time() - 4000
+    for p in [trial, *trial.rglob("*")]:
+        os.utime(p, (old, old))
+
+
+def retry_job(jobs: Path) -> Path:
+    job = make_job(
+        jobs,
+        "j",
+        "/x/deep-swe/tasks",
+        ["a-one", "b-two", "c-three"],
+        started_at="2026-10-28T09:00:00",
+        finished_at="2026-10-28T10:00:00",
+        stats={},
+    )
+    finish(make_trial(jobs, "j", "a-one"), 1.0)
+    failed_attempt(make_trial(jobs, "j", "b-two"))
+    old = time.time() - 4000
+    for p in [job, *job.rglob("*")]:
+        os.utime(p, (old, old))
+    return job
+
+
+def test_a_run_lists_what_retry_would_run_again(jobs: Path) -> None:
+    retry_job(jobs)
+    [run] = fv.Store([jobs]).runs()
+    assert run["status"] == "stopped" and run["earlier"] == []
+    assert [(t["task"], t["state"]) for t in run["retry"]["tasks"]] == [
+        ("b-two", "failed"),
+        ("c-three", "not started"),
+    ]
+    assert (
+        run["retry"]["tasks"][0]["reason"].startswith("AgentTimeoutError")
+        and not run["retry"]["in_progress"]
+    )
+
+
+def test_an_attempt_moved_aside_is_an_earlier_attempt_not_a_trial_of_the_run(
+    jobs: Path,
+) -> None:
+    job = retry_job(jobs)
+    (job / ".attempts").mkdir()
+    (job / "b-two__abc").rename(job / ".attempts" / "b-two__abc")
+    (job / ".attempts" / "attempts.jsonl").write_text(
+        json.dumps(
+            {
+                "at": "2026-10-28T10:05:00+00:00",
+                "task": "b-two",
+                "state": "failed",
+                "reason": "AgentTimeoutError: timed out",
+                "moved_to": ".attempts/b-two__abc",
+            }
+        )
+        + "\n"
+    )
+    t2 = job / "b-two__new"
+    t2.mkdir()
+    (t2 / "config.json").write_text(
+        (job / ".attempts" / "b-two__abc" / "config.json").read_text()
+    )
+    finish(t2, 1.0)
+    store = fv.Store([jobs])
+    [run] = store.runs()
+    assert sorted(t["trial"] for t in run["trials"]) == ["a-one__abc", "b-two__new"]
+    assert run["counts"]["passed"] == 2 and run["counts"]["failed"] == 0
+    [e] = run["earlier"]
+    assert (e["trial"], e["task"], e["reason"], e["superseded"]) == (
+        "b-two__abc",
+        "b-two",
+        "AgentTimeoutError: timed out",
+        True,
+    )
+    assert sorted(t["trial"] for t in store.scan()) == ["a-one__abc", "b-two__new"]
+    assert (
+        store.detail("j", "b-two__abc", 0)["next"] == 1
+    )  # the earlier attempt can still be opened
+
+
+def test_the_retry_endpoint_checks_everything_then_starts_the_script(
+    jobs: Path,
+) -> None:
+    retry_job(jobs)
+    store = fv.Store([jobs])
+    started = []
+
+    class Proc:
+        def poll(self):
+            return None
+
+    store.launch = lambda job, tasks: (
+        started.append((job.name, tasks)) or Proc(),
+        ".attempts/retry-x.log",
+    )
+    server = ThreadingHTTPServer(("127.0.0.1", 0), fv.make_handler(store))
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+
+    def post(body: object, headers: dict | None = None) -> tuple[int, dict]:
+        h = (
+            {"Content-Type": "application/json", "X-Decorum-Viewer": "1"}
+            if headers is None
+            else headers
+        )
+        req = urllib.request.Request(
+            f"{base}/api/runs/retry",
+            data=json.dumps(body).encode(),
+            headers=h,
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req) as r:
+                return r.status, json.load(r)
+        except urllib.error.HTTPError as e:
+            return e.code, json.load(e)
+
+    try:
+        assert (
+            post({"job": "j"}, {"Content-Type": "application/json"})[0] == 403
+        )  # no page header
+        assert post({"job": "nope"})[0] == 404
+        assert post({"job": "j", "tasks": ["a-one"]}) == (
+            400,
+            {"error": "not retryable (graded, or not in this run): a-one"},
+        )
+        assert post({"job": "j", "tasks": "b-two"})[0] == 400
+        assert post(["j"])[0] == 400
+        assert started == []
+        assert post({"job": "j", "tasks": ["b-two"]}) == (
+            200,
+            {"job": "j", "tasks": ["b-two"], "log": ".attempts/retry-x.log"},
+        )
+        assert started == [("j", ["b-two"])]
+        (jobs / "j" / ".attempts").mkdir(exist_ok=True)
+        (jobs / "j" / ".attempts" / "retry-20261028T100000Z.log").write_text(
+            "job j: 3 tasks\n" + "line\n" * 100 + "the end\n"
+        )
+        tail = json.load(urllib.request.urlopen(f"{base}/api/runs/retry-log?job=j"))
+        assert (
+            tail["log"] == ".attempts/retry-20261028T100000Z.log"
+            and tail["text"].endswith("the end")
+            and "job j" not in tail["text"]
+        )
+        [run] = json.load(urllib.request.urlopen(f"{base}/api/runs"))["runs"]
+        assert run["status"] == "running" and run["retry"]["in_progress"]
+        assert post({"job": "j"})[0] == 409  # one retry at a time
+        store.retry_enabled = False
+        assert post({"job": "j"})[0] == 403
+        assert (
+            json.load(urllib.request.urlopen(f"{base}/api/runs"))["runs"][0]["retry"]
+            is None
+        )
+    finally:
+        server.shutdown()
+
+
+def test_a_graded_run_has_nothing_to_retry(jobs: Path) -> None:
+    make_job(
+        jobs,
+        "j",
+        "/x/deep-swe/tasks",
+        ["a-one"],
+        started_at="2026-10-28T09:00:00",
+        finished_at="2026-10-28T10:00:00",
+        stats={},
+    )
+    finish(make_trial(jobs, "j", "a-one"), 0.0)
+    store = fv.Store([jobs])
+    assert store.runs()[0]["retry"]["tasks"] == []
+    with pytest.raises(ValueError, match="nothing to retry"):
+        store.retry("j", None)
+
+
+def test_the_real_launcher_runs_the_script_detached_and_logs_beside_the_attempts(
+    tmp_path: Path,
+) -> None:
+    job = tmp_path / "j"
+    job.mkdir()
+    proc, log = fv.launch_retry(job, ["x"])
+    assert (
+        proc.wait(timeout=30) == 2
+    )  # no config.json: the script refuses, and says so in the log
+    assert (
+        log.startswith(".attempts/retry-")
+        and "has no config.json" in (job / log).read_text()
+    )
