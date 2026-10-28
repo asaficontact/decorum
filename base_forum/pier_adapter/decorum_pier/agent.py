@@ -182,16 +182,43 @@ class DecorumForum(BaseInstalledAgent):
             "package-lock.json": (RUNTIME_DIR / "package-lock.json").read_text(),
         }
         bundle = base64.b64encode(gzip.compress(json.dumps(manifest).encode(), mtime=0)).decode()
-        packages = (
-            "if command -v apt-get >/dev/null; then "
-            "apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends "
-            "ca-certificates curl xz-utils git ripgrep fd-find >/dev/null; "
-            "elif command -v dnf >/dev/null; then dnf install -y -q ca-certificates curl xz git ripgrep fd-find; "
-            "elif command -v yum >/dev/null; then yum install -y -q ca-certificates curl xz git; fi; "
-            # pi's grep and find tools need rg and fd on PATH; without them they try a download the sandbox blocks
-            'command -v fd >/dev/null || { f=$(command -v fdfind) && ln -sf "$f" /usr/local/bin/fd; } || true; '
-            "command -v rg >/dev/null || echo 'decorum: ripgrep not installed; pi grep will fall back to failing' >&2"
-        )
+        # Benchmark images already contain most prerequisites. Reinstalling them asks APT to upgrade them,
+        # which can select unavailable security updates and changes the benchmark's installed environment.
+        packages = r"""
+missing=()
+certificates=false
+for bundle in /etc/ssl/certs/ca-certificates.crt /etc/pki/tls/certs/ca-bundle.crt /etc/ssl/cert.pem; do
+    if [ -s "$bundle" ]; then certificates=true; break; fi
+done
+if ! "$certificates"; then missing+=(ca-certificates); fi
+command -v curl >/dev/null || missing+=(curl)
+if ! command -v xz >/dev/null; then
+    if command -v apt-get >/dev/null; then missing+=(xz-utils); else missing+=(xz); fi
+fi
+command -v git >/dev/null || missing+=(git)
+command -v rg >/dev/null || missing+=(ripgrep)
+if ! command -v fd >/dev/null && ! command -v fdfind >/dev/null; then missing+=(fd-find); fi
+if [ "${#missing[@]}" -gt 0 ]; then
+    if command -v apt-get >/dev/null; then
+        apt-get -o Acquire::Retries=3 update -qq
+        DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=3 install -y -qq \
+            --no-install-recommends --no-upgrade "${missing[@]}"
+    elif command -v dnf >/dev/null; then
+        dnf install -y -q "${missing[@]}"
+    elif command -v yum >/dev/null; then
+        yum install -y -q "${missing[@]}"
+    else
+        echo "decorum: no supported package manager to install: ${missing[*]}" >&2
+        exit 1
+    fi
+fi
+# pi needs these tools before the sandbox's network closes; do not hide a failed install or alias.
+if ! command -v fd >/dev/null; then ln -sf "$(command -v fdfind)" /usr/local/bin/fd; fi
+for tool in curl xz git rg fd; do
+    if ! command -v "$tool" >/dev/null; then echo "decorum: required tool missing: $tool" >&2; exit 1; fi
+    "$tool" --version >/dev/null
+done
+""".strip()
         node = (
             "arch=$(uname -m); case $arch in x86_64) a=x64;; aarch64|arm64) a=arm64;; "
             '*) echo "decorum: unsupported architecture $arch" >&2; exit 1;; esac; '

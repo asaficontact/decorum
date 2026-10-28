@@ -25,8 +25,12 @@ base_forum/
 ## How a trial runs
 
 Pier starts the task's sandbox (no network except the model provider's API), uploads the runtime and the rulebook,
-and runs `node runtime/src/main.ts run` with the task's instruction. Inside, one Node process hosts every agent as a
-pi session:
+and runs `node runtime/src/main.ts run` with the task's instruction.
+
+The image installer reuses existing system tools and installs only missing prerequisites. It checks that curl,
+xz, git, ripgrep and fd run before the sandbox's network closes; existing tools are not requested for upgrade.
+
+Inside, one Node process hosts every agent as a pi session:
 
 1. **The authority** (`-m`, e.g. Kimi K3) gets the instruction, pi's coding tools, and the forum tools:
    `open_thread`, `assign_workers`, `post`, `read_thread`, `list_threads`, `wait`, `close_thread` (and
