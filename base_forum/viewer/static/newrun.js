@@ -345,7 +345,11 @@ function modeBody() {
     w.append(r);
     if (ST.mix === "custom") {
       const c = el("div", "row");
-      for (const band of BANDS) c.append(field(BAND_WORD[band], stepper(Math.min(ST.custom[band], b.tasks.filter((t) => t.band === band).length), 0, b.tasks.filter((t) => t.band === band).length, (v) => { ST.custom[band] = v; ST.n = BANDS.reduce((a, x) => a + ST.custom[x], 0); refresh(); }, `${BAND_WORD[band]} tasks`)));
+      for (const band of BANDS) {
+        ST.custom[band] = Math.min(ST.custom[band], b.tasks.filter((t) => t.band === band).length); // a count can come from the other benchmark
+      }
+      ST.n = BANDS.reduce((a, x) => a + ST.custom[x], 0);
+      for (const band of BANDS) c.append(field(BAND_WORD[band], stepper(ST.custom[band], 0, b.tasks.filter((t) => t.band === band).length, (v) => { ST.custom[band] = v; ST.n = BANDS.reduce((a, x) => a + ST.custom[x], 0); refresh(); }, `${BAND_WORD[band]} tasks`)));
       w.append(c);
     }
     const sp = el("label", "check");

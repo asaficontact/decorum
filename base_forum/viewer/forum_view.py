@@ -45,7 +45,8 @@ RUN_BASELINE = SCRIPTS / "run_baseline.sh"
 THINKING = ("off", "minimal", "low", "medium", "high", "xhigh", "max")
 # provider/model or provider/vendor/model, ASCII only and matched whole (no trailing newline slips through)
 MODEL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9.-]*(/[A-Za-z0-9._:+-]+)+", re.ASCII)
-# run_baseline.sh reads these from its environment: a run started from the page sets them, never inherits them
+# run_baseline.sh reads these from its environment: a run started from the page sets them, never inherits them.
+# DEEPSWE_DIR and SWEPRO_DIR are passed on: they say where this computer keeps the benchmarks, not how a run runs.
 RUN_SETTINGS = (
     "BENCHMARK",
     "MODE",
@@ -1578,7 +1579,7 @@ def make_handler(store: Store, extra_hosts: tuple[str, ...] = ()):
 def paid_actions(store: Store, a: argparse.Namespace) -> None:
     """Retry and New run start paid work. Served beyond this computer (--allow-host, behind a proxy such as
     tailscale serve), anyone who can reach the page could use them, so they are then off unless allowed by name."""
-    remote = bool(a.allow_host)
+    remote = bool(a.allow_host) or a.host not in ("127.0.0.1", "localhost", "::1")
     store.retry_enabled = (
         store.retry_enabled and not a.no_retry and (not remote or a.allow_retry)
     )

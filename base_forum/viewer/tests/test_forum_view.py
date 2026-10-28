@@ -1365,6 +1365,7 @@ def test_paid_actions_are_off_when_the_page_is_served_beyond_this_computer(
 
     def args(**kw):
         base = {
+            "host": "127.0.0.1",
             "allow_host": [],
             "allow_start": False,
             "allow_retry": False,
@@ -1382,6 +1383,7 @@ def test_paid_actions_are_off_when_the_page_is_served_beyond_this_computer(
             True,
         ),
         ({"no_start": True}, False, True),
+        ({"host": "100.64.0.7"}, False, False),  # bound to the Tailscale address
     )
     for kw, start, retry in cases:
         store = fv.Store([jobs])
