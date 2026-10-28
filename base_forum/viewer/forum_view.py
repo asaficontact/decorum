@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
@@ -36,6 +37,52 @@ except ImportError:  # the viewer copied away from base_forum: no retry
     retry_failed = None
 ATTEMPTS = ".attempts"
 DEFAULT_JOBS = HERE.parent / "jobs"
+CATALOG_DIR = HERE.parent / "tasks" / "catalog"
+RUN_LISTS = (
+    HERE.parent / "tasks" / "runs"
+)  # the task list of each run started from the page
+RUN_BASELINE = SCRIPTS / "run_baseline.sh"
+THINKING = ("off", "minimal", "low", "medium", "high", "xhigh", "max")
+# provider/model or provider/vendor/model, ASCII only and matched whole (no trailing newline slips through)
+MODEL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9.-]*(/[A-Za-z0-9._:+-]+)+", re.ASCII)
+# run_baseline.sh reads these from its environment: a run started from the page sets them, never inherits them.
+# DEEPSWE_DIR and SWEPRO_DIR are passed on: they say where this computer keeps the benchmarks, not how a run runs.
+RUN_SETTINGS = (
+    "BENCHMARK",
+    "MODE",
+    "TASKS",
+    "N_TASKS",
+    "RULEBOOK",
+    "AUTHORITY_MODEL",
+    "WORKER_MODEL",
+    "AUTHORITY_THINKING",
+    "WORKER_THINKING",
+    "CONCURRENCY",
+    "CPUS",
+    "MEMORY_MB",
+    "ENV_FILE",
+    "JOBS_DIR",
+    "JOB_NAME",
+    "DRY_RUN",
+    "FAUX",
+    "RETRIES",
+    "MIN_WORKERS",
+    "MAX_WORKERS",
+    "MAX_LIVE_WORKERS",
+    "BUDGET_USD",
+)
+PRESET_FILES = {
+    "deepswe": [
+        ("Baseline 10", "baseline-10.tsv", "the 10 tasks of the first baseline")
+    ],
+    "swebenchpro": [
+        (
+            "Collaborator's 10",
+            "swebenchpro-10.tsv",
+            "the 10 tasks your collaborator runs",
+        )
+    ],
+}
 FORUM_TOOLS = {
     "open_thread",
     "assign_workers",
@@ -486,6 +533,10 @@ class Store:
             str, subprocess.Popen
         ] = {}  # job -> the retry this server started, while it runs
         self.launch = launch_retry
+        self.start_enabled = True
+        self.start_launch = launch_run
+        self.starting: dict[str, dict] = {}
+        self._catalog: dict | None = None
         self.launch_grace = 2.0  # seconds to watch a new retry for an immediate refusal
 
     def scan(self) -> list[dict]:
@@ -565,26 +616,274 @@ class Store:
         names = data.get("names")
         return names if isinstance(names, dict) else {}
 
+    def _set_name(self, root: Path, job: str, text: str) -> None:
+        path = root / NAMES_FILE
+        data = _read_json(path) or {}
+        names = data.get("names") if isinstance(data.get("names"), dict) else {}
+        if text:
+            names[job] = text
+        else:
+            names.pop(job, None)
+        data["names"] = names
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
+        tmp.replace(path)
+
     def rename(self, job: str, name: object) -> str:
         """Give a run a display name (stored beside the jobs, in NAMES_FILE); an empty name restores the default."""
         text = clean_name(name)
         with self.lock:
             for root, j in self._job_dirs():
-                if j.name != job:
-                    continue
-                path = root / NAMES_FILE
-                data = _read_json(path) or {}
-                names = data.get("names") if isinstance(data.get("names"), dict) else {}
-                if text:
-                    names[job] = text
-                else:
-                    names.pop(job, None)
-                data["names"] = names
-                tmp = path.with_suffix(".tmp")
-                tmp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
-                tmp.replace(path)
-                return text
+                if j.name == job:
+                    self._set_name(root, job, text)
+                    return text
         raise KeyError(job)
+
+    # ---------- starting a run ----------
+
+    def catalog(self) -> dict:
+        """The benchmarks the New run page chooses from, with their tasks and saved lists (read once)."""
+        if self._catalog is None:
+            cats = {}
+            for key in ("swebenchpro", "deepswe"):
+                cat = _read_json(CATALOG_DIR / f"{key}.json")
+                if not cat:
+                    continue
+                known = {t["id"] for t in cat["tasks"]}
+                presets = []
+                for name, file, about in PRESET_FILES.get(key, []):
+                    f = HERE.parent / "tasks" / file
+                    if f.exists():
+                        ids = [
+                            ln.split("\t")[0]
+                            for ln in f.read_text().splitlines()
+                            if ln
+                            and not ln.startswith("#")
+                            and not ln.startswith("task\t")
+                        ]
+                        presets.append(
+                            {
+                                "name": name,
+                                "about": about,
+                                "ids": [i for i in ids if i in known],
+                            }
+                        )
+                hard = [t["id"] for t in cat["tasks"] if t.get("hard51")]
+                if hard:
+                    presets.append(
+                        {
+                            "name": "HARD-51",
+                            "about": "Scale's hard subset of V2",
+                            "ids": hard,
+                        }
+                    )
+                cats[key] = {**cat, "presets": presets}
+            self._catalog = cats
+        return {"benchmarks": self._catalog, "start": self.start_enabled}
+
+    def start(self, body: dict) -> dict:
+        """Check a New run request, write its task list, and start run_baseline.sh with it in the background."""
+        if not self.start_enabled:
+            raise PermissionError(
+                "starting runs is switched off in this viewer (--no-start)"
+            )
+        cats = self.catalog()["benchmarks"]
+        key = body.get("benchmark")
+        if key not in cats:
+            raise ValueError(f"benchmark must be one of {', '.join(cats)}")
+        tasks = body.get("tasks")
+        if (
+            not isinstance(tasks, list)
+            or not tasks
+            or not all(isinstance(t, str) for t in tasks)
+        ):
+            raise ValueError("tasks must be a non-empty list of task ids")
+        tasks = list(dict.fromkeys(tasks))
+        known = {t["id"] for t in cats[key]["tasks"]}
+        unknown = [t for t in tasks if t not in known]
+        if unknown:
+            raise ValueError(f"not in {cats[key]['name']}: {', '.join(unknown[:5])}")
+
+        def whole(name: str, lo: int, hi: int, default: int) -> int:
+            v = body.get(name, default)
+            if not isinstance(v, int) or isinstance(v, bool) or not lo <= v <= hi:
+                raise ValueError(f"{name} must be a whole number from {lo} to {hi}")
+            return v
+
+        mode = body.get("mode", "forum")
+        if mode not in ("forum", "single"):
+            raise ValueError("mode must be forum or single")
+        scripted = body.get("scripted") is True
+        models = {
+            "authority_model": body.get("authority_model"),
+            "worker_model": body.get("worker_model") if mode == "forum" else None,
+        }
+        for name, m in models.items():
+            if m is not None and (not isinstance(m, str) or not MODEL_RE.fullmatch(m)):
+                raise ValueError(f"{name} must look like provider/model, got {m!r}")
+        if models["authority_model"] is None or (
+            mode == "forum" and models["worker_model"] is None
+        ):
+            raise ValueError(
+                "authority_model is required, and worker_model in forum mode"
+            )
+        for name in ("authority_thinking", "worker_thinking"):
+            if body.get(name, "high") not in THINKING:
+                raise ValueError(f"{name} must be one of {', '.join(THINKING)}")
+        lo, hi = whole("min_workers", 0, 8, 3), whole("max_workers", 1, 8, 6)
+        if lo > hi:
+            raise ValueError(f"min_workers ({lo}) is more than max_workers ({hi})")
+        live, conc, retries = (
+            whole("max_live_workers", 1, 8, 4),
+            whole("concurrency", 1, 12, 2),
+            whole("retries", 0, 3, 0),
+        )
+        budget = body.get("budget_usd", 10)
+        if (
+            not isinstance(budget, (int, float))
+            or isinstance(budget, bool)
+            or not 1 <= budget <= 1000
+        ):
+            raise ValueError("budget_usd must be from 1 to 1000 dollars")
+        name = clean_name(body.get("name", "") or "")
+        # the keys the models need, from base_forum/.env, where run_baseline.sh reads them (scripted agents need none)
+        if not scripted:
+            env_file = HERE.parent / ".env"
+            have = (
+                retry_failed.read_env_file(env_file)
+                if retry_failed and env_file.is_file()
+                else {}
+            )
+            for m in filter(None, models.values()):
+                need = retry_failed.KEYS.get(m.split("/")[0]) if retry_failed else None
+                if need and not have.get(need):
+                    raise ValueError(
+                        f"{need} is not set: put it in {env_file} (it is never sent to the page)"
+                    )
+        root = self.roots[0]
+        stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+        job = f"{re.sub(r'[^a-z0-9]+', '-', name.lower()).strip('-')[:40] or f'{key}-{mode}'}-{stamp}"
+        with self.lock:
+            if (root / job).exists() or job in self.starting:
+                raise RuntimeError(
+                    "a run with this name was started this second; try again"
+                )
+            RUN_LISTS.mkdir(parents=True, exist_ok=True)
+            tsv = RUN_LISTS / f"{job}.tsv"
+            tsv.write_text("task\n" + "\n".join(tasks) + "\n")
+            env = {
+                "BENCHMARK": key,
+                "TASKS": str(tsv),
+                "MODE": mode,
+                "JOB_NAME": job,
+                "JOBS_DIR": str(root),
+                "AUTHORITY_MODEL": models["authority_model"],
+                "AUTHORITY_THINKING": body.get("authority_thinking", "high"),
+                "CONCURRENCY": str(conc),
+                "RETRIES": str(retries),
+                "BUDGET_USD": f"{budget:g}",
+            }
+            if mode == "forum":
+                env.update(
+                    {
+                        "WORKER_MODEL": models["worker_model"],
+                        "WORKER_THINKING": body.get("worker_thinking", "high"),
+                        "MIN_WORKERS": str(lo),
+                        "MAX_WORKERS": str(hi),
+                        "MAX_LIVE_WORKERS": str(live),
+                    }
+                )
+            if scripted:
+                env["FAUX"] = "smoke"
+            if name:
+                self._set_name(root, job, name)
+            (root / ".decorum-start").mkdir(parents=True, exist_ok=True)
+            log = root / ".decorum-start" / f"{job}.log"
+            proc = self.start_launch(env, log)
+            self.starting[job] = {
+                "proc": proc,
+                "log": log,
+                "benchmark": key,
+                "mode": mode,
+                "tasks": tasks,
+                "name": name or None,
+                "authority_model": models["authority_model"],
+                "worker_model": models["worker_model"],
+                "scripted": scripted,
+                "at": datetime.now(UTC).isoformat(),
+            }
+        deadline = time.time() + self.launch_grace
+        while time.time() < deadline and proc.poll() is None:
+            time.sleep(0.1)
+        if proc.poll() not in (None, 0):
+            lines = [
+                x for x in log.read_text(errors="replace").splitlines() if x.strip()
+            ]
+            # refused at once: leave nothing behind (no listed run, no name, no task list); the log stays
+            with self.lock:
+                self.starting.pop(job, None)
+                if name:
+                    self._set_name(root, job, "")
+                tsv.unlink(missing_ok=True)
+            raise RuntimeError(
+                f"the run did not start: {lines[-1] if lines else 'see ' + str(log)}"
+            )
+        return {"job": job, "tasks": len(tasks), "log": str(log)}
+
+    def _starting_runs(self, present: set[str]) -> list[dict]:
+        """Runs started from the page whose job folder Pier has not made yet (or that stopped before it could)."""
+        out = []
+        bench_word = {"swebenchpro": "SWE-bench Pro", "deepswe": "DeepSWE"}
+        for job, s in list(self.starting.items()):
+            if job in present:
+                if s["proc"].poll() is not None:
+                    del self.starting[job]
+                continue
+            code = s["proc"].poll()
+            problem = None
+            if code not in (None, 0):
+                lines = (
+                    [
+                        x
+                        for x in s["log"].read_text(errors="replace").splitlines()
+                        if x.strip()
+                    ]
+                    if s["log"].exists()
+                    else []
+                )
+                problem = f"The run stopped before Pier made its folder: {lines[-1] if lines else 'see ' + str(s['log'])}"
+            n = len(s["tasks"])
+            out.append(
+                {
+                    "job": job,
+                    "name": s["name"],
+                    "benchmark": bench_word.get(s["benchmark"], s["benchmark"]),
+                    "mode": s["mode"],
+                    "rulebook": "base-0",
+                    "authority_model": s["authority_model"],
+                    "worker_model": s["worker_model"],
+                    "faux": s["scripted"],
+                    "started_at": s["at"],
+                    "finished_at": None,
+                    "status": "starting" if problem is None else "stopped",
+                    "planned": n,
+                    "pending": n,
+                    "counts": {
+                        "running": 0,
+                        "passed": 0,
+                        "not_passed": 0,
+                        "ungraded": 0,
+                        "failed": 0,
+                    },
+                    "cost_usd": 0.0,
+                    "trials": [],
+                    "earlier": [],
+                    "retry": None,
+                    "task_ids": s["tasks"],
+                    "problem": problem,
+                }
+            )
+        return out
 
     # ---------- retrying failed tasks ----------
 
@@ -975,8 +1274,10 @@ class Store:
                         "trials": trials,
                         "earlier": self._earlier(job, earlier),
                         "retry": retry,
+                        "task_ids": task_names or sorted({t["task"] for t in trials}),
                     }
                 )
+            runs += self._starting_runs({r["job"] for r in runs})
             runs.sort(
                 key=lambda r: (r["status"] != "running", -(_ts(r["started_at"]) or 0))
             )
@@ -1095,6 +1396,20 @@ def team_of(st: TrialState) -> dict:
     }
 
 
+def launch_run(env: dict[str, str], log: Path) -> subprocess.Popen:
+    """Run run_baseline.sh on its own, detached from this server, with the run's settings in its environment."""
+    base = {k: v for k, v in os.environ.items() if k not in RUN_SETTINGS}
+    with log.open("w") as out:
+        return subprocess.Popen(
+            ["bash", str(RUN_BASELINE)],
+            env={**base, **env},
+            stdout=out,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+
+
 def launch_retry(job: Path, tasks: list[str] | None) -> tuple[subprocess.Popen, str]:
     """Run retry_failed.py on its own, detached from this server; its output goes to .attempts/retry-<time>.log."""
     (job / ATTEMPTS).mkdir(exist_ok=True)
@@ -1152,7 +1467,7 @@ def make_handler(store: Store, extra_hosts: tuple[str, ...] = ()):
             if not self._host_ok():
                 return self._send(421, b'{"error":"unknown host"}', "application/json")
             u = urlparse(self.path)
-            if u.path not in ("/api/runs/rename", "/api/runs/retry"):
+            if u.path not in ("/api/runs/rename", "/api/runs/retry", "/api/runs/start"):
                 return self._send(404, b'{"error":"not found"}', "application/json")
             # Only the page itself may write: a custom header forces a CORS preflight that a foreign page cannot pass.
             if self.headers.get("X-Decorum-Viewer") != "1" or not (
@@ -1160,7 +1475,7 @@ def make_handler(store: Store, extra_hosts: tuple[str, ...] = ()):
             ).startswith("application/json"):
                 return self._send(403, b'{"error":"forbidden"}', "application/json")
             n = int(self.headers.get("Content-Length") or 0)
-            if n <= 0 or n > 4096:
+            if n <= 0 or n > (262144 if u.path == "/api/runs/start" else 4096):
                 return self._send(400, b'{"error":"bad request"}', "application/json")
 
             def fail(code: int, msg: str) -> None:
@@ -1172,6 +1487,8 @@ def make_handler(store: Store, extra_hosts: tuple[str, ...] = ()):
                 body = json.loads(self.rfile.read(n))
                 if not isinstance(body, dict):
                     raise TypeError("the body must be a JSON object")
+                if u.path == "/api/runs/start":
+                    return self._json(store.start(body))
                 if u.path == "/api/runs/retry":
                     return self._json(
                         store.retry(str(body.get("job", "")), body.get("tasks"))
@@ -1208,6 +1525,8 @@ def make_handler(store: Store, extra_hosts: tuple[str, ...] = ()):
             if u.path == "/api/search":
                 jobs = [j for j in q.get("jobs", "").split(",") if j] or None
                 return self._json(store.search(q.get("q", "")[:200], jobs))
+            if u.path == "/api/catalog":
+                return self._json(store.catalog())
             if u.path == "/api/runs/retry-log":
                 d = store.retry_log(q.get("job", ""))
                 if d is None:
@@ -1257,6 +1576,16 @@ def make_handler(store: Store, extra_hosts: tuple[str, ...] = ()):
     return H
 
 
+def paid_actions(store: Store, a: argparse.Namespace) -> None:
+    """Retry and New run start paid work. Served beyond this computer (--allow-host, behind a proxy such as
+    tailscale serve), anyone who can reach the page could use them, so they are then off unless allowed by name."""
+    remote = bool(a.allow_host) or a.host not in ("127.0.0.1", "localhost", "::1")
+    store.retry_enabled = (
+        store.retry_enabled and not a.no_retry and (not remote or a.allow_retry)
+    )
+    store.start_enabled = not a.no_start and (not remote or a.allow_start)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -1287,6 +1616,21 @@ def main() -> None:
         "requests under any other name are refused",
     )
     ap.add_argument(
+        "--allow-start",
+        action="store_true",
+        help="keep New run on when the page is served beyond this computer (--allow-host)",
+    )
+    ap.add_argument(
+        "--allow-retry",
+        action="store_true",
+        help="keep Retry on when the page is served beyond this computer (--allow-host)",
+    )
+    ap.add_argument(
+        "--no-start",
+        action="store_true",
+        help="hide New run (starting a run costs model calls)",
+    )
+    ap.add_argument(
         "--no-retry",
         action="store_true",
         help="hide the Retry button (retrying runs tasks again, which costs model calls)",
@@ -1296,7 +1640,7 @@ def main() -> None:
     a.tasks = a.tasks or [HERE.parent / ".deep-swe" / "tasks"]
     TASK_DIRS.extend(p.expanduser().resolve() for p in a.tasks)
     store = Store([p.expanduser().resolve() for p in a.jobs])
-    store.retry_enabled = store.retry_enabled and not a.no_retry
+    paid_actions(store, a)
     server = ThreadingHTTPServer(
         (a.host, a.port), make_handler(store, (a.host, *a.allow_host))
     )

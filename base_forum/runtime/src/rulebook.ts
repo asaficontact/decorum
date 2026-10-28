@@ -99,13 +99,6 @@ export function parseRulebook(text: string, source = "rulebook"): Rulebook {
 		if (!budgetKeys.has(key)) throw new RulebookError(`${source}: unknown budget key "${key}" (known: ${[...budgetKeys].join(", ")})`);
 	}
 	const base = BASE_RULEBOOK;
-	const pick = (key: string, fallback: unknown) => (key in b ? b[key] : fallback);
-	const maxLive = numberOrNull("max_live_workers", pick("max_live_workers", base.budget.max_live_workers), source, { min: 0, integer: true });
-	if (maxLive === null) throw new RulebookError(`${source}: budget.max_live_workers cannot be null`);
-	const maxTotal = numberOrNull("max_workers_total", pick("max_workers_total", base.budget.max_workers_total), source, { min: 0, integer: true });
-	const minTotal = numberOrNull("min_workers_total", pick("min_workers_total", base.budget.min_workers_total), source, { min: 0, integer: true });
-	if (minTotal === null) throw new RulebookError(`${source}: budget.min_workers_total cannot be null (use 0 for none)`);
-	if (maxTotal !== null && minTotal > maxTotal) throw new RulebookError(`${source}: budget.min_workers_total (${minTotal}) is more than budget.max_workers_total (${maxTotal})`);
 	const str = (key: string, fallback: string) => {
 		const v = key in data ? data[key] : fallback;
 		if (typeof v !== "string") throw new RulebookError(`${source}: ${key} must be a string`);
@@ -119,15 +112,37 @@ export function parseRulebook(text: string, source = "rulebook"): Rulebook {
 		workspace: choice("workspace", data.workspace ?? base.workspace, source),
 		closing: choice("closing", data.closing ?? base.closing, source),
 		authority: choice("authority", data.authority ?? base.authority, source),
-		budget: {
-			usd_per_trial: numberOrNull("usd_per_trial", pick("usd_per_trial", base.budget.usd_per_trial), source, { min: 0, integer: false }),
-			max_live_workers: maxLive,
-			max_workers_total: maxTotal,
-			min_workers_total: minTotal,
-			wall_clock_sec: numberOrNull("wall_clock_sec", pick("wall_clock_sec", base.budget.wall_clock_sec), source, { min: 1, integer: false }),
-		},
+		budget: budgetFrom(b, base.budget, source),
 		norms: str("norms", base.norms),
 	};
+}
+
+/** A budget from raw values, each checked; a missing key takes the fallback's value. */
+function budgetFrom(b: Record<string, unknown>, fallback: Budget, source: string): Budget {
+	const pick = (key: keyof Budget) => (key in b ? b[key] : fallback[key]);
+	const maxLive = numberOrNull("max_live_workers", pick("max_live_workers"), source, { min: 0, integer: true });
+	if (maxLive === null) throw new RulebookError(`${source}: budget.max_live_workers cannot be null`);
+	const maxTotal = numberOrNull("max_workers_total", pick("max_workers_total"), source, { min: 0, integer: true });
+	const minTotal = numberOrNull("min_workers_total", pick("min_workers_total"), source, { min: 0, integer: true });
+	if (minTotal === null) throw new RulebookError(`${source}: budget.min_workers_total cannot be null (use 0 for none)`);
+	if (maxTotal !== null && minTotal > maxTotal) throw new RulebookError(`${source}: budget.min_workers_total (${minTotal}) is more than budget.max_workers_total (${maxTotal})`);
+	return {
+		usd_per_trial: numberOrNull("usd_per_trial", pick("usd_per_trial"), source, { min: 0, integer: false }),
+		max_live_workers: maxLive,
+		max_workers_total: maxTotal,
+		min_workers_total: minTotal,
+		wall_clock_sec: numberOrNull("wall_clock_sec", pick("wall_clock_sec"), source, { min: 1, integer: false }),
+	};
+}
+
+/** The rulebook with some budget values replaced (a run started from the viewer sets the worker range and the
+ * spend cap per task); the result is checked like a rulebook file, and its name says it was changed. */
+export function withBudget(rb: Rulebook, overrides: Partial<Budget>, source = "--budget overrides"): Rulebook {
+	const set = Object.fromEntries(Object.entries(overrides).filter(([, v]) => v !== undefined));
+	if (!Object.keys(set).length) return rb;
+	const budget = budgetFrom({ ...rb.budget, ...set }, rb.budget, source);
+	const changed = Object.keys(set).map((k) => `${k}=${budget[k as keyof Budget]}`).join(", ");
+	return { ...rb, budget, description: `${rb.description ? `${rb.description} ` : ""}(budget set for this run: ${changed})`.trim() };
 }
 
 /** "between 3 and 6 workers in the trial", "at least 3 workers", "at most 6 workers", or "any number of workers". */

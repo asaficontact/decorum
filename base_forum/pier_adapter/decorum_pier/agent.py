@@ -18,6 +18,7 @@ from __future__ import annotations
 import base64
 import gzip
 import json
+import math
 import os
 import shlex
 import tempfile
@@ -109,6 +110,10 @@ class DecorumForum(BaseInstalledAgent):
         faux: str | None = None,
         commit: bool | str = True,
         wall_clock_sec: float | str | None = None,
+        min_workers: int | str | None = None,
+        max_workers: int | str | None = None,
+        max_live_workers: int | str | None = None,
+        budget_usd: float | str | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(*args, **kwargs)
@@ -124,6 +129,26 @@ class DecorumForum(BaseInstalledAgent):
         self.wall_clock_sec = None if wall_clock_sec in (None, "", "none") else float(wall_clock_sec)
         if self.wall_clock_sec is not None and self.wall_clock_sec <= 0:
             raise ValueError(f"wall_clock_sec must be positive; got {wall_clock_sec!r}")
+        # A run started from the viewer sets the rulebook's worker range and spend cap per task; the runtime checks them
+        # as it checks a rulebook file (min <= max, whole numbers).
+        self.budget_flags: list[str] = []
+        for name, value, flag, whole in (
+            ("min_workers", min_workers, "--min-workers", True),
+            ("max_workers", max_workers, "--max-workers", True),
+            ("max_live_workers", max_live_workers, "--max-live-workers", True),
+            ("budget_usd", budget_usd, "--budget-usd", False),
+        ):
+            if value in (None, "", "none"):
+                continue
+            try:
+                number = float(value) if not isinstance(value, bool) else math.nan
+            except (TypeError, ValueError):
+                number = math.nan
+            if not math.isfinite(number):
+                raise ValueError(f"{name} must be a number; got {value!r}")
+            if number < 0 or (whole and not number.is_integer()):
+                raise ValueError(f"{name} must be a {'whole ' if whole else ''}number >= 0; got {value!r}")
+            self.budget_flags += [flag, str(int(number)) if whole or number.is_integer() else repr(number)]
         for name, level in (("authority_thinking", authority_thinking), ("worker_thinking", worker_thinking)):
             if level not in THINKING:
                 raise ValueError(f"{name} must be one of {sorted(THINKING)}; got {level!r}")
@@ -266,6 +291,7 @@ done
         ]  # fmt: skip
         if self.wall_clock_sec is not None:
             args += ["--wall-clock-sec", str(int(self.wall_clock_sec))]
+        args += self.budget_flags
         if self.faux:
             args += ["--faux", self.faux]
         else:

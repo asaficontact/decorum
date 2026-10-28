@@ -188,21 +188,24 @@ function renderTeams(d) {
 const KINDS = [["plan", "var(--a2)"], ["investigation", "var(--a3)"], ["implementation", "var(--a0)"], ["tests", "var(--a4)"], ["review", "var(--a6)"]];
 const KIND_COLOR = Object.fromEntries(KINDS);
 const IN = { bench: "all", extra: false, off: new Set(), data: null, at: 0 };
+// The three pages: a run (or a task), Insights across runs, and New run.
 function setPage(page) {
   S.page = page;
-  $("nav-runs").setAttribute("aria-selected", String(page !== "insights"));
+  $("nav-runs").setAttribute("aria-selected", String(page === "runs"));
   $("nav-insights").setAttribute("aria-selected", String(page === "insights"));
+  $("nav-new").setAttribute("aria-current", page === "new" ? "page" : "false");
   $("insights").hidden = page !== "insights";
-  if (page === "insights") {
-    $("run").hidden = true; $("trial").hidden = true; $("empty").hidden = true;
-    S.sel = null; S.runSel = null;
-    closeDrawer();
-    history.replaceState(null, "", "#insights");
-    renderRail();
-    renderInsightsFilters();
-    loadInsights(true);
-  }
+  $("newrun").hidden = page !== "new";
+  if (page === "runs") return;
+  $("run").hidden = true; $("trial").hidden = true; $("empty").hidden = true;
+  S.sel = null; S.runSel = null;
+  closeDrawer();
+  history.replaceState(null, "", page === "new" ? "#new" : "#insights");
+  renderRail();
+  if (page === "insights") { renderInsightsFilters(); loadInsights(true); }
+  if (page === "new") NewRun.show();
 }
+$("nav-new").addEventListener("click", () => setPage("new"));
 $("nav-insights").addEventListener("click", () => setPage("insights"));
 $("nav-runs").addEventListener("click", () => { setPage("runs"); if (S.runs.length) selectRun(S.runs[0].job); });
 function inRuns() {

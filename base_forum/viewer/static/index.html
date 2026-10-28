@@ -20,6 +20,7 @@
         <button type="button" role="tab" id="nav-runs" aria-selected="true">Runs</button>
         <button type="button" role="tab" id="nav-insights" aria-selected="false">Insights across runs</button>
       </div>
+      <button type="button" class="new-run" id="nav-new" aria-current="false">＋ New run</button>
     </header>
     <nav id="trials" class="trials"></nav>
     <footer class="rail-foot"><span id="updated">Connecting…</span></footer>
@@ -31,6 +32,8 @@
       <p>Start one with <code>base_forum/scripts/run_baseline.sh</code>; it appears on the left as soon as Pier creates its job folder. Each run is one benchmark run of up to ten tasks; open a run to see its results, open a task to watch its forum.</p>
       <p>In each task, the <b>authority</b> plans the work and runs it through <b>threads</b>: it assigns <b>workers</b> to them, each with a persona and instructions, and they report back with posts and a finish report. Click an agent to see everything it did.</p>
     </div>
+
+    <section id="newrun" hidden aria-label="New run"></section>
 
     <section id="insights" hidden aria-labelledby="in-title">
       <header class="run-top">
@@ -94,6 +97,7 @@
           <button type="button" class="rename-btn big" id="r-rename">Rename</button>
         </div>
         <p class="facts" id="r-facts"></p>
+        <p class="problem" id="r-problem" hidden></p>
       </header>
       <div class="view-tabs run-tabs" role="tablist" aria-label="Run view">
         <button role="tab" id="rt-tasks" aria-selected="true" aria-controls="r-tasks-view">Tasks</button>
@@ -203,6 +207,12 @@
   <div class="rd-actions"><button type="button" id="rd-cancel">Cancel</button><button type="button" class="primary" id="rd-go">Retry</button></div>
 </dialog>
 <script src="app.js"></script>
+<dialog class="start-dialog" id="start-dialog" aria-labelledby="sd-title">
+  <h3 id="sd-title">Start?</h3>
+  <p id="sd-text"></p>
+  <div class="sd-actions"><button type="button" id="sd-cancel">Cancel</button><button type="button" class="primary" id="sd-go">Start</button></div>
+</dialog>
 <script src="analysis.js"></script>
+<script src="newrun.js"></script>
 </body>
 </html>

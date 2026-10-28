@@ -14,7 +14,7 @@ import { parseArgs } from "node:util";
 import { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { registerFaux } from "./faux.ts";
 import { ModelSpecError, resolveModel } from "./models.ts";
-import { BASE_RULEBOOK, loadRulebook, RulebookError } from "./rulebook.ts";
+import { BASE_RULEBOOK, loadRulebook, RulebookError, withBudget } from "./rulebook.ts";
 import type { CommitPolicy, Mode, ThinkingLevel } from "./runtime.ts";
 import { ForumRuntime } from "./runtime.ts";
 
@@ -22,7 +22,8 @@ const THINKING = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 const USAGE = `usage: decorum-forum run --instruction-file F --repo DIR --out DIR [--mode forum|single]
   --authority-model provider/id [--worker-model provider/id] [--rulebook FILE]
   [--authority-thinking LEVEL] [--worker-thinking LEVEL] [--work-dir DIR] [--faux smoke]
-  [--commit-policy commit|leave] [--wall-clock-sec N] [--max-authority-wakes N]`;
+  [--commit-policy commit|leave] [--wall-clock-sec N] [--max-authority-wakes N]
+  [--min-workers N] [--max-workers N] [--max-live-workers N] [--budget-usd X]   (override the rulebook's budget)`;
 
 class ConfigError extends Error {}
 
@@ -50,6 +51,10 @@ async function main(argv: string[]): Promise<number> {
 			"commit-policy": { type: "string", default: "commit" },
 			"wall-clock-sec": { type: "string" },
 			"max-authority-wakes": { type: "string" },
+			"min-workers": { type: "string" },
+			"max-workers": { type: "string" },
+			"max-live-workers": { type: "string" },
+			"budget-usd": { type: "string" },
 		},
 		strict: true,
 	});
@@ -66,7 +71,19 @@ async function main(argv: string[]): Promise<number> {
 	for (const k of ["authority-thinking", "worker-thinking"] as const) {
 		if (!THINKING.includes(v[k]!)) throw new ConfigError(`--${k} must be one of ${THINKING.join(", ")}.`);
 	}
-	const rulebook = v.rulebook ? loadRulebook(v.rulebook) : BASE_RULEBOOK;
+	const num = (k: "min-workers" | "max-workers" | "max-live-workers" | "budget-usd"): number | undefined => {
+		const x = v[k];
+		if (x === undefined) return undefined;
+		const n = Number(x);
+		if (x.trim() === "" || !Number.isFinite(n)) throw new ConfigError(`--${k} must be a number, got "${x}".`);
+		return n;
+	};
+	const rulebook = withBudget(v.rulebook ? loadRulebook(v.rulebook) : BASE_RULEBOOK, {
+		min_workers_total: num("min-workers"),
+		max_workers_total: num("max-workers"),
+		max_live_workers: num("max-live-workers"),
+		usd_per_trial: num("budget-usd"),
+	});
 	const commitPolicy = v["commit-policy"] as CommitPolicy;
 	if (commitPolicy !== "commit" && commitPolicy !== "leave") throw new ConfigError(`--commit-policy must be commit or leave, got "${commitPolicy}".`);
 	const wallClockSec = v["wall-clock-sec"] === undefined ? undefined : Number(v["wall-clock-sec"]);
