@@ -17,6 +17,7 @@ test("the shipped base-0 rulebook equals the runtime's default", () => {
 test("a rulebook may omit rules; omitted rules take base-0's value", () => {
 	const rb = parseRulebook("name: tiny\nbudget:\n  usd_per_trial: 3\n");
 	assert.equal(rb.visibility, "all");
+	assert.equal(rb.authority, "manager");
 	assert.equal(rb.budget.usd_per_trial, 3);
 	assert.equal(rb.budget.max_live_workers, BASE_RULEBOOK.budget.max_live_workers);
 });
@@ -24,6 +25,7 @@ test("a rulebook may omit rules; omitted rules take base-0's value", () => {
 test("an unknown rule, an unknown value or a bad number is refused, naming it", () => {
 	assert.throws(() => parseRulebook("reviewers: 2\n"), (e: Error) => e instanceof RulebookError && /unknown rule "reviewers"/.test(e.message));
 	assert.throws(() => parseRulebook("visibility: some\n"), /visibility must be one of all \| participants/);
+	assert.throws(() => parseRulebook("authority: boss\n"), /authority must be one of manager \| player/);
 	assert.throws(() => parseRulebook("budget:\n  max_live_workers: 1.5\n"), /max_live_workers must be an integer/);
 	assert.throws(() => parseRulebook("budget:\n  max_live_workers: null\n"), /cannot be null/);
 	assert.throws(() => parseRulebook("budget:\n  tokens: 5\n"), /unknown budget key "tokens"/);

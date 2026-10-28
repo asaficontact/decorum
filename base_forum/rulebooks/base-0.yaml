@@ -1,14 +1,16 @@
-# base-0: the open forum. The baseline Decorum's evolved rulebooks are compared against.
-# Anyone reads and posts anywhere, workers share the authority's checkout, a worker closes its own
-# assignment with a summary. Only the trial's limits are enforced. Every key is typed: an unknown key
+# base-0: the open forum with a manager. The baseline Decorum's evolved rulebooks are compared against.
+# The authority runs the work through workers and does not edit files itself (Tawab, 2026-10-27); anyone
+# reads and posts anywhere, workers share the authority's checkout, a worker closes its own assignment with
+# a summary. Beyond that only the trial's limits are enforced. Every key is typed: an unknown key
 # or value is refused when the rulebook is loaded (runtime/src/rulebook.ts).
 name: base-0
-description: "The open forum: anyone reads and posts anywhere, workers share the checkout, a worker closes its own assignment; only the trial's limits are enforced."
+description: "The open forum with a manager: the authority runs the work through workers and does not edit files itself; anyone reads and posts anywhere, workers share the checkout, a worker closes its own assignment; beyond that only the trial's limits are enforced."
 
 visibility: all          # all | participants — which threads an agent may read
 posting: all             # all | participants — which threads an agent may post in
 workspace: shared        # shared | isolated  — one checkout for everyone, or a git worktree per worker
 closing: self            # self | evidence    — what a worker must give to finish its assignment
+authority: manager       # manager | player   — manager: the authority's write and edit tools are refused
 
 budget:
   usd_per_trial: 10      # dollars for the whole trial, all agents; null = no cap

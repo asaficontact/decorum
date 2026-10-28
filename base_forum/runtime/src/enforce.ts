@@ -47,6 +47,14 @@ export function checkResume(rb: Rulebook, s: TrialState): Decision {
 	return OK;
 }
 
+/** Authority: under "manager" the authority's own write and edit calls are refused; the work goes to workers. */
+export function checkAuthorityTool(rb: Rulebook, tool: string): Decision {
+	if (rb.authority === "manager" && (tool === "write" || tool === "edit")) {
+		return { ok: false, rule: "authority", reason: "Under this rulebook the authority manages and does not change files itself. Assign the change to a worker (assign_workers, or post the change to an existing worker's thread).", terminate: false };
+	}
+	return OK;
+}
+
 /** Visibility: may this agent read this thread? The authority owns every thread, so it always may. */
 export function checkRead(rb: Rulebook, agent: string, participants: readonly string[]): Decision {
 	if (rb.visibility === "all" || participants.includes(agent)) return OK;

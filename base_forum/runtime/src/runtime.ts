@@ -8,7 +8,7 @@ import type { Model } from "@earendil-works/pi-ai";
 import { createAgentSession, DefaultResourceLoader, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
 import type { AgentSession, ModelRuntime, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { Decision, TrialState } from "./enforce.ts";
-import { checkBudget, checkResume, checkSpawn } from "./enforce.ts";
+import { checkAuthorityTool, checkBudget, checkResume, checkSpawn } from "./enforce.ts";
 import type { ForumEvent } from "./forum.ts";
 import { Forum, ForumError } from "./forum.ts";
 import { AUTHORITY, authoritySystemPrompt, digest, WORKER_NUDGE, workerFirstPrompt, workerSystemPrompt } from "./prompts.ts";
@@ -306,6 +306,13 @@ export class ForumRuntime implements ForumHost {
 		}
 		if (a.running) {
 			const evs = this.drain(a);
+			// A finished worker still in its last turn that is sent back gets its assignment reopened now, so the
+			// report it files for the new work is a report, not a repeat.
+			if (a.role === "worker" && a.finished && evs.some((e) => this.wakesFinished(a, e))) {
+				a.finished = false;
+				a.nudges = 0;
+				this.forum.reopenAssignment(a.name);
+			}
 			const text = digest(evs);
 			a.steered.push({ text, events: evs });
 			a.session.steer(text).catch((e: unknown) => {
@@ -505,9 +512,19 @@ export class ForumRuntime implements ForumHost {
 						pi.on("tool_call", async (event) => {
 							if (runtime.stopped) return { block: true, reason: `The trial is stopping: ${runtime.stopReason}`, terminate: true };
 							const d = checkBudget(runtime.rulebook, runtime.state());
-							if (d.ok) return undefined;
-							runtime.stop(d.rule, d.reason, spec.name, event.toolName);
-							return { block: true, reason: d.reason, terminate: true };
+							if (!d.ok) {
+								runtime.stop(d.rule, d.reason, spec.name, event.toolName);
+								return { block: true, reason: d.reason, terminate: true };
+							}
+							// the manager rule binds the authority only, and only when there is a forum to manage
+							if (spec.role === "authority" && runtime.o.mode === "forum") {
+								const a = checkAuthorityTool(runtime.rulebook, event.toolName);
+								if (!a.ok) {
+									runtime.forum.refusal(spec.name, event.toolName, a.rule, a.reason);
+									return { block: true, reason: a.reason };
+								}
+							}
+							return undefined;
 						});
 					},
 				},

@@ -110,7 +110,7 @@ test("the dollar budget stops every agent, and what was done is still committed"
 				return call("bash", { command: "true" });
 			},
 		},
-		{ rulebook: { budget: { usd_per_trial: 0.05 } }, cost: { input: 5, output: 5, cacheRead: 5, cacheWrite: 5 } },
+		{ rulebook: { authority: "player", budget: { usd_per_trial: 0.05 } }, cost: { input: 5, output: 5, cacheRead: 5, cacheWrite: 5 } },
 	);
 	assert.equal(summary.end_reason, "budget.usd_per_trial");
 	assert.ok(summary.cost_usd >= 0.05);
@@ -402,4 +402,42 @@ test("a second finish() is a no-op, not a second report", async () => {
 
 test("mentionsIn finds each @name once and ignores e-mail addresses", () => {
 	assert.deepEqual(mentionsIn("@w1 and @api-2, again @w1; mail me@host.com or @@x"), ["w1", "api-2"]);
+});
+
+// ---- the authority as manager (Tawab, 2026-10-27) ----
+
+test("under authority: manager the authority's write and edit are refused, and a worker makes the change", async () => {
+	const { summary, repo, outDir } = await runTrial({
+		authority: ({ step, seen }) => {
+			if (step === 0) return call("write", { path: "mine.txt", content: "x\n" });
+			if (step === 1) {
+				assert.match(seen, /Under this rulebook the authority manages and does not change files itself/);
+				return call("open_thread", { title: "t", goal: "g" });
+			}
+			if (step === 2) return call("assign_workers", { thread: "T1", workers: [{ name: "w1", persona: "p", instructions: "write w.txt" }] });
+			if (!seen.includes("w1 finished")) return call("wait", { timeout_sec: 30 });
+			if (!seen.includes("[main")) return call("bash", { command: "git add -A && git commit -qm done && git log --oneline -1 | cat && echo '[main ok]'" });
+			return say("done");
+		},
+		w1: ({ step }) => (step === 0 ? call("write", { path: "w.txt", content: "w\n" }) : step === 1 ? call("finish", { summary: "wrote w.txt" }) : say("ok")),
+	});
+	assert.equal(summary.end_reason, "authority_done");
+	assert.ok(!existsSync(join(repo, "mine.txt")), "the authority's own write never happened");
+	assert.ok(existsSync(join(repo, "w.txt")));
+	assert.deepEqual(summary.refusals.map((r) => [r.agent, r.tool, r.rule]), [["authority", "write", "authority"]]);
+	assert.ok(events(outDir).some((e) => e.kind === "refusal" && e.rule === "authority"));
+});
+
+test("under authority: player, and in single mode, the authority edits files itself", async () => {
+	for (const opts of [{ rulebook: { authority: "player" as const } }, { mode: "single" as const }]) {
+		const { summary, repo } = await runTrial(
+			{
+				authority: ({ step }) => (step === 0 ? call("write", { path: "a.txt", content: "a\n" }) : say("done")),
+				single: ({ step }) => (step === 0 ? call("write", { path: "a.txt", content: "a\n" }) : say("done")),
+			},
+			opts,
+		);
+		assert.equal(summary.refusals.length, 0, JSON.stringify(opts));
+		assert.ok(existsSync(join(repo, "a.txt")));
+	}
 });

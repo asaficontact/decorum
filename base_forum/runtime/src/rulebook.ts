@@ -9,6 +9,7 @@ export type Visibility = "all" | "participants";
 export type Posting = "all" | "participants";
 export type Workspace = "shared" | "isolated";
 export type Closing = "self" | "evidence";
+export type AuthorityRole = "manager" | "player";
 
 export interface Budget {
 	/** Dollars for the whole trial, all agents together. null = no cap. */
@@ -32,6 +33,8 @@ export interface Rulebook {
 	workspace: Workspace;
 	/** What a worker must give to finish its assignment. */
 	closing: Closing;
+	/** manager: the authority may not write or edit files, workers make every change; player: it may. */
+	authority: AuthorityRole;
 	budget: Budget;
 	/** Prompt-only norms: text every agent reads, enforced by nothing. */
 	norms: string;
@@ -42,15 +45,17 @@ const CHOICES = {
 	posting: ["all", "participants"],
 	workspace: ["shared", "isolated"],
 	closing: ["self", "evidence"],
+	authority: ["manager", "player"],
 } as const;
 
 export const BASE_RULEBOOK: Rulebook = {
 	name: "base-0",
-	description: "The open forum: anyone reads and posts anywhere, workers share the checkout, a worker closes its own assignment; only the trial's limits are enforced.",
+	description: "The open forum with a manager: the authority runs the work through workers and does not edit files itself; anyone reads and posts anywhere, workers share the checkout, a worker closes its own assignment; beyond that only the trial's limits are enforced.",
 	visibility: "all",
 	posting: "all",
 	workspace: "shared",
 	closing: "self",
+	authority: "manager",
 	budget: { usd_per_trial: 10, max_live_workers: 4, max_workers_total: null, wall_clock_sec: 9000 },
 	norms: "",
 };
@@ -78,7 +83,7 @@ export function parseRulebook(text: string, source = "rulebook"): Rulebook {
 	const raw: unknown = parse(text) ?? {};
 	if (typeof raw !== "object" || Array.isArray(raw)) throw new RulebookError(`${source}: the rulebook must be a YAML mapping`);
 	const data = raw as Record<string, unknown>;
-	const known = new Set(["name", "description", "visibility", "posting", "workspace", "closing", "budget", "norms"]);
+	const known = new Set(["name", "description", "visibility", "posting", "workspace", "closing", "authority", "budget", "norms"]);
 	for (const key of Object.keys(data)) {
 		if (!known.has(key)) throw new RulebookError(`${source}: unknown rule "${key}" (known: ${[...known].join(", ")})`);
 	}
@@ -107,6 +112,7 @@ export function parseRulebook(text: string, source = "rulebook"): Rulebook {
 		posting: choice("posting", data.posting ?? base.posting, source),
 		workspace: choice("workspace", data.workspace ?? base.workspace, source),
 		closing: choice("closing", data.closing ?? base.closing, source),
+		authority: choice("authority", data.authority ?? base.authority, source),
 		budget: {
 			usd_per_trial: numberOrNull("usd_per_trial", pick("usd_per_trial", base.budget.usd_per_trial), source, { min: 0, integer: false }),
 			max_live_workers: maxLive,
@@ -130,6 +136,9 @@ export function describeRules(rb: Rulebook): string {
 		rb.workspace === "shared"
 			? "- Workspace: all agents work in the same checkout; other agents may be editing files at the same time."
 			: "- Workspace: each worker works in its own git worktree on its own branch; the authority merges finished work.",
+		rb.authority === "manager"
+			? "- Authority: the authority manages; it may not write or edit files, and workers make every change."
+			: "- Authority: the authority may also write and edit files itself.",
 		rb.closing === "self"
 			? "- Closing: a worker finishes its own assignment with a summary."
 			: "- Closing: a worker finishes only with evidence: the commands it ran to check the work and what they printed.",
