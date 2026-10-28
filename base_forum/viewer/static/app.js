@@ -77,7 +77,7 @@ function outcome(t) {
   return t.reward >= 1 ? { word: `passed${detail}`, cls: "passed" } : { word: `did not pass${detail}`, cls: "finished" };
 }
 const STATUS_WORD = { running: "running", starting: "starting", stalled: "no activity for 10 min", finished: "finished", failed: "failed to start" };
-const AGENT_WORD = { working: "working", waiting: "waiting for messages", finished: "finished", stopped: "stopped" };
+const AGENT_WORD = { working: "working", waiting: "waiting", finished: "finished", stopped: "stopped" };
 
 // ---------- the rail ----------
 
@@ -171,7 +171,7 @@ function renderTeam() {
     top.append(who(a.name));
     top.append(el("span", `st ${a.state} agent-st`, AGENT_WORD[a.state] || a.state));
     c.append(top);
-    c.append(el("div", "persona", a.role === "authority" ? "Leads the task; opens threads and assigns workers" : `${a.persona || ""}${a.thread ? ` · in ${a.thread}` : ""}`));
+    c.append(el("div", "persona", a.role === "authority" ? "Manages the team: plans, assigns workers, verifies" : `${a.persona || ""}${a.thread ? ` · in ${a.thread}` : ""}`));
     const last = [...a.actions].reverse().find((x) => !x.forum) || a.actions.at(-1);
     const doing = el("div", "doing");
     const refused = S.events.filter((e) => e.kind === "refusal" && e.agent === a.name).length;
@@ -394,7 +394,7 @@ function renderDrawer() {
   if (!a) return;
   $("d-name").replaceChildren(who(a.name));
   $("d-meta").textContent = `${a.role === "authority" ? "Authority" : `Worker in ${a.thread}`} · ${a.model || ""} · ${AGENT_WORD[a.state] || a.state} · ${a.calls} model calls · ${money(a.cost_usd)}`;
-  $("d-persona").textContent = a.role === "authority" ? "Leads the task; opens threads and assigns workers." : a.persona || "";
+  $("d-persona").textContent = a.role === "authority" ? "Manages the team: writes the plan, assigns and briefs workers, follows and verifies their work, and commits." : a.persona || "";
   const ol = $("d-actions");
   ol.replaceChildren();
   for (const x of [...a.actions].reverse()) {
