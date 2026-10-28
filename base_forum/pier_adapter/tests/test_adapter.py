@@ -76,6 +76,10 @@ def test_a_runs_worker_range_and_spend_cap_reach_the_runtime(tmp_path):
         make(tmp_path, min_workers="2.5")
     with pytest.raises(ValueError, match="budget_usd must be a number"):
         make(tmp_path, budget_usd="lots")
+    for bad in ("inf", "nan", True):
+        with pytest.raises(ValueError, match="must be a number"):
+            make(tmp_path, max_workers=bad)
+    assert "--budget-usd 1234567 " in make(tmp_path, budget_usd=1234567)._command() + " "  # no rounding
 
 
 def test_configuration_errors_are_named(tmp_path):

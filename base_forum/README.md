@@ -151,7 +151,7 @@ The sheet on the right shows what the run will be and the most it can spend and 
 chosen tasks are against the whole benchmark, and how uncertain a pass rate is at that many tasks. **Start** writes
 the list to `tasks/runs/<run>.tsv` and starts `run_baseline.sh` with the settings shown under "What it runs"; the run
 appears in the list at once. A model's key must be in `base_forum/.env`: the page says which one is missing and never
-sees it. Start the viewer with `--no-start` to hide the button.
+sees it. Start the viewer with `--no-start` to hide the button. When the page is served beyond this computer (`--allow-host`, behind a proxy such as tailscale serve), anyone who can reach it could start paid work, so New run and Retry are then off unless you add `--allow-start` or `--allow-retry`.
 
 The catalogues the page chooses from are in `tasks/catalog/`, built by `scripts/build_catalog.py` from the public
 data (sources in the script). The worker range and the spend cap reach the runtime as `MIN_WORKERS`, `MAX_WORKERS`,

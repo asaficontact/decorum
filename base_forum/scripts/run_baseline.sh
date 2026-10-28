@@ -68,9 +68,9 @@ case "$BENCHMARK" in
 esac
 case "$RETRIES" in ''|*[!0-9]*) die "RETRIES must be a whole number, got '$RETRIES'" ;; esac
 for v in MIN_WORKERS MAX_WORKERS MAX_LIVE_WORKERS; do
-  case "${!v:-0}" in *[!0-9]*) die "$v must be a whole number, got '${!v}'" ;; esac
+  if [ -n "${!v:-}" ] && ! [[ "${!v}" =~ ^[0-9]{1,3}$ ]]; then die "$v must be a whole number up to 999, got '${!v}'"; fi
 done
-case "${BUDGET_USD:-0}" in *[!0-9.]*|*.*.*) die "BUDGET_USD must be a number of dollars, got '$BUDGET_USD'" ;; esac
+if [ -n "${BUDGET_USD:-}" ] && ! [[ "$BUDGET_USD" =~ ^[0-9]{1,6}(\.[0-9]+)?$ ]]; then die "BUDGET_USD must be a number of dollars, got '$BUDGET_USD'"; fi
 if [ -n "${MIN_WORKERS:-}" ] && [ -n "${MAX_WORKERS:-}" ] && [ "$MIN_WORKERS" -gt "$MAX_WORKERS" ]; then
   die "MIN_WORKERS ($MIN_WORKERS) is more than MAX_WORKERS ($MAX_WORKERS)"
 fi

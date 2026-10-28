@@ -43,7 +43,33 @@ RUN_LISTS = (
 )  # the task list of each run started from the page
 RUN_BASELINE = SCRIPTS / "run_baseline.sh"
 THINKING = ("off", "minimal", "low", "medium", "high", "xhigh", "max")
-MODEL_RE = re.compile(r"^[A-Za-z0-9][\w.-]*/[\w.:+-]+$")
+# provider/model or provider/vendor/model, ASCII only and matched whole (no trailing newline slips through)
+MODEL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9.-]*(/[A-Za-z0-9._:+-]+)+", re.ASCII)
+# run_baseline.sh reads these from its environment: a run started from the page sets them, never inherits them
+RUN_SETTINGS = (
+    "BENCHMARK",
+    "MODE",
+    "TASKS",
+    "N_TASKS",
+    "RULEBOOK",
+    "AUTHORITY_MODEL",
+    "WORKER_MODEL",
+    "AUTHORITY_THINKING",
+    "WORKER_THINKING",
+    "CONCURRENCY",
+    "CPUS",
+    "MEMORY_MB",
+    "ENV_FILE",
+    "JOBS_DIR",
+    "JOB_NAME",
+    "DRY_RUN",
+    "FAUX",
+    "RETRIES",
+    "MIN_WORKERS",
+    "MAX_WORKERS",
+    "MAX_LIVE_WORKERS",
+    "BUDGET_USD",
+)
 PRESET_FILES = {
     "deepswe": [
         ("Baseline 10", "baseline-10.tsv", "the 10 tasks of the first baseline")
@@ -692,7 +718,7 @@ class Store:
             "worker_model": body.get("worker_model") if mode == "forum" else None,
         }
         for name, m in models.items():
-            if m is not None and (not isinstance(m, str) or not MODEL_RE.match(m)):
+            if m is not None and (not isinstance(m, str) or not MODEL_RE.fullmatch(m)):
                 raise ValueError(f"{name} must look like provider/model, got {m!r}")
         if models["authority_model"] is None or (
             mode == "forum" and models["worker_model"] is None
@@ -719,17 +745,14 @@ class Store:
         ):
             raise ValueError("budget_usd must be from 1 to 1000 dollars")
         name = clean_name(body.get("name", "") or "")
-        # the keys the models need, from base_forum/.env or this process (scripted agents need none)
+        # the keys the models need, from base_forum/.env, where run_baseline.sh reads them (scripted agents need none)
         if not scripted:
             env_file = HERE.parent / ".env"
-            have = {
-                **(
-                    retry_failed.read_env_file(env_file)
-                    if retry_failed and env_file.is_file()
-                    else {}
-                ),
-                **os.environ,
-            }
+            have = (
+                retry_failed.read_env_file(env_file)
+                if retry_failed and env_file.is_file()
+                else {}
+            )
             for m in filter(None, models.values()):
                 need = retry_failed.KEYS.get(m.split("/")[0]) if retry_failed else None
                 if need and not have.get(need):
@@ -795,6 +818,12 @@ class Store:
             lines = [
                 x for x in log.read_text(errors="replace").splitlines() if x.strip()
             ]
+            # refused at once: leave nothing behind (no listed run, no name, no task list); the log stays
+            with self.lock:
+                self.starting.pop(job, None)
+                if name:
+                    self._set_name(root, job, "")
+                tsv.unlink(missing_ok=True)
             raise RuntimeError(
                 f"the run did not start: {lines[-1] if lines else 'see ' + str(log)}"
             )
@@ -1368,10 +1397,11 @@ def team_of(st: TrialState) -> dict:
 
 def launch_run(env: dict[str, str], log: Path) -> subprocess.Popen:
     """Run run_baseline.sh on its own, detached from this server, with the run's settings in its environment."""
+    base = {k: v for k, v in os.environ.items() if k not in RUN_SETTINGS}
     with log.open("w") as out:
         return subprocess.Popen(
             ["bash", str(RUN_BASELINE)],
-            env={**os.environ, **env},
+            env={**base, **env},
             stdout=out,
             stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,
@@ -1545,6 +1575,16 @@ def make_handler(store: Store, extra_hosts: tuple[str, ...] = ()):
     return H
 
 
+def paid_actions(store: Store, a: argparse.Namespace) -> None:
+    """Retry and New run start paid work. Served beyond this computer (--allow-host, behind a proxy such as
+    tailscale serve), anyone who can reach the page could use them, so they are then off unless allowed by name."""
+    remote = bool(a.allow_host)
+    store.retry_enabled = (
+        store.retry_enabled and not a.no_retry and (not remote or a.allow_retry)
+    )
+    store.start_enabled = not a.no_start and (not remote or a.allow_start)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -1575,6 +1615,16 @@ def main() -> None:
         "requests under any other name are refused",
     )
     ap.add_argument(
+        "--allow-start",
+        action="store_true",
+        help="keep New run on when the page is served beyond this computer (--allow-host)",
+    )
+    ap.add_argument(
+        "--allow-retry",
+        action="store_true",
+        help="keep Retry on when the page is served beyond this computer (--allow-host)",
+    )
+    ap.add_argument(
         "--no-start",
         action="store_true",
         help="hide New run (starting a run costs model calls)",
@@ -1589,8 +1639,7 @@ def main() -> None:
     a.tasks = a.tasks or [HERE.parent / ".deep-swe" / "tasks"]
     TASK_DIRS.extend(p.expanduser().resolve() for p in a.tasks)
     store = Store([p.expanduser().resolve() for p in a.jobs])
-    store.retry_enabled = store.retry_enabled and not a.no_retry
-    store.start_enabled = not a.no_start
+    paid_actions(store, a)
     server = ThreadingHTTPServer(
         (a.host, a.port), make_handler(store, (a.host, *a.allow_host))
     )

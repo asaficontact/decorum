@@ -266,6 +266,7 @@ function benchCards(compact) {
       ST.picked = new Set();
       ST.filters = { repo: "", language: "", band: "", category: "", hard51: false, q: "" };
       ST.sameRun = 0;
+      if (ST.mode === "pick" || ST.mode === "same") ST.mode = "random"; // those were the other benchmark's tasks
       render();
     });
     w.append(card);
@@ -344,7 +345,7 @@ function modeBody() {
     w.append(r);
     if (ST.mix === "custom") {
       const c = el("div", "row");
-      for (const band of BANDS) c.append(field(BAND_WORD[band], stepper(ST.custom[band], 0, 99, (v) => { ST.custom[band] = v; ST.n = BANDS.reduce((a, x) => a + ST.custom[x], 0); refresh(); }, `${BAND_WORD[band]} tasks`)));
+      for (const band of BANDS) c.append(field(BAND_WORD[band], stepper(Math.min(ST.custom[band], b.tasks.filter((t) => t.band === band).length), 0, b.tasks.filter((t) => t.band === band).length, (v) => { ST.custom[band] = v; ST.n = BANDS.reduce((a, x) => a + ST.custom[x], 0); refresh(); }, `${BAND_WORD[band]} tasks`)));
       w.append(c);
     }
     const sp = el("label", "check");
@@ -352,7 +353,7 @@ function modeBody() {
     i.type = "checkbox"; i.checked = ST.spread;
     i.addEventListener("change", () => { ST.spread = i.checked; refresh(); });
     sp.append(i, " Spread each band over the repositories");
-    w.append(narrowRow(false), sp, el("p", "why", `Difficulty is how often published attempts solved each task (${b.solve_source}), cut into four equal bands. Every band is covered, so the run cannot be all easy or all hard by chance.`));
+    w.append(narrowRow(false), sp, el("p", "why", `Difficulty is how often published attempts solved each task (${b.solve_source}), cut into four bands at the quartiles. Tasks with the same rate stay together, so the bands are not always equal: ${ST.benchKey === "swebenchpro" ? "on SWE-bench Pro the very hard band holds every task no published model solved. " : ""}Every band is covered, so the run cannot be all easy or all hard by chance.`));
   } else if (ST.mode === "same") {
     const runs = ST.sameRuns;
     const list = el("div", "same-list");
@@ -372,7 +373,7 @@ function modeBody() {
     const ta = el("textarea", "paste");
     ta.value = ST.paste;
     ta.rows = 6;
-    ta.placeholder = ST.benchKey === "swebenchpro" ? "instance_ansible__ansible-83fb24b9…\nqutebrowser-fea33d6\nflipt-io, navidrome-…" : "igel-persist-feature-schema\nbandit-incremental-cache-control";
+    ta.placeholder = ST.benchKey === "swebenchpro" ? "instance_ansible__ansible-83fb24b9…\ninstance_qutebrowser__qutebrowser-fea33d6\nflipt-io__flipt-0b119520" : "igel-persist-feature-schema\nbandit-incremental-cache-control";
     ta.setAttribute("aria-label", "Task ids");
     ta.addEventListener("input", () => { ST.paste = ta.value; refresh(); });
     w.append(ta, el("div", "paste-check", ""), el("p", "why", "A full id, or any unique start of one: “qutebrowser-fea33d6” is enough."));

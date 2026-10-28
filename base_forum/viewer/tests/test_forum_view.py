@@ -1252,22 +1252,25 @@ def test_a_bad_request_is_refused_before_anything_is_written(
     assert calls == [] and not (jobs / "runlists").exists()
 
 
-def test_real_models_need_their_key(
+def test_real_models_need_their_key_in_base_forum_env(
     jobs: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store, calls = starter(jobs, monkeypatch)
-    monkeypatch.delenv("MOONSHOT_API_KEY", raising=False)
-    monkeypatch.setattr(fv, "HERE", jobs / "nowhere" / "viewer")  # no base_forum/.env
+    monkeypatch.setattr(fv, "HERE", jobs / "base" / "viewer")
+    monkeypatch.setenv(
+        "MOONSHOT_API_KEY", "sk-test"
+    )  # in the viewer's shell only: run_baseline.sh reads .env
     with pytest.raises(ValueError, match="MOONSHOT_API_KEY is not set"):
         store.start(start_body(scripted=False))
-    monkeypatch.setenv("MOONSHOT_API_KEY", "sk-test")
+    (jobs / "base").mkdir(exist_ok=True)
+    (jobs / "base" / ".env").write_text("MOONSHOT_API_KEY=sk-test\n")
     assert (
         store.start(start_body(scripted=False))["tasks"] == 2
         and "FAUX" not in calls[0][0]
     )
 
 
-def test_a_start_that_fails_at_once_says_why_and_the_run_shows_stopped(
+def test_a_start_refused_at_once_says_why_and_leaves_nothing_behind(
     jobs: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store, _ = starter(jobs, monkeypatch)
@@ -1285,8 +1288,105 @@ def test_a_start_that_fails_at_once_says_why_and_the_run_shows_stopped(
         RuntimeError, match="the run did not start: run_baseline: Docker is not running"
     ):
         store.start(start_body())
+    assert store.runs() == [] and list((jobs / "runlists").iterdir()) == []
+    assert json.loads((jobs / fv.NAMES_FILE).read_text())["names"] == {}
+
+
+def test_a_run_that_stops_after_starting_shows_why(
+    jobs: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store, _ = starter(jobs, monkeypatch)
+    state = {"code": None}
+
+    class Later:
+        def poll(self):
+            return state["code"]
+
+    def launch(env: dict, log: Path) -> Later:
+        log.write_text("cloning…\nrun_baseline: could not prepare the tasks\n")
+        return Later()
+
+    store.start_launch = launch
+    store.start(start_body())
+    assert store.runs()[0]["status"] == "starting"
+    state["code"] = 2
     [run] = store.runs()
-    assert run["status"] == "stopped" and "Docker is not running" in run["problem"]
+    assert run["status"] == "stopped" and run["problem"].endswith(
+        "run_baseline: could not prepare the tasks"
+    )
+
+
+def test_model_ids_are_matched_whole_and_in_ascii(
+    jobs: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store, calls = starter(jobs, monkeypatch)
+    for bad in (
+        "moonshotai/kimi-k3\n",
+        "moonshotai/kimi-ｋ３",
+        "kimi-k3",
+        "/kimi",
+        "moonshotai/kimi k3",
+    ):
+        with pytest.raises(ValueError, match="must look like provider/model"):
+            store.start(start_body(authority_model=bad))
+    store.start(start_body(authority_model="openrouter/moonshotai/kimi-k3"))
+    assert calls[-1][0]["AUTHORITY_MODEL"] == "openrouter/moonshotai/kimi-k3"
+
+
+def test_the_runs_settings_are_its_own_not_the_shells(
+    jobs: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen = {}
+
+    class Popen:
+        def __init__(self, argv, env, **kw):
+            seen.update(env=env, argv=argv)
+
+    monkeypatch.setattr(fv.subprocess, "Popen", Popen)
+    for k, v in (
+        ("N_TASKS", "1"),
+        ("RULEBOOK", "other"),
+        ("DRY_RUN", "1"),
+        ("FAUX", "smoke"),
+        ("PATH", "/usr/bin"),
+    ):
+        monkeypatch.setenv(k, v)
+    fv.launch_run({"BENCHMARK": "deepswe", "JOB_NAME": "j"}, jobs / "log")
+    env = seen["env"]
+    assert env["BENCHMARK"] == "deepswe" and env["PATH"] == "/usr/bin"
+    assert not {"N_TASKS", "RULEBOOK", "DRY_RUN", "FAUX"} & set(env)
+    assert seen["argv"][0] == "bash" and seen["argv"][1].endswith("run_baseline.sh")
+
+
+def test_paid_actions_are_off_when_the_page_is_served_beyond_this_computer(
+    jobs: Path,
+) -> None:
+    import argparse
+
+    def args(**kw):
+        base = {
+            "allow_host": [],
+            "allow_start": False,
+            "allow_retry": False,
+            "no_start": False,
+            "no_retry": False,
+        }
+        return argparse.Namespace(**{**base, **kw})
+
+    cases = (
+        ({}, True, True),
+        ({"allow_host": ["trex.example"]}, False, False),
+        (
+            {"allow_host": ["trex.example"], "allow_start": True, "allow_retry": True},
+            True,
+            True,
+        ),
+        ({"no_start": True}, False, True),
+    )
+    for kw, start, retry in cases:
+        store = fv.Store([jobs])
+        fv.paid_actions(store, args(**kw))
+        assert (store.start_enabled, store.retry_enabled) == (start, retry), kw
 
 
 def test_the_start_endpoint_needs_the_page_header_and_can_be_switched_off(

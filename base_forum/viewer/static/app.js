@@ -303,6 +303,8 @@ function renderRunOverview() {
     fact("Workers", r.mode === "forum" ? r.worker_model : null);
   }
   fact("Rulebook", r.rulebook);
+  $("r-problem").hidden = !r.problem;
+  $("r-problem").textContent = r.problem || "";
   const graded = r.counts.passed + r.counts.not_passed;
   $("r-score").textContent = graded ? `${r.counts.passed} of ${graded} graded tasks passed` : r.status === "running" ? "No task graded yet" : "No task was graded";
   $("r-bar").replaceChildren(runBar(r, true));

@@ -18,6 +18,7 @@ from __future__ import annotations
 import base64
 import gzip
 import json
+import math
 import os
 import shlex
 import tempfile
@@ -140,12 +141,14 @@ class DecorumForum(BaseInstalledAgent):
             if value in (None, "", "none"):
                 continue
             try:
-                number = float(value)
+                number = float(value) if not isinstance(value, bool) else math.nan
             except (TypeError, ValueError):
-                raise ValueError(f"{name} must be a number; got {value!r}") from None
-            if number < 0 or (whole and number != int(number)):
+                number = math.nan
+            if not math.isfinite(number):
+                raise ValueError(f"{name} must be a number; got {value!r}")
+            if number < 0 or (whole and not number.is_integer()):
                 raise ValueError(f"{name} must be a {'whole ' if whole else ''}number >= 0; got {value!r}")
-            self.budget_flags += [flag, str(int(number)) if whole else f"{number:g}"]
+            self.budget_flags += [flag, str(int(number)) if whole or number.is_integer() else repr(number)]
         for name, level in (("authority_thinking", authority_thinking), ("worker_thinking", worker_thinking)):
             if level not in THINKING:
                 raise ValueError(f"{name} must be one of {sorted(THINKING)}; got {level!r}")
