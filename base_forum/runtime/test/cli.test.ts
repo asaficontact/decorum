@@ -55,3 +55,23 @@ test("--faux smoke runs a whole forum trial from the command line and writes the
 	assert.equal(s.agents.length, 4);
 	assert.match(gitOut(repo, "ls-files"), /DECORUM_SMOKE_w1.md/);
 });
+
+test("--min-workers, --max-workers, --max-live-workers and --budget-usd set the rulebook's budget for the run", () => {
+	const repo = gitRepo();
+	const out = tempDir();
+	const r = cli(["run", "--instruction", "Write smoke files.", "--repo", repo, "--out", out, "--work-dir", tempDir(), "--faux", "smoke",
+		"--min-workers", "2", "--max-workers", "3", "--max-live-workers", "2", "--budget-usd", "4"]);
+	assert.equal(r.code, 0, r.err);
+	const s = JSON.parse(readFileSync(join(out, "summary.json"), "utf8"));
+	assert.equal(s.rulebook.budget.min_workers_total, 2);
+	assert.equal(s.rulebook.budget.max_workers_total, 3);
+	assert.equal(s.rulebook.budget.max_live_workers, 2);
+	assert.equal(s.rulebook.budget.usd_per_trial, 4);
+	const base = ["run", "--instruction", "x", "--repo", gitRepo(), "--out", tempDir(), "--work-dir", tempDir(), "--faux", "smoke"];
+	const flipped = cli([...base, "--min-workers", "5", "--max-workers", "2"]);
+	assert.equal(flipped.code, 2);
+	assert.match(flipped.err, /min_workers_total \(5\) is more than budget.max_workers_total \(2\)/);
+	const word = cli([...base, "--budget-usd", "lots"]);
+	assert.equal(word.code, 2);
+	assert.match(word.err, /--budget-usd must be a number, got "lots"/);
+});

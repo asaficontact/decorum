@@ -5,7 +5,7 @@ import { test } from "node:test";
 import { checkBudget, checkFinish, checkPost, checkRead, checkSpawn } from "../src/enforce.ts";
 import type { TrialState } from "../src/enforce.ts";
 import { Forum, ForumError } from "../src/forum.ts";
-import { BASE_RULEBOOK, describeRules, loadRulebook, parseRulebook, RulebookError } from "../src/rulebook.ts";
+import { BASE_RULEBOOK, describeRules, loadRulebook, parseRulebook, RulebookError, withBudget } from "../src/rulebook.ts";
 import { tempDir } from "./helpers.ts";
 
 const RULEBOOKS = join(import.meta.dirname, "..", "..", "rulebooks");
@@ -94,4 +94,16 @@ test("the forum numbers threads, posts and assignments, and appends every event 
 	assert.throws(() => f.thread("T9"), /No thread "T9"/);
 	const kinds = readFileSync(log, "utf8").trim().split("\n").map((l) => JSON.parse(l).kind);
 	assert.deepEqual(kinds, ["thread_opened", "assigned", "post", "finished", "thread_closed"]);
+});
+
+test("a run can set the worker range and the spend cap; the result is checked like a rulebook", () => {
+	assert.equal(withBudget(BASE_RULEBOOK, {}), BASE_RULEBOOK);
+	assert.equal(withBudget(BASE_RULEBOOK, { min_workers_total: undefined }), BASE_RULEBOOK);
+	const rb = withBudget(BASE_RULEBOOK, { min_workers_total: 2, max_workers_total: 4, max_live_workers: 2, usd_per_trial: 5 });
+	assert.deepEqual(rb.budget, { ...BASE_RULEBOOK.budget, min_workers_total: 2, max_workers_total: 4, max_live_workers: 2, usd_per_trial: 5 });
+	assert.match(rb.description, /budget set for this run: min_workers_total=2, max_workers_total=4, max_live_workers=2, usd_per_trial=5/);
+	assert.equal(rb.name, BASE_RULEBOOK.name);
+	assert.throws(() => withBudget(BASE_RULEBOOK, { min_workers_total: 7 }), /min_workers_total \(7\) is more than budget.max_workers_total \(6\)/);
+	assert.throws(() => withBudget(BASE_RULEBOOK, { max_workers_total: 1.5 }), RulebookError);
+	assert.throws(() => withBudget(BASE_RULEBOOK, { usd_per_trial: -1 }), /usd_per_trial must be a number >= 0/);
 });

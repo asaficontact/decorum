@@ -19,6 +19,8 @@
 #   TASKS [per benchmark]              a TSV whose first column is the task id (# lines and the header are skipped)
 #   N_TASKS [all]                      run only the first N tasks of the list
 #   CONCURRENCY [2]                    trials at once
+#   MIN_WORKERS, MAX_WORKERS          the fewest and most workers per task (default: the rulebook's, 3 and 6 in base-0)
+#   MAX_LIVE_WORKERS, BUDGET_USD       workers at once, and the spend cap per task in dollars (default: the rulebook's)
 #   RETRIES [0]                        retry a trial that fails on infrastructure (Docker, network, a crash) up to N
 #                                      times during the run; Pier never retries a timeout or a grading error this way.
 #                                      After a run, scripts/retry_failed.py retries any failed task, timeouts included.
@@ -65,6 +67,13 @@ case "$BENCHMARK" in
   *) die "BENCHMARK must be deepswe or swebenchpro, got '$BENCHMARK'" ;;
 esac
 case "$RETRIES" in ''|*[!0-9]*) die "RETRIES must be a whole number, got '$RETRIES'" ;; esac
+for v in MIN_WORKERS MAX_WORKERS MAX_LIVE_WORKERS; do
+  case "${!v:-0}" in *[!0-9]*) die "$v must be a whole number, got '${!v}'" ;; esac
+done
+case "${BUDGET_USD:-0}" in *[!0-9.]*|*.*.*) die "BUDGET_USD must be a number of dollars, got '$BUDGET_USD'" ;; esac
+if [ -n "${MIN_WORKERS:-}" ] && [ -n "${MAX_WORKERS:-}" ] && [ "$MIN_WORKERS" -gt "$MAX_WORKERS" ]; then
+  die "MIN_WORKERS ($MIN_WORKERS) is more than MAX_WORKERS ($MAX_WORKERS)"
+fi
 case "$MODE" in
   forum) AGENT=decorum_pier:DecorumForum ;;
   single) AGENT=decorum_pier:DecorumSingle ;;
@@ -142,6 +151,12 @@ if [ -n "$MEMORY_MB" ]; then cmd+=(--override-memory-mb "$MEMORY_MB"); fi
 if [ "$MODE" = forum ]; then cmd+=(--ak "worker_model=$WORKER_MODEL" --ak "worker_thinking=$WORKER_THINKING"); fi
 if [ -n "${FAUX:-}" ]; then cmd+=(--ak "faux=$FAUX"); fi
 if [ "$RETRIES" -gt 0 ]; then cmd+=(--max-retries "$RETRIES"); fi
+if [ "$MODE" = forum ]; then
+  if [ -n "${MIN_WORKERS:-}" ]; then cmd+=(--ak "min_workers=$MIN_WORKERS"); fi
+  if [ -n "${MAX_WORKERS:-}" ]; then cmd+=(--ak "max_workers=$MAX_WORKERS"); fi
+  if [ -n "${MAX_LIVE_WORKERS:-}" ]; then cmd+=(--ak "max_live_workers=$MAX_LIVE_WORKERS"); fi
+fi
+if [ -n "${BUDGET_USD:-}" ]; then cmd+=(--ak "budget_usd=$BUDGET_USD"); fi
 
 echo "job $JOB_NAME: $BENCHMARK, ${#ids[@]} tasks, mode $MODE, rulebook $RULEBOOK, authority $AUTHORITY_MODEL ($AUTHORITY_THINKING)$([ "$MODE" = forum ] && echo ", workers $WORKER_MODEL ($WORKER_THINKING)")"
 echo "time limit: the tasks' ${limit} s (the runtime stops by ${WALL_CLOCK_SEC} s at the latest, sooner if the rulebook says so); commit: $COMMIT; sandbox: ${CPUS:-task default} CPUs, ${MEMORY_MB:-task default} MB"

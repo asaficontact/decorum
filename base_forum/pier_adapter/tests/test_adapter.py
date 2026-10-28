@@ -68,6 +68,16 @@ def test_swebench_pro_settings_reach_the_runtime(tmp_path):
         make(tmp_path, wall_clock_sec=0)
 
 
+def test_a_runs_worker_range_and_spend_cap_reach_the_runtime(tmp_path):
+    assert "--min-workers" not in make(tmp_path)._command()
+    cmd = make(tmp_path, min_workers="2", max_workers=5, max_live_workers="3", budget_usd="7.5")._command()
+    assert "--min-workers 2 --max-workers 5 --max-live-workers 3 --budget-usd 7.5" in cmd
+    with pytest.raises(ValueError, match="min_workers must be a whole number"):
+        make(tmp_path, min_workers="2.5")
+    with pytest.raises(ValueError, match="budget_usd must be a number"):
+        make(tmp_path, budget_usd="lots")
+
+
 def test_configuration_errors_are_named(tmp_path):
     with pytest.raises(ValueError, match="worker_model"):
         DecorumForum(logs_dir=tmp_path, model_name="moonshotai/kimi-k3")
