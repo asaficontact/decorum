@@ -16,6 +16,8 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+import retry_failed  # same folder: the summary names what retry_failed.py would retry
+
 
 def _seconds(timing: dict | None) -> float | None:
     if not timing or not timing.get("started_at") or not timing.get("finished_at"):
@@ -38,8 +40,29 @@ def _reward(result: dict, trial: Path) -> tuple[float | None, str | None]:
     return None, None
 
 
+def earlier_attempts(job: Path) -> tuple[dict[str, int], float]:
+    """Per task, how many earlier attempts retry_failed.py moved aside, and what those attempts cost."""
+    log = job / ".attempts" / "attempts.jsonl"
+    counts: dict[str, int] = {}
+    if log.exists():
+        for line in log.read_text().splitlines():
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            counts[row.get("task", "?")] = counts.get(row.get("task", "?"), 0) + 1
+    cost = 0.0
+    for s_path in job.glob(".attempts/*/agent/decorum/summary.json"):
+        try:
+            cost += float(json.loads(s_path.read_text()).get("cost_usd") or 0)
+        except (ValueError, TypeError):
+            pass
+    return counts, cost
+
+
 def load(job: Path) -> list[dict]:
     rows = []
+    earlier, _ = earlier_attempts(job)
     for rfile in sorted(job.glob("*/result.json")):
         trial = rfile.parent
         result = json.loads(rfile.read_text())
@@ -50,7 +73,7 @@ def load(job: Path) -> list[dict]:
         reward, graded_by = _reward(result, trial)
         rows.append(
             {
-                "task": result.get("task_name", trial.name).split("/")[-1],
+                "task": retry_failed.task_of(trial),
                 "trial": trial.name,
                 "reward": reward,
                 "graded_by": graded_by,
@@ -71,6 +94,7 @@ def load(job: Path) -> list[dict]:
                 "exception": None
                 if graded_by == "regrade"
                 else exc.get("exception_type"),
+                "attempts": 1 + earlier.get(retry_failed.task_of(trial), 0),
             }
         )
     return rows
@@ -128,6 +152,8 @@ def main() -> int:
         "end_reason",
         "exception",
     ]
+    if any(r["attempts"] > 1 for r in rows):
+        cols.append("attempts")
     fmt = lambda v: (
         "-" if v is None else (f"{v:.2f}" if isinstance(v, float) else str(v))
     )
@@ -152,6 +178,20 @@ def main() -> int:
     print(
         f"cost ${cost:.2f} total, ${cost / len(rows):.2f} per trial; workers used in {sum(1 for r in rows if r['workers'])} of {len(rows)} trials"
     )
+    earlier, earlier_cost = earlier_attempts(a.job)
+    if earlier:
+        print(
+            f"{len(earlier)} task(s) were retried; their {sum(earlier.values())} earlier attempt(s) cost ${earlier_cost:.2f} more"
+            f" and are kept in {a.job / '.attempts'}"
+        )
+    if (a.job / "config.json").exists():
+        todo = retry_failed.retryable(retry_failed.classify(a.job))
+        if todo:
+            kinds = ", ".join(f"{n} {k}" for k in ("failed", "interrupted", "not started") if (n := sum(r["state"] == k for r in todo)))
+            print(
+                f"{len(todo)} task(s) have no graded attempt ({kinds}); retry them with:\n"
+                f"  python3 {Path(__file__).resolve().parent / 'retry_failed.py'} {a.job}"
+            )
     if a.csv:
         with a.csv.open("w", newline="") as f:
             w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
