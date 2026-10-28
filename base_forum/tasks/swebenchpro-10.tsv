@@ -1,0 +1,14 @@
+# SWE-bench Pro V2: the 10 tasks Tawab's collaborator uses (2026-10-27). Reference columns: whether each model
+# solved the task in Scale's own 2025 runs on v1 (SWE-agent, 250 turns; traj/<run>/eval_results.json in
+# github.com/scaleapi/SWE-bench_Pro-os); V2 rewrote problem statements, so they are a guide, not a baseline.
+task	repo	language	kimi_k2_v1_2025	sonnet45_v1_2025	gpt5_v1_2025
+instance_ansible__ansible-83fb24b923064d3576d473747ebbe62e4535c9e3-vba6da65a0f3baefda7a058ebbd0a8dcafb8512f5	ansible/ansible	python	0	0	0
+instance_ansible__ansible-12734fa21c08a0ce8c84e533abdc560db2eb1955-v7eee2454f617569fd6889f2211f75bc02a35f9f8	ansible/ansible	python	1	1	1
+instance_ansible__ansible-106909db8b730480615f4a33de0eb5b710944e78-v0f01c69f1e2528b935359cfe578530722bca2c59	ansible/ansible	python	0	1	0
+instance_ansible__ansible-cd9c4eb5a6b2bfaf4a6709f001ce3d0c92c1eed2-v0f01c69f1e2528b935359cfe578530722bca2c59	ansible/ansible	python	0	0	0
+instance_internetarchive__openlibrary-43f9e7e0d56a4f1d487533543c17040a029ac501-v0f5aece3601a5b4419f7ccec1dbda2071be28ee4	internetarchive/openlibrary	python	0	1	1
+instance_internetarchive__openlibrary-6afdb09df692223c3a31df65cfa92f15e5614c01-v08d8e8889ec945ab821fb156c04c7d2e2810debb	internetarchive/openlibrary	python	0	1	0
+instance_internetarchive__openlibrary-2abe28b472ffed563a87cfe83685b161b35263b0-v13642507b4fc1f8d234172bf8129942da2c2ca26	internetarchive/openlibrary	python	1	1	1
+instance_qutebrowser__qutebrowser-fea33d607fde83cf505b228238cf365936437a63-v9f8e9d96c85c85a605e382f1510bd08563afc566	qutebrowser/qutebrowser	python	0	1	1
+instance_qutebrowser__qutebrowser-0b621cb0ce2b54d3f93d8d41d8ff4257888a87e5-v2ef375ac784985212b1805e1d0431dc8f1b3c171	qutebrowser/qutebrowser	python	1	1	1
+instance_qutebrowser__qutebrowser-96b997802e942937e81d2b8a32d08f00d3f4bc4e-v5fc38aaf22415ab0b70567368332beee7955b367	qutebrowser/qutebrowser	python	1	1	1

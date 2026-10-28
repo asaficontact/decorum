@@ -1,0 +1,7 @@
+.env
+jobs/
+.deep-swe/
+__pycache__/
+*.egg-info/
+.venv/
+.swebench-pro/
