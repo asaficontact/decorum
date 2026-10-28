@@ -14,9 +14,10 @@ base_forum/
   pier_adapter/             decorum_pier: the Pier agents DecorumForum and DecorumSingle
   scripts/run_baseline.sh   run N DeepSWE tasks with Pier + Docker
   scripts/summarize.py      one table per job, against the leaderboard's Kimi K3 reference
+  scripts/retry_failed.py   run a job's failed tasks again, in the same job, keeping the failed attempts
   scripts/regrade.sh        grade a trial's patch by hand when Pier's verifier step fails
   scripts/watch.py          follow a running job live in the terminal
-  viewer/                   the forum viewer: a live web page over every trial in the job folders
+  viewer/                   Forum Decorum, the viewer: runs, forums, team analysis and insights, live
   tasks/baseline-10.tsv     DeepSWE: the 10 baseline tasks, with Kimi K3 / K2.7-code reference pass rates
   tasks/swebenchpro-10.tsv  SWE-bench Pro V2: the 10 tasks the collaborators use, with Scale's 2025 per-task results
 ```
@@ -24,8 +25,12 @@ base_forum/
 ## How a trial runs
 
 Pier starts the task's sandbox (no network except the model provider's API), uploads the runtime and the rulebook,
-and runs `node runtime/src/main.ts run` with the task's instruction. Inside, one Node process hosts every agent as a
-pi session:
+and runs `node runtime/src/main.ts run` with the task's instruction.
+
+The image installer reuses existing system tools and installs only missing prerequisites. It checks that curl,
+xz, git, ripgrep and fd run before the sandbox's network closes; existing tools are not requested for upgrade.
+
+Inside, one Node process hosts every agent as a pi session:
 
 1. **The authority** (`-m`, e.g. Kimi K3) gets the instruction, pi's coding tools, and the forum tools:
    `open_thread`, `assign_workers`, `post`, `read_thread`, `list_threads`, `wait`, `close_thread` (and
@@ -110,7 +115,7 @@ to run slower than on the leaderboard.
 
 Watching live: the runtime writes the forum and every agent's session as it goes, and Docker mounts them on the host.
 
-- **In the browser:** `python3 base_forum/viewer/forum_view.py --open` (http://127.0.0.1:8479/). The left column
+- **In the browser:** `python3 base_forum/viewer/forum_view.py --open` (http://127.0.0.1:8479/), Forum Decorum. The left column
   lists your runs (one per `run_baseline.sh` invocation, i.e. one Pier job), running ones first: benchmark (DeepSWE
   or SWE-bench Pro V2), status, how many tasks passed, did not pass, failed or are still waiting, and the cost; open a
   run's arrow to see its tasks. Clicking a run opens its page: the score, a bar of the results, and a table of its
@@ -121,7 +126,12 @@ Watching live: the runtime writes the forum and every agent's session as it goes
   agent's persona, state and current action), and its threads as columns: the plan, workers joining with their
   instructions, every post, finish reports, and each worker's tool calls folded per step. **L** switches to one
   timeline, **T** back; clicking an agent shows everything it did; **Pause updates** freezes the page while you read.
-  Standard library only; it binds to 127.0.0.1.
+  A run's **Team analysis** tab shows its setup and, task by task, who was on the team (each worker named and
+  coloured by role: implementer, tester, reviewer, investigator, guessed from its persona), the threads, the posts of
+  the authority and of the workers, send-backs and refusals, beside the result. **Insights across runs** (top of the
+  left column) works over the runs you tick: search everything that was said (posts and finish reports), runs side
+  by side, cost and result task by task, what the threads were about, how each task unfolded thread by thread, and
+  the same task across runs. Standard library only; it binds to 127.0.0.1.
 - **In the terminal:** `python3 base_forum/scripts/watch.py base_forum/jobs/<job>` prints the same events as lines
   (`--quiet` for the forum only). `run_baseline.sh` prints both commands when it starts.
 
@@ -129,12 +139,33 @@ Results: `base_forum/jobs/<job>/`; `python3 base_forum/scripts/summarize.py base
 base_forum/tasks/baseline-10.tsv` prints one line per trial (reward, cost, time, workers, posts, end reason) beside the
 leaderboard's Kimi K3 pass rate for that task. `pier view base_forum/jobs/<job>` opens the trajectories.
 
+## When a task fails: retrying it
+
+A task can end without a result of its own: Pier's time limit stopped the agent (`AgentTimeoutError`), Docker or the
+network failed, the runtime crashed, or the run was stopped before the task finished or started. The summary says
+how many and prints the command; the viewer's run page lists them with the reason and a **Retry** button.
+
+```bash
+python3 base_forum/scripts/retry_failed.py base_forum/jobs/<job> --dry-run    # what would be retried, and why
+python3 base_forum/scripts/retry_failed.py base_forum/jobs/<job>              # asks, then retries them all
+python3 base_forum/scripts/retry_failed.py base_forum/jobs/<job> --task <id>  # one task
+```
+
+It moves each failed attempt to `<job>/.attempts/` (logged in `attempts.jsonl`; the viewer shows it as an earlier
+attempt you can still open), then runs `pier job resume` on the job: the same models, rulebook, time limit and
+concurrency, with the keys from `base_forum/.env`. A task that was graded, passed or not, is never retried: retrying
+until it passes would change what the pass rate means. Retried tasks are marked in the summary (`attempts`), with
+what the failed attempts cost. `RETRIES=1 run_baseline.sh` also lets Pier retry infrastructure failures (not
+timeouts) on its own during the run; it deletes the failed attempt, so prefer `retry_failed.py` when you want to see
+why it failed. Start the viewer with `--no-retry` to hide the button.
+
 ## Developing
 
 ```bash
 cd base_forum/runtime && npm ci && npm test && npx tsc --noEmit      # 45 tests, scripted agents, no key
 cd base_forum/pier_adapter && uv run --with pytest --with-editable . pytest -q
 cd base_forum/viewer && uv run --no-project --with pytest pytest -q
+cd base_forum && uv run --no-project --with pytest pytest -q scripts/tests
 node base_forum/runtime/src/main.ts run --instruction "..." --repo /tmp/repo --out /tmp/out --faux smoke   # no model
 pier run -p <task> --agent-import-path decorum_pier:DecorumForum --ak faux=smoke --env docker   # Pier + Docker, no model
 ```

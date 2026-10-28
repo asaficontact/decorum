@@ -16,6 +16,8 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import subprocess
+import sys
 import threading
 import time
 import webbrowser
@@ -26,6 +28,13 @@ from urllib.parse import parse_qs, urlparse
 
 HERE = Path(__file__).resolve().parent
 STATIC = HERE / "static"
+SCRIPTS = HERE.parent / "scripts"
+sys.path.insert(0, str(SCRIPTS))
+try:  # one definition of "failed" for the Retry button and the command line
+    import retry_failed
+except ImportError:  # the viewer copied away from base_forum: no retry
+    retry_failed = None
+ATTEMPTS = ".attempts"
 DEFAULT_JOBS = HERE.parent / "jobs"
 FORUM_TOOLS = {
     "open_thread",
@@ -472,10 +481,16 @@ class Store:
         self.trials: dict[tuple[str, str], TrialState] = {}
         # The server answers requests on several threads, and every read advances shared offsets: one at a time.
         self.lock = threading.RLock()
+        self.retry_enabled = retry_failed is not None
+        self.retries: dict[
+            str, subprocess.Popen
+        ] = {}  # job -> the retry this server started, while it runs
+        self.launch = launch_retry
+        self.launch_grace = 2.0  # seconds to watch a new retry for an immediate refusal
 
     def scan(self) -> list[dict]:
         with self.lock:
-            return self._scan()
+            return [t for t in self._scan() if not t["superseded"]]
 
     def detail(self, job: str, trial: str, since: int) -> dict | None:
         with self.lock:
@@ -488,9 +503,13 @@ class Store:
             if not root.is_dir():
                 continue
             for job in sorted(p for p in root.iterdir() if p.is_dir()):
+                earlier = job / ATTEMPTS
                 for trial in sorted(
                     p
-                    for p in job.iterdir()
+                    for p in [
+                        *job.iterdir(),
+                        *(earlier.iterdir() if earlier.is_dir() else []),
+                    ]
                     if p.is_dir() and (p / "config.json").exists()
                 ):
                     agent_cfg = (_read_json(trial / "config.json") or {}).get(
@@ -503,8 +522,12 @@ class Store:
                     ):
                         continue
                     key = (job.name, trial.name)
-                    st = self.trials.setdefault(key, TrialState(trial))
-                    out.append(st.overview(job.name))
+                    st = self.trials.get(key)
+                    if st is None or st.path != trial:  # new, or moved aside by a retry
+                        st = self.trials[key] = TrialState(trial)
+                    ov = st.overview(job.name)
+                    ov["superseded"] = trial.parent.name == ATTEMPTS
+                    out.append(ov)
         order = {"running": 0, "starting": 1, "stalled": 2, "finished": 3, "failed": 4}
         out.sort(
             key=lambda t: (
@@ -563,6 +586,268 @@ class Store:
                 return text
         raise KeyError(job)
 
+    # ---------- retrying failed tasks ----------
+
+    def _earlier(self, job: Path, earlier: list[dict]) -> list[dict]:
+        """Attempts a retry moved aside, with why (from .attempts/attempts.jsonl), oldest first."""
+        why = {}
+        log = job / ATTEMPTS / "attempts.jsonl"
+        if log.exists():
+            for line in log.read_text().splitlines():
+                try:
+                    row = json.loads(line)
+                except ValueError:
+                    continue
+                if row.get("moved_to"):
+                    why[Path(row["moved_to"]).name] = row
+        out = []
+        for t in earlier:
+            row = why.get(t["trial"], {})
+            out.append(
+                {
+                    **t,
+                    "reason": row.get("reason") or t.get("problem"),
+                    "retried_at": row.get("at"),
+                }
+            )
+        return sorted(out, key=lambda t: t.get("retried_at") or "")
+
+    def _retry_state(self, job: Path) -> dict | None:
+        """What the Retry button would run again, and whether a retry is running now."""
+        if not self.retry_enabled or not (job / "config.json").exists():
+            return None
+        proc = self.retries.get(job.name)
+        if proc is not None and proc.poll() is not None:
+            del self.retries[job.name]
+            proc = None
+        try:
+            todo = retry_failed.retryable(
+                retry_failed.classify(job), graded_errors=True
+            )
+        except (SystemExit, OSError, ValueError):
+            todo = []
+        logs = (
+            sorted((job / ATTEMPTS).glob("retry-*.log"))
+            if (job / ATTEMPTS).is_dir()
+            else []
+        )
+        return {
+            "tasks": [
+                {
+                    **{k: r.get(k) for k in ("task", "state", "reason", "trial")},
+                    "default": r["state"]
+                    in retry_failed.RETRIED,  # ticked unless the reader unticks it
+                    "always": r["state"]
+                    in retry_failed.ALWAYS,  # Pier runs it on any resume
+                }
+                for r in todo
+            ],
+            "in_progress": proc is not None
+            or retry_failed.lock_holder(job) is not None,
+            "log": f"{ATTEMPTS}/{logs[-1].name}" if logs else None,
+            "command": f"python3 {SCRIPTS / 'retry_failed.py'} {job}",
+        }
+
+    def retry_log(self, job: str, lines: int = 60) -> dict | None:
+        """The end of the newest retry's log (what retry_failed.py and Pier printed)."""
+        with self.lock:
+            found = next((j for _, j in self._job_dirs() if j.name == job), None)
+        if found is None:
+            return None
+        logs = (
+            sorted((found / ATTEMPTS).glob("retry-*.log"))
+            if (found / ATTEMPTS).is_dir()
+            else []
+        )
+        if not logs:
+            return {"job": job, "log": None, "text": ""}
+        text = logs[-1].read_text(errors="replace").splitlines()[-lines:]
+        return {
+            "job": job,
+            "log": f"{ATTEMPTS}/{logs[-1].name}",
+            "text": "\n".join(text),
+        }
+
+    def retry(self, job: str, tasks: object) -> dict:
+        """Start retry_failed.py on a run's failed tasks (the default ones, or the ones named)."""
+        if not self.retry_enabled:
+            raise PermissionError(
+                "retrying is switched off in this viewer (--no-retry)"
+            )
+        if tasks is not None and (
+            not isinstance(tasks, list) or not all(isinstance(t, str) for t in tasks)
+        ):
+            raise TypeError("tasks must be a list of task ids")
+        named = list(dict.fromkeys(tasks or []))
+        with self.lock:
+            found = next((j for _, j in self._job_dirs() if j.name == job), None)
+            if found is None or not (found / "config.json").exists():
+                raise KeyError(job)
+            state = self._retry_state(found)
+            if state["in_progress"] or retry_failed.is_running(found):
+                raise RuntimeError(
+                    "this run is still running; retry it when it has finished"
+                )
+            picked, errors = retry_failed.pick(retry_failed.classify(found), named)
+            if errors:
+                raise ValueError("; ".join(errors))
+            if not picked:
+                raise ValueError(
+                    "nothing to retry: every task in this run has a graded attempt"
+                )
+            proc, log = self.launch(found, named or None)
+            self.retries[job] = proc
+        # a retry that refuses (a missing key, no pier) stops within a moment: say why instead of "started"
+        deadline = time.time() + self.launch_grace
+        while time.time() < deadline and proc.poll() is None:
+            time.sleep(0.1)
+        if proc.poll() not in (None, 0):
+            lines = [
+                x
+                for x in (found / log).read_text(errors="replace").splitlines()
+                if x.strip()
+            ]
+            raise RuntimeError(
+                f"the retry stopped at once: {lines[-1] if lines else 'see ' + log}"
+            )
+        return {"job": job, "tasks": [r["task"] for r in picked], "log": log}
+
+    def teams(self, job: str, runs: list[dict] | None = None) -> dict | None:
+        """How the authority staffed each task of one run, and the run's setup."""
+        with self.lock:
+            run = next(
+                (
+                    r
+                    for r in (runs if runs is not None else self.runs())
+                    if r["job"] == job
+                ),
+                None,
+            )
+            if run is None:
+                return None
+            rows, setup = [], None
+            for t in run["trials"]:
+                st = self.trials.get((job, t["trial"]))
+                if st is None:
+                    continue
+                st.update()
+                summary = _read_json(st.dec / "summary.json") or {}
+                if summary and setup is None:
+                    setup = {
+                        "rulebook": summary.get("rulebook"),
+                        "models": summary.get("models"),
+                        "commit_policy": summary.get("commit_policy"),
+                    }
+                rows.append(
+                    {
+                        **{
+                            k: t.get(k)
+                            for k in (
+                                "trial",
+                                "task",
+                                "title",
+                                "repository",
+                                "status",
+                                "reward",
+                                "tests",
+                                "cost_usd",
+                                "duration_sec",
+                                "problem",
+                                "started_at",
+                            )
+                        },
+                        **team_of(st),
+                    }
+                )
+            return {
+                "run": {k: v for k, v in run.items() if k != "trials"},
+                "setup": setup,
+                "tasks": rows,
+            }
+
+    def insights(self, jobs: list[str] | None) -> dict:
+        """Every selected run with its tasks' teams and threads, for the cross-run page."""
+        with self.lock:
+            out = []
+            runs = self.runs()
+            for r in runs:
+                if jobs and r["job"] not in jobs:
+                    continue
+                d = self.teams(r["job"], runs)
+                if d:
+                    out.append(d)
+            return {"runs": out}
+
+    def search(self, q: str, jobs: list[str] | None, limit: int = 120) -> dict:
+        """Posts and finish reports whose text contains every word of q (case-insensitive)."""
+        words = [w for w in q.lower().split() if w]
+        if not words:
+            return {"q": q, "hits": [], "more": False}
+        hits = []
+        with self.lock:
+            for r in self.runs():
+                if jobs and r["job"] not in jobs:
+                    continue
+                for t in [*r["trials"], *r["earlier"]]:
+                    st = self.trials.get((r["job"], t["trial"]))
+                    if st is None:
+                        continue
+                    titles, roles = {}, {}
+                    for e in st.events:
+                        k = e.get("kind")
+                        if k == "thread_opened":
+                            titles[e["thread"]["id"]] = e["thread"].get("title", "")
+                        elif k == "assigned":
+                            a = e["assignment"]
+                            roles[a["worker"]] = role_of(
+                                a.get("persona", ""), titles.get(a.get("thread"), "")
+                            )
+                        text, who, thread = None, None, None
+                        if k == "post":
+                            text, who, thread = (
+                                e["post"].get("text", ""),
+                                e["post"].get("author", ""),
+                                e["post"].get("thread"),
+                            )
+                        elif k == "finished":
+                            a = e["assignment"]
+                            text, who, thread = (
+                                (a.get("summary") or "")
+                                + " "
+                                + (a.get("evidence") or ""),
+                                a.get("worker"),
+                                a.get("thread"),
+                            )
+                        if text and all(w in text.lower() for w in words):
+                            hits.append(
+                                {
+                                    "job": r["job"],
+                                    "run": r["name"] or r["job"],
+                                    "trial": t["trial"],
+                                    "task": t["task"],
+                                    "title": t["title"],
+                                    "earlier": t.get("superseded", False),
+                                    "at": e.get("at"),
+                                    "kind": "finish report"
+                                    if k == "finished"
+                                    else "post",
+                                    "author": who,
+                                    "role": "authority"
+                                    if who == "authority"
+                                    else roles.get(who, ""),
+                                    "thread": thread,
+                                    "thread_title": titles.get(thread, ""),
+                                    "text": text[:600],
+                                }
+                            )
+        hits.sort(key=lambda h: h["at"] or "", reverse=True)
+        return {
+            "q": q,
+            "hits": hits[:limit],
+            "more": len(hits) > limit,
+            "total": len(hits),
+        }
+
     def runs(self) -> list[dict]:
         with self.lock:
             by_job: dict[str, list[dict]] = {}
@@ -570,7 +855,9 @@ class Store:
                 by_job.setdefault(t["job"], []).append(t)
             runs = []
             for root, job in self._job_dirs():
-                trials = by_job.get(job.name, [])
+                everything = by_job.get(job.name, [])
+                trials = [t for t in everything if not t["superseded"]]
+                earlier = [t for t in everything if t["superseded"]]
                 cfg = _read_json(job / "config.json") or {}
                 agent = (cfg.get("agents") or [{}])[0] or {}
                 if not trials and "decorum" not in str(agent.get("import_path") or ""):
@@ -607,8 +894,11 @@ class Store:
                 finished_at = _local_iso(res.get("finished_at"))
                 # A job with no finish time is running only while something in it still moves: a crashed pier
                 # never writes finished_at, and must not look alive forever.
+                # the job folder's own time changes when a retry makes .attempts/; a new trial folder has its own
                 touched = [
-                    p.stat().st_mtime for p in (job, job / "result.json") if p.exists()
+                    p.stat().st_mtime
+                    for p in [job / "result.json", *job.iterdir()]
+                    if p.exists() and p.name != ATTEMPTS
                 ]
                 touched += [
                     self.trials[(job.name, t["trial"])].last_activity()
@@ -657,6 +947,9 @@ class Store:
                     "failed": 4,
                 }
                 trials.sort(key=lambda t: (order.get(t["status"], 9), t["task"]))
+                retry = self._retry_state(job)
+                if retry and retry["in_progress"]:
+                    status = "running"
                 runs.append(
                     {
                         "job": job.name,
@@ -680,12 +973,144 @@ class Store:
                         "counts": counts,
                         "cost_usd": round(sum(t["cost_usd"] or 0 for t in trials), 4),
                         "trials": trials,
+                        "earlier": self._earlier(job, earlier),
+                        "retry": retry,
                     }
                 )
             runs.sort(
                 key=lambda r: (r["status"] != "running", -(_ts(r["started_at"]) or 0))
             )
             return runs
+
+
+ROLE_WORDS = [
+    ("reviewer", ("review", "audit", "critic", "verif")),
+    ("tester", ("test", "qa", "quality")),
+    ("investigator", ("investig", "research", "explor", "analys", "diagnos", "triage")),
+]
+
+
+def role_of(persona: str, title: str) -> str:
+    """A worker's role, guessed from its persona and its thread's title (a keyword rule, shown as a guess)."""
+    text = f"{persona} {title}".lower()
+    for role, words in ROLE_WORDS:
+        if any(w in text for w in words):
+            return role
+    return "implementer"
+
+
+KIND_WORDS = [
+    ("plan", ("plan", "requirement")),
+    ("review", ("review", "audit", "verif", "final check")),
+    ("tests", ("test", "qa")),
+    ("investigation", ("investig", "research", "explor", "diagnos", "triage", "scout")),
+]
+
+
+def kind_of(title: str, goal: str = "") -> str:
+    """What a thread was about, guessed from its title (then its goal) by keywords."""
+    for text in (title.lower(), goal.lower()):
+        for kind, words in KIND_WORDS:
+            if any(w in text for w in words):
+                return kind
+    return "implementation"
+
+
+def team_of(st: TrialState) -> dict:
+    titles, workers, posts_by, finished_at = {}, {}, {}, {}
+    threads: dict[str, dict] = {}
+    edges: dict[tuple[str, str], int] = {}
+    refusals = 0
+    for e in st.events:
+        k = e.get("kind")
+        if k == "thread_opened":
+            th = e["thread"]
+            titles[th["id"]] = th.get("title", "")
+            threads[th["id"]] = {
+                "id": th["id"],
+                "title": th.get("title", ""),
+                "kind": kind_of(th.get("title", ""), th.get("goal", "")),
+                "opened_at": e.get("at"),
+                "closed_at": None,
+                "last_at": e.get("at"),
+                "posts": 0,
+                "sent_back": 0,
+                "workers": [],
+            }
+        elif k == "thread_closed":
+            th = threads.get((e.get("thread") or {}).get("id"))
+            if th:
+                th["closed_at"] = e.get("at")
+        elif k == "assigned":
+            a = e["assignment"]
+            if a.get("thread") in threads:
+                threads[a["thread"]]["workers"].append(a["worker"])
+            workers[a["worker"]] = {
+                "worker": a["worker"],
+                "persona": a.get("persona", ""),
+                "thread": a.get("thread"),
+                "title": titles.get(a.get("thread"), ""),
+                "posts": 0,
+                "sent_back": 0,
+                "finished": False,
+            }
+        elif k == "finished":
+            w = workers.get(e["assignment"]["worker"])
+            if w:
+                w["finished"] = True
+                finished_at[w["thread"]] = w["worker"]
+        elif k == "post":
+            post = e["post"]
+            who = post.get("author", "")
+            posts_by[who] = posts_by.get(who, 0) + 1
+            if who in workers:
+                workers[who]["posts"] += 1
+            th = threads.get(post.get("thread"))
+            if th:
+                th["posts"] += 1
+                th["last_at"] = e.get("at")
+            # the authority posting in the thread of a worker that had finished sends it back
+            if who == "authority" and post.get("thread") in finished_at:
+                w = workers[finished_at.pop(post["thread"])]
+                w["sent_back"] += 1
+                if th:
+                    th["sent_back"] += 1
+            for m in post.get("mentions") or []:
+                edges[(who, m)] = edges.get((who, m), 0) + 1
+        elif k == "refusal":
+            refusals += 1
+    team = list(workers.values())
+    for w in team:
+        w["role"] = role_of(w["persona"], w["title"])
+    return {
+        "team": team,
+        "threads": len(titles),
+        "posts_authority": posts_by.get("authority", 0),
+        "posts_workers": sum(v for k, v in posts_by.items() if k != "authority"),
+        "sent_back": sum(w["sent_back"] for w in team),
+        "refusals": refusals,
+        "mentions": [{"from": a, "to": b, "n": n} for (a, b), n in edges.items()],
+        "thread_list": list(threads.values()),
+        "first_at": st.events[0].get("at") if st.events else None,
+    }
+
+
+def launch_retry(job: Path, tasks: list[str] | None) -> tuple[subprocess.Popen, str]:
+    """Run retry_failed.py on its own, detached from this server; its output goes to .attempts/retry-<time>.log."""
+    (job / ATTEMPTS).mkdir(exist_ok=True)
+    name = f"retry-{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}.log"
+    cmd = [sys.executable, str(SCRIPTS / "retry_failed.py"), str(job), "--yes"]
+    for t in tasks or []:
+        cmd += ["--task", t]
+    with (job / ATTEMPTS / name).open("w") as out:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=out,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    return proc, f"{ATTEMPTS}/{name}"
 
 
 def _ts(iso: str | None) -> float | None:
@@ -697,8 +1122,21 @@ def _ts(iso: str | None) -> float | None:
         return None
 
 
-def make_handler(store: Store):
+def make_handler(store: Store, extra_hosts: tuple[str, ...] = ()):
     class H(BaseHTTPRequestHandler):
+        def _host_ok(self) -> bool:
+            """Answer only requests addressed to this server by name: a page that rebinds its own DNS name to
+            127.0.0.1 is then refused, so it can neither read the forums nor start a retry."""
+            port = self.server.server_address[1]
+            host = (self.headers.get("Host") or "").lower()
+            names = {
+                "127.0.0.1",
+                "localhost",
+                "[::1]",
+                *(h.lower() for h in extra_hosts),
+            }
+            return host in names or host in {f"{n}:{port}" for n in names}
+
         def _send(self, code: int, body: bytes, ctype: str) -> None:
             self.send_response(code)
             self.send_header("Content-Type", ctype)
@@ -711,8 +1149,10 @@ def make_handler(store: Store):
             self._send(200, json.dumps(obj).encode(), "application/json")
 
         def do_POST(self) -> None:
+            if not self._host_ok():
+                return self._send(421, b'{"error":"unknown host"}', "application/json")
             u = urlparse(self.path)
-            if u.path != "/api/runs/rename":
+            if u.path not in ("/api/runs/rename", "/api/runs/retry"):
                 return self._send(404, b'{"error":"not found"}', "application/json")
             # Only the page itself may write: a custom header forces a CORS preflight that a foreign page cannot pass.
             if self.headers.get("X-Decorum-Viewer") != "1" or not (
@@ -722,24 +1162,66 @@ def make_handler(store: Store):
             n = int(self.headers.get("Content-Length") or 0)
             if n <= 0 or n > 4096:
                 return self._send(400, b'{"error":"bad request"}', "application/json")
+
+            def fail(code: int, msg: str) -> None:
+                self._send(
+                    code, json.dumps({"error": msg}).encode(), "application/json"
+                )
+
             try:
                 body = json.loads(self.rfile.read(n))
+                if not isinstance(body, dict):
+                    raise TypeError("the body must be a JSON object")
+                if u.path == "/api/runs/retry":
+                    return self._json(
+                        store.retry(str(body.get("job", "")), body.get("tasks"))
+                    )
                 name = store.rename(str(body.get("job", "")), body.get("name", ""))
             except KeyError:
-                return self._send(404, b'{"error":"no such run"}', "application/json")
+                return fail(404, "no such run")
+            except PermissionError as e:
+                return fail(403, str(e))
+            except OSError as e:
+                return fail(500, f"could not start: {e}")
+            except RuntimeError as e:
+                return fail(409, str(e))
             except (ValueError, TypeError, AttributeError) as e:
-                return self._send(
-                    400, json.dumps({"error": str(e)}).encode(), "application/json"
-                )
+                return fail(400, str(e))
             return self._json({"job": body.get("job"), "name": name or None})
 
         def do_GET(self) -> None:
+            if not self._host_ok():
+                return self._send(
+                    421,
+                    b"unknown host; start the viewer with --allow-host <name>",
+                    "text/plain",
+                )
             u = urlparse(self.path)
             q = {k: v[0] for k, v in parse_qs(u.query).items()}
             if u.path == "/api/runs":
                 return self._json(
                     {"now": datetime.now(UTC).isoformat(), "runs": store.runs()}
                 )
+            if u.path == "/api/insights":
+                jobs = [j for j in q.get("jobs", "").split(",") if j] or None
+                return self._json(store.insights(jobs))
+            if u.path == "/api/search":
+                jobs = [j for j in q.get("jobs", "").split(",") if j] or None
+                return self._json(store.search(q.get("q", "")[:200], jobs))
+            if u.path == "/api/runs/retry-log":
+                d = store.retry_log(q.get("job", ""))
+                if d is None:
+                    return self._send(
+                        404, b'{"error":"no such run"}', "application/json"
+                    )
+                return self._json(d)
+            if u.path == "/api/teams":
+                d = store.teams(q.get("job", ""))
+                if d is None:
+                    return self._send(
+                        404, b'{"error":"no such run"}', "application/json"
+                    )
+                return self._json(d)
             if u.path == "/api/trials":
                 return self._json(
                     {"now": datetime.now(UTC).isoformat(), "trials": store.scan()}
@@ -764,6 +1246,8 @@ def make_handler(store: Store):
                 ".js": "text/javascript",
                 ".css": "text/css",
                 ".svg": "image/svg+xml",
+                ".woff2": "font/woff2",
+                ".txt": "text/plain; charset=utf-8",
             }.get(f.suffix, "application/octet-stream")
             return self._send(200, f.read_bytes(), ctype)
 
@@ -795,12 +1279,27 @@ def main() -> None:
     ap.add_argument(
         "--open", action="store_true", help="open the page in the default browser"
     )
+    ap.add_argument(
+        "--allow-host",
+        action="append",
+        default=[],
+        help="another name the page is reached by (behind a proxy such as tailscale serve); "
+        "requests under any other name are refused",
+    )
+    ap.add_argument(
+        "--no-retry",
+        action="store_true",
+        help="hide the Retry button (retrying runs tasks again, which costs model calls)",
+    )
     a = ap.parse_args()
     a.jobs = a.jobs or [DEFAULT_JOBS]
     a.tasks = a.tasks or [HERE.parent / ".deep-swe" / "tasks"]
     TASK_DIRS.extend(p.expanduser().resolve() for p in a.tasks)
     store = Store([p.expanduser().resolve() for p in a.jobs])
-    server = ThreadingHTTPServer((a.host, a.port), make_handler(store))
+    store.retry_enabled = store.retry_enabled and not a.no_retry
+    server = ThreadingHTTPServer(
+        (a.host, a.port), make_handler(store, (a.host, *a.allow_host))
+    )
     url = f"http://{a.host}:{a.port}/"
     print(
         f"decorum forum viewer: {url}  (jobs: {', '.join(map(str, store.roots))}; Ctrl-C to stop)",

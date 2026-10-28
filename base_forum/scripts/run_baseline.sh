@@ -19,6 +19,9 @@
 #   TASKS [per benchmark]              a TSV whose first column is the task id (# lines and the header are skipped)
 #   N_TASKS [all]                      run only the first N tasks of the list
 #   CONCURRENCY [2]                    trials at once
+#   RETRIES [0]                        retry a trial that fails on infrastructure (Docker, network, a crash) up to N
+#                                      times during the run; Pier never retries a timeout or a grading error this way.
+#                                      After a run, scripts/retry_failed.py retries any failed task, timeouts included.
 #   CPUS, MEMORY_MB                    per trial sandbox. DeepSWE: 4 CPUs / 8192 MB (its tasks ask 2 / 8192).
 #                                      SWE-bench Pro: unset, so each task runs with its own settings (1 CPU / 4096 MB).
 #   ENV_FILE [base_forum/.env]         must define MOONSHOT_API_KEY (or the key for your provider)
@@ -41,6 +44,7 @@ WORKER_THINKING="${WORKER_THINKING:-high}"
 RULEBOOK="${RULEBOOK:-base-0}"
 N_TASKS="${N_TASKS:-}"
 CONCURRENCY="${CONCURRENCY:-2}"
+RETRIES="${RETRIES:-0}"
 ENV_FILE="${ENV_FILE:-$BASE/.env}"
 DEEPSWE_DIR="${DEEPSWE_DIR:-$BASE/.deep-swe}"
 SWEPRO_DIR="${SWEPRO_DIR:-$BASE/.swebench-pro}"
@@ -60,6 +64,7 @@ case "$BENCHMARK" in
     COMMIT=false ;;
   *) die "BENCHMARK must be deepswe or swebenchpro, got '$BENCHMARK'" ;;
 esac
+case "$RETRIES" in ''|*[!0-9]*) die "RETRIES must be a whole number, got '$RETRIES'" ;; esac
 case "$MODE" in
   forum) AGENT=decorum_pier:DecorumForum ;;
   single) AGENT=decorum_pier:DecorumSingle ;;
@@ -136,6 +141,7 @@ if [ -n "$CPUS" ]; then cmd+=(--override-cpus "$CPUS"); fi
 if [ -n "$MEMORY_MB" ]; then cmd+=(--override-memory-mb "$MEMORY_MB"); fi
 if [ "$MODE" = forum ]; then cmd+=(--ak "worker_model=$WORKER_MODEL" --ak "worker_thinking=$WORKER_THINKING"); fi
 if [ -n "${FAUX:-}" ]; then cmd+=(--ak "faux=$FAUX"); fi
+if [ "$RETRIES" -gt 0 ]; then cmd+=(--max-retries "$RETRIES"); fi
 
 echo "job $JOB_NAME: $BENCHMARK, ${#ids[@]} tasks, mode $MODE, rulebook $RULEBOOK, authority $AUTHORITY_MODEL ($AUTHORITY_THINKING)$([ "$MODE" = forum ] && echo ", workers $WORKER_MODEL ($WORKER_THINKING)")"
 echo "time limit: the tasks' ${limit} s (the runtime stops by ${WALL_CLOCK_SEC} s at the latest, sooner if the rulebook says so); commit: $COMMIT; sandbox: ${CPUS:-task default} CPUs, ${MEMORY_MB:-task default} MB"
@@ -143,6 +149,9 @@ printf '%q ' "${cmd[@]}"; echo
 [ -n "${DRY_RUN:-}" ] && exit 0
 mkdir -p "$JOBS_DIR"
 echo "watch it live: python3 $BASE/viewer/forum_view.py --open --jobs $JOBS_DIR   (or in a terminal: python3 $BASE/scripts/watch.py $JOBS_DIR/$JOB_NAME)"
-"${cmd[@]}"
+rc=0
+"${cmd[@]}" || rc=$?
+[ "$rc" -eq 0 ] || echo "run_baseline: pier exited with $rc; the summary below says which tasks have no result"
 echo
-python3 "$BASE/scripts/summarize.py" "$JOBS_DIR/$JOB_NAME" --reference "$TASKS"
+python3 "$BASE/scripts/summarize.py" "$JOBS_DIR/$JOB_NAME" --reference "$TASKS" || true
+exit "$rc"
