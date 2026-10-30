@@ -37,8 +37,16 @@ const S = {
 
 // ---------- formatting ----------
 
+// the agent that leads a trial: the forum's authority, or a majority vote's aggregator
+const isLead = (name) => name === "authority" || name === "aggregator";
+const MODE_WORD = { single: "single agent", vote: "majority vote", forum: "forum" };
+const LEAD_ABOUT = {
+  authority: ["Authority", "Manages the team: plans, assigns workers, verifies", "Manages the team: writes the plan, assigns and briefs workers, follows and verifies their work, and commits."],
+  aggregator: ["Aggregator", "Reads every worker's patch, answers with the final patch", "Reads the task and every worker's patch (it may read the code, not change it) and answers with the final patch, which is applied to the checkout."],
+};
+
 function colorOf(name) {
-  if (!S.colors.has(name)) S.colors.set(name, name === "authority" ? 0 : 1 + ((S.colors.size - (S.colors.has("authority") ? 1 : 0)) % (HUES - 1)));
+  if (!S.colors.has(name)) S.colors.set(name, isLead(name) ? 0 : 1 + ((S.colors.size - ([...S.colors.keys()].some(isLead) ? 1 : 0)) % (HUES - 1)));
   return `var(--a${S.colors.get(name)})`;
 }
 function who(name) {
@@ -104,7 +112,7 @@ function shortDate(iso) {
   return d.toLocaleString(undefined, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit", ...(sameYear ? {} : { year: "numeric" }) });
 }
 function defaultLabel(r) {
-  const kind = [r.mode === "single" ? "single agent" : null, r.faux ? "scripted" : null].filter(Boolean).join(", ");
+  const kind = [r.mode === "single" || r.mode === "vote" ? MODE_WORD[r.mode] : null, r.faux ? "scripted" : null].filter(Boolean).join(", ");
   const when = shortDate(r.started_at);
   return `${BENCH_WORD[r.benchmark] || r.benchmark || "Run"}${when ? `, ${when}` : ` ${r.job}`}${kind ? ` (${kind})` : ""}`;
 }
@@ -288,7 +296,7 @@ function cell(child) {
 function renderRunOverview() {
   const r = runOf(S.runSel);
   if (!r) return;
-  $("r-eyebrow").textContent = [BENCH_WORD[r.benchmark] || r.benchmark || "Run", r.mode === "single" ? "single agent" : "forum", r.job].join(" · ");
+  $("r-eyebrow").textContent = [BENCH_WORD[r.benchmark] || r.benchmark || "Run", MODE_WORD[r.mode] || "forum", r.job].join(" · ");
   if (S.renaming !== r.job) $("r-title").textContent = runLabel(r);
   const facts = $("r-facts");
   facts.replaceChildren();
@@ -299,8 +307,8 @@ function renderRunOverview() {
   fact(r.status === "running" ? "Spent so far" : "Cost", money(r.cost_usd));
   if (r.faux) fact("Agents", "scripted, no model calls");
   else {
-    fact("Authority", r.authority_model);
-    fact("Workers", r.mode === "forum" ? r.worker_model : null);
+    fact(r.mode === "vote" ? "Aggregator" : "Authority", r.authority_model);
+    fact("Workers", r.mode === "single" ? null : `${r.mode === "vote" && r.workers ? `${r.workers} × ` : ""}${r.worker_model || ""}` || null);
   }
   fact("Rulebook", r.rulebook);
   $("r-problem").hidden = !r.problem;
@@ -538,12 +546,13 @@ function renderHead() {
   const running = t.status === "running";
   fact(running ? "Running for" : "Took", clock(t.duration_sec ?? (Date.now() - ts(t.started_at)) / 1000));
   fact(running ? "Spent so far" : "Cost", money(t.cost_usd));
-  const auth = S.agents.find((a) => a.role === "authority");
+  const auth = S.agents.find((a) => isLead(a.role));
   const worker = S.agents.find((a) => a.role === "worker");
-  fact("Authority", t.models?.authority || auth?.model);
+  fact(t.mode === "vote" ? "Aggregator" : "Authority", t.models?.authority || auth?.model);
   fact("Workers", t.models?.worker || worker?.model);
-  fact("Rulebook", t.rulebook);
-  if (t.end_reason && t.end_reason !== "authority_done") fact("Ended by", t.end_reason.replace("budget.", "budget: ").replace("_", " "));
+  if (t.mode !== "vote") fact("Rulebook", t.rulebook);
+  if (t.vote) fact("Final patch", t.vote.applied ? (t.vote.same_as ? `${t.vote.same_as}'s, applied` : "the aggregator's own, applied") : "none applied");
+  if (t.end_reason && !["authority_done", "vote_done"].includes(t.end_reason)) fact("Ended by", t.end_reason.replace("budget.", "budget: ").replaceAll("_", " "));
   const note = $("t-note");
   note.hidden = !t.replay;
   note.textContent = "A replay: a recorded real trial played back at its original pace, so the page has something live to show.";
@@ -566,7 +575,7 @@ function renderTeam() {
     top.append(who(a.name));
     top.append(el("span", `st ${a.state} agent-st`, AGENT_WORD[a.state] || a.state));
     c.append(top);
-    c.append(el("div", "persona", a.role === "authority" ? "Manages the team: plans, assigns workers, verifies" : `${a.persona || ""}${a.thread ? ` · in ${a.thread}` : ""}`));
+    c.append(el("div", "persona", LEAD_ABOUT[a.role] ? LEAD_ABOUT[a.role][1] : `${a.persona || (a.thread ? "Solves the task on its own" : "")}${a.thread ? ` · in ${a.thread}` : ""}`));
     const last = [...a.actions].reverse().find((x) => !x.forum) || a.actions.at(-1);
     const doing = el("div", "doing");
     const refused = S.events.filter((e) => e.kind === "refusal" && e.agent === a.name).length;
@@ -788,8 +797,8 @@ function renderDrawer() {
   const a = S.agents.find((x) => x.name === S.drawer);
   if (!a) return;
   $("d-name").replaceChildren(who(a.name));
-  $("d-meta").textContent = `${a.role === "authority" ? "Authority" : `Worker in ${a.thread}`} · ${a.model || ""} · ${AGENT_WORD[a.state] || a.state} · ${a.calls} model calls · ${money(a.cost_usd)}`;
-  $("d-persona").textContent = a.role === "authority" ? "Manages the team: writes the plan, assigns and briefs workers, follows and verifies their work, and commits." : a.persona || "";
+  $("d-meta").textContent = `${LEAD_ABOUT[a.role] ? LEAD_ABOUT[a.role][0] : `Worker in ${a.thread}`} · ${a.model || ""} · ${AGENT_WORD[a.state] || a.state} · ${a.calls} model calls · ${money(a.cost_usd)}`;
+  $("d-persona").textContent = LEAD_ABOUT[a.role] ? LEAD_ABOUT[a.role][2] : a.persona || "";
   const ol = $("d-actions");
   ol.replaceChildren();
   for (const x of [...a.actions].reverse()) {

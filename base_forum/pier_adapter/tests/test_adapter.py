@@ -16,13 +16,13 @@ from pathlib import Path
 import pytest
 from pier.models.trajectories import Trajectory
 
-from decorum_pier.agent import RUNTIME_DIR, DecorumForum, DecorumSingle
+from decorum_pier.agent import RUNTIME_DIR, DecorumForum, DecorumSingle, DecorumVote
 from decorum_pier.atif import build_trajectory
 
 
 def make(tmp_path: Path, cls=DecorumForum, **kw):
     kw.setdefault("model_name", "moonshotai/kimi-k3")
-    if cls is DecorumForum:
+    if cls in (DecorumForum, DecorumVote):
         kw.setdefault("worker_model", "moonshotai/kimi-k2.7-code")
     return cls(logs_dir=tmp_path, **kw)
 
@@ -130,6 +130,46 @@ def test_command_carries_both_models_and_the_rulebook(tmp_path):
     single = make(tmp_path, cls=DecorumSingle)._command()
     assert "--mode single" in single and "--worker-model" not in single
     assert DecorumSingle.name() == "decorum-single"
+
+
+def test_vote_runs_n_workers_and_an_aggregator_with_the_tasks_id(tmp_path):
+    trial = tmp_path / "instance_x__y-abc__Q1"
+    (trial / "agent").mkdir(parents=True)
+    (trial / "config.json").write_text(json.dumps({"task": {"path": "/tasks/instance_x__y-abcdef0123"}}))
+    vote = make(trial / "agent", cls=DecorumVote, model_name="moonshotai/kimi-k2.7-code", workers="6")
+    cmd = vote._command()
+    assert DecorumVote.name() == "decorum-vote"
+    assert "--mode vote" in cmd
+    assert "--authority-model moonshotai/kimi-k2.7-code --worker-model moonshotai/kimi-k2.7-code" in cmd
+    assert "--workers 6 --instance-id instance_x__y-abcdef0123" in cmd
+    assert "--aggregator-reserve" not in cmd
+    assert "--aggregator-reserve 0.25" in make(trial / "agent", cls=DecorumVote, aggregator_reserve="0.25")._command()
+    # without a config.json, the trial folder's name less Pier's suffix
+    bare = tmp_path / "instance_x__y-abc__Q2" / "agent"
+    bare.mkdir(parents=True)
+    assert make(bare, cls=DecorumVote, workers=5)._command().endswith("--workers 5 --instance-id instance_x__y-abc")
+    assert "--workers" not in make(tmp_path)._command(), "the forum takes no worker count"
+    for bad in ("0", "21", "2.5", "many"):
+        with pytest.raises(ValueError, match="workers must be a whole number from 1 to 20"):
+            make(tmp_path, cls=DecorumVote, workers=bad)
+    with pytest.raises(ValueError, match="aggregator_reserve"):
+        make(tmp_path, cls=DecorumVote, aggregator_reserve="1")
+    with pytest.raises(ValueError, match="worker_model"):
+        DecorumVote(logs_dir=tmp_path, model_name="moonshotai/kimi-k2.7-code")
+
+
+def test_a_vote_trajectory_has_the_aggregator_at_its_root(tmp_path):
+    usage = {"input": 10, "output": 5, "cacheRead": 0, "cacheWrite": 0, "costUsd": 0.01, "llmCalls": 1}
+    agents = [{"name": f"worker{i}", "role": "worker", "model": "m/w", "usage": usage, "session_file": None} for i in (1, 2)]
+    summary = {"mode": "vote", "models": {"authority": "m/a"}, "end_reason": "vote_done", "cost_usd": 0.03, "vote": {"workers": 2}}
+    t = build_trajectory({**summary, "agents": [*agents, {"name": "aggregator", "role": "aggregator", "model": "m/a", "usage": usage, "session_file": None}]}, tmp_path, agent_name="decorum-vote", version="test")
+    Trajectory.model_validate(t.to_json_dict())
+    assert t.agent.model_name == "m/a"
+    assert [s.trajectory_id for s in t.subagent_trajectories or []] == ["worker1", "worker2"]
+    assert t.final_metrics.extra["vote"] == {"workers": 2}
+    # stopped before the aggregator started: still a trajectory, rooted at an empty aggregator
+    early = build_trajectory({**summary, "agents": agents}, tmp_path, agent_name="decorum-vote", version="test")
+    assert early.agent.model_name == "m/a" and len(early.subagent_trajectories or []) == 2
 
 
 def test_swebench_pro_settings_reach_the_runtime(tmp_path):

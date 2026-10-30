@@ -1223,6 +1223,37 @@ def test_a_single_agent_run_sends_no_worker_settings(
     assert calls[0][0]["JOB_NAME"].startswith("swebenchpro-single-")
 
 
+def test_a_majority_vote_run_sends_its_worker_count_and_no_worker_range(
+    jobs: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store, calls = starter(jobs, monkeypatch)
+    store.start(start_body(mode="vote", authority_model="moonshotai/kimi-k2.7-code", workers=6, max_live_workers=4, name=""))
+    env = calls[0][0]
+    assert {k: env[k] for k in ("MODE", "AUTHORITY_MODEL", "WORKER_MODEL", "WORKERS", "MAX_LIVE_WORKERS")} == {
+        "MODE": "vote",
+        "AUTHORITY_MODEL": "moonshotai/kimi-k2.7-code",
+        "WORKER_MODEL": "moonshotai/kimi-k2.7-code",
+        "WORKERS": "6",
+        "MAX_LIVE_WORKERS": "4",
+    }
+    assert not {"MIN_WORKERS", "MAX_WORKERS"} & set(env)
+    assert env["JOB_NAME"].startswith("swebenchpro-vote-")
+    [run] = store.runs()
+    assert (run["mode"], run["workers"]) == ("vote", 6)
+    # never more workers at once than there are workers
+    store.start(start_body(mode="vote", workers=3, max_live_workers=8, name="clipped"))
+    assert calls[1][0]["MAX_LIVE_WORKERS"] == "3"
+
+
+def test_the_mode_of_a_run_comes_from_its_pier_agent() -> None:
+    assert fv._mode_of("decorum_pier:DecorumForum") == "forum"
+    assert fv._mode_of("decorum_pier:DecorumSingle") == "single"
+    assert fv._mode_of("decorum_pier:DecorumVote") == "vote"
+    assert fv._vote_brief(None) is None
+    brief = fv._vote_brief({"workers": 3, "reports": [{"ok": True}, {"ok": False}, {"ok": True}], "aggregator": {"apply": {"applied": True}, "same_as": "worker3"}})
+    assert brief == {"workers": 3, "patches": 2, "applied": True, "same_as": "worker3"}
+
+
 @pytest.mark.parametrize(
     "change, message",
     [
@@ -1230,7 +1261,7 @@ def test_a_single_agent_run_sends_no_worker_settings(
         ({"tasks": []}, "non-empty list"),
         ({"tasks": ["instance_nope"]}, "not in SWE-bench Pro: instance_nope"),
         ({"authority_model": "kimi; rm -rf /"}, "must look like provider/model"),
-        ({"worker_model": None}, "worker_model in forum mode"),
+        ({"worker_model": None}, "worker_model in forum and vote mode"),
         ({"authority_thinking": "huge"}, "authority_thinking must be one of"),
         (
             {"min_workers": 6, "max_workers": 3},
@@ -1239,7 +1270,9 @@ def test_a_single_agent_run_sends_no_worker_settings(
         ({"max_workers": 9}, "max_workers must be a whole number from 1 to 8"),
         ({"concurrency": "3"}, "concurrency must be a whole number"),
         ({"budget_usd": 0}, "budget_usd must be from 1 to 1000"),
-        ({"mode": "swarm"}, "mode must be forum or single"),
+        ({"mode": "swarm"}, "mode must be forum, single or vote"),
+        ({"mode": "vote", "workers": 21}, "workers must be a whole number from 1 to 20"),
+        ({"mode": "vote", "worker_model": None}, "worker_model in forum and vote mode"),
         ({"name": "x" * 81}, "at most 80 characters"),
     ],
 )

@@ -1,17 +1,19 @@
 #!/usr/bin/env bash
-# Run the Decorum base forum (or the single-agent condition) on DeepSWE or SWE-bench Pro tasks with Pier and Docker.
+# Run the Decorum base forum (or the single-agent or majority-vote condition) on DeepSWE or SWE-bench Pro tasks with
+# Pier and Docker.
 #
 #   base_forum/scripts/run_baseline.sh                          # DeepSWE: the 10 baseline tasks, forum mode
 #   BENCHMARK=swebenchpro base_forum/scripts/run_baseline.sh    # SWE-bench Pro V2: the 10 tasks in tasks/swebenchpro-10.tsv
 #   MODE=single base_forum/scripts/run_baseline.sh              # the same tasks, one agent, no forum
+#   MODE=vote WORKERS=5 base_forum/scripts/run_baseline.sh      # EvoMAS's majority vote: 5 workers, one aggregator
 #   N_TASKS=1 base_forum/scripts/run_baseline.sh                # just the first task, to check the setup
 #   DRY_RUN=1 base_forum/scripts/run_baseline.sh                # print the pier command and stop
 #   FAUX=smoke N_TASKS=1 base_forum/scripts/run_baseline.sh     # scripted agents, no key, no cost: checks Docker + Pier
 #
 # Settings (environment variables, defaults in brackets):
 #   BENCHMARK [deepswe]                deepswe | swebenchpro (SWE-bench Pro V2, Scale's Harbor tasks)
-#   MODE [forum]                       forum | single
-#   AUTHORITY_MODEL [moonshotai/kimi-k3]
+#   MODE [forum]                       forum | single | vote
+#   AUTHORITY_MODEL [moonshotai/kimi-k3]  in vote mode, the aggregator's model (AUTHORITY_THINKING is its thinking)
 #   WORKER_MODEL [moonshotai/kimi-k2.7-code]
 #   AUTHORITY_THINKING [max]           off | minimal | low | medium | high | xhigh | max (the leaderboard ran K3 at max)
 #   WORKER_THINKING [high]
@@ -21,6 +23,8 @@
 #   CONCURRENCY [2]                    trials at once
 #   MIN_WORKERS, MAX_WORKERS          the fewest and most workers per task (default: the rulebook's, 3 and 6 in base-0)
 #   MAX_LIVE_WORKERS, BUDGET_USD       workers at once, and the spend cap per task in dollars (default: the rulebook's)
+#   WORKERS [5]                        vote mode: how many workers solve each task (1-20; EvoMAS's pool has 6)
+#   AGGREGATOR_RESERVE [0.15]          vote mode: the share of the dollars and the clock kept for the aggregator
 #   RETRIES [0]                        retry a trial that fails on infrastructure (Docker, network, a crash) up to N
 #                                      times during the run; Pier never retries a timeout or a grading error this way.
 #                                      After a run, scripts/retry_failed.py retries any failed task, timeouts included.
@@ -67,9 +71,11 @@ case "$BENCHMARK" in
   *) die "BENCHMARK must be deepswe or swebenchpro, got '$BENCHMARK'" ;;
 esac
 case "$RETRIES" in ''|*[!0-9]*) die "RETRIES must be a whole number, got '$RETRIES'" ;; esac
-for v in MIN_WORKERS MAX_WORKERS MAX_LIVE_WORKERS; do
+for v in MIN_WORKERS MAX_WORKERS MAX_LIVE_WORKERS WORKERS; do
   if [ -n "${!v:-}" ] && ! [[ "${!v}" =~ ^[0-9]{1,3}$ ]]; then die "$v must be a whole number up to 999, got '${!v}'"; fi
 done
+if [ -n "${WORKERS:-}" ] && { [ "$WORKERS" -lt 1 ] || [ "$WORKERS" -gt 20 ]; }; then die "WORKERS must be from 1 to 20, got '$WORKERS'"; fi
+if [ -n "${AGGREGATOR_RESERVE:-}" ] && ! [[ "$AGGREGATOR_RESERVE" =~ ^0(\.[0-9]+)?$ ]]; then die "AGGREGATOR_RESERVE must be a share from 0 to 0.9, got '$AGGREGATOR_RESERVE'"; fi
 if [ -n "${BUDGET_USD:-}" ] && ! [[ "$BUDGET_USD" =~ ^[0-9]{1,6}(\.[0-9]+)?$ ]]; then die "BUDGET_USD must be a number of dollars, got '$BUDGET_USD'"; fi
 if [ -n "${MIN_WORKERS:-}" ] && [ -n "${MAX_WORKERS:-}" ] && [ "$MIN_WORKERS" -gt "$MAX_WORKERS" ]; then
   die "MIN_WORKERS ($MIN_WORKERS) is more than MAX_WORKERS ($MAX_WORKERS)"
@@ -77,7 +83,8 @@ fi
 case "$MODE" in
   forum) AGENT=decorum_pier:DecorumForum ;;
   single) AGENT=decorum_pier:DecorumSingle ;;
-  *) die "MODE must be forum or single, got '$MODE'" ;;
+  vote) AGENT=decorum_pier:DecorumVote ;;
+  *) die "MODE must be forum, single or vote, got '$MODE'" ;;
 esac
 JOB_NAME="${JOB_NAME:-${FAUX:+faux-}$BENCHMARK-$MODE-$(basename "$RULEBOOK" .yaml)-$(date -u +%Y%m%dT%H%M%SZ)}"
 
@@ -88,7 +95,7 @@ env_args=()
 if [ -f "$ENV_FILE" ]; then env_args=(--env-file "$ENV_FILE"); fi
 if [ -z "${FAUX:-}" ]; then
   [ -f "$ENV_FILE" ] || die "no env file at $ENV_FILE: create it with MOONSHOT_API_KEY=... (see base_forum/README.md)"
-  for model in "$AUTHORITY_MODEL" $([ "$MODE" = forum ] && echo "$WORKER_MODEL"); do
+  for model in "$AUTHORITY_MODEL" $([ "$MODE" != single ] && echo "$WORKER_MODEL"); do
     case "${model%%/*}" in
       moonshotai|moonshotai-cn) key=MOONSHOT_API_KEY ;;
       openrouter) key=OPENROUTER_API_KEY ;;
@@ -148,17 +155,26 @@ cmd=(pier run -p "$TASK_ROOT" "${include[@]}"
   --env docker -n "$CONCURRENCY" -o "$JOBS_DIR" --job-name "$JOB_NAME" ${env_args[@]+"${env_args[@]}"} -y)
 if [ -n "$CPUS" ]; then cmd+=(--override-cpus "$CPUS"); fi
 if [ -n "$MEMORY_MB" ]; then cmd+=(--override-memory-mb "$MEMORY_MB"); fi
-if [ "$MODE" = forum ]; then cmd+=(--ak "worker_model=$WORKER_MODEL" --ak "worker_thinking=$WORKER_THINKING"); fi
+if [ "$MODE" != single ]; then cmd+=(--ak "worker_model=$WORKER_MODEL" --ak "worker_thinking=$WORKER_THINKING"); fi
 if [ -n "${FAUX:-}" ]; then cmd+=(--ak "faux=$FAUX"); fi
 if [ "$RETRIES" -gt 0 ]; then cmd+=(--max-retries "$RETRIES"); fi
 if [ "$MODE" = forum ]; then
   if [ -n "${MIN_WORKERS:-}" ]; then cmd+=(--ak "min_workers=$MIN_WORKERS"); fi
   if [ -n "${MAX_WORKERS:-}" ]; then cmd+=(--ak "max_workers=$MAX_WORKERS"); fi
-  if [ -n "${MAX_LIVE_WORKERS:-}" ]; then cmd+=(--ak "max_live_workers=$MAX_LIVE_WORKERS"); fi
 fi
+if [ "$MODE" = vote ]; then
+  cmd+=(--ak "workers=${WORKERS:-5}")
+  if [ -n "${AGGREGATOR_RESERVE:-}" ]; then cmd+=(--ak "aggregator_reserve=$AGGREGATOR_RESERVE"); fi
+fi
+if [ "$MODE" != single ] && [ -n "${MAX_LIVE_WORKERS:-}" ]; then cmd+=(--ak "max_live_workers=$MAX_LIVE_WORKERS"); fi
 if [ -n "${BUDGET_USD:-}" ]; then cmd+=(--ak "budget_usd=$BUDGET_USD"); fi
 
-echo "job $JOB_NAME: $BENCHMARK, ${#ids[@]} tasks, mode $MODE, rulebook $RULEBOOK, authority $AUTHORITY_MODEL ($AUTHORITY_THINKING)$([ "$MODE" = forum ] && echo ", workers $WORKER_MODEL ($WORKER_THINKING)")"
+case "$MODE" in
+  forum) team="authority $AUTHORITY_MODEL ($AUTHORITY_THINKING), workers $WORKER_MODEL ($WORKER_THINKING)" ;;
+  single) team="one agent, $AUTHORITY_MODEL ($AUTHORITY_THINKING)" ;;
+  vote) team="${WORKERS:-5} workers $WORKER_MODEL ($WORKER_THINKING), aggregator $AUTHORITY_MODEL ($AUTHORITY_THINKING)" ;;
+esac
+echo "job $JOB_NAME: $BENCHMARK, ${#ids[@]} tasks, mode $MODE, rulebook $RULEBOOK, $team"
 echo "time limit: the tasks' ${limit} s (the runtime stops by ${WALL_CLOCK_SEC} s at the latest, sooner if the rulebook says so); commit: $COMMIT; sandbox: ${CPUS:-task default} CPUs, ${MEMORY_MB:-task default} MB"
 printf '%q ' "${cmd[@]}"; echo
 [ -n "${DRY_RUN:-}" ] && exit 0

@@ -1,6 +1,8 @@
 // Scripted agents on pi's faux provider, so the whole runtime (and the Pier adapter around it) can be run
 // end to end with no model and no key. `--faux smoke` drives one forum trial: the authority opens a thread,
-// assigns two workers with different personas, waits for both, commits, and ends. Not for measuring anything.
+// assigns two workers with different personas, waits for both, commits, and ends. In vote mode each worker writes
+// and commits its own file, and the aggregator lists the checkout and answers with worker1's patch in a fenced
+// block, as a model might. Not for measuring anything.
 
 import { fauxAssistantMessage, fauxProvider, fauxText, fauxToolCall } from "@earendil-works/pi-ai";
 import type { Context } from "@earendil-works/pi-ai";
@@ -30,13 +32,30 @@ function agentName(ctx: Context): string {
 	const sys = String(ctx.systemPrompt ?? "");
 	const w = /worker "([a-z0-9-]+)"/.exec(sys);
 	if (w) return w[1]!;
-	return sys.includes('You are "authority"') ? "authority" : "single";
+	if (sys.includes('You are "authority"')) return "authority";
+	// vote mode: a worker works in worktrees/workerN; the aggregator's prompt holds the workers' reports
+	const v = /worktrees\/(worker\d+)/.exec(sys);
+	if (v) return `vote-${v[1]}`;
+	if (transcript(ctx).includes("Context from other agents:")) return "aggregator";
+	return "single";
 }
 
 function smoke(ctx: Context) {
 	const who = agentName(ctx);
 	const step = ctx.messages.filter((m) => m.role === "assistant").length;
 	const seen = transcript(ctx);
+	if (who.startsWith("vote-")) {
+		const name = who.slice("vote-".length);
+		if (step === 0) return fauxAssistantMessage(fauxToolCall("write", { path: `DECORUM_SMOKE_${name}.md`, content: `written by ${name}\n` }), { stopReason: "toolUse" });
+		if (step === 1) return fauxAssistantMessage(fauxToolCall("bash", { command: `git add -A && git commit -qm '${name}: smoke' && git log --oneline -1` }), { stopReason: "toolUse" });
+		return fauxAssistantMessage(`Done: wrote DECORUM_SMOKE_${name}.md.`);
+	}
+	if (who === "aggregator") {
+		if (step === 0) return fauxAssistantMessage(fauxToolCall("ls", { path: "." }), { stopReason: "toolUse" });
+		const prompt = transcript({ ...ctx, messages: ctx.messages.slice(0, 1) });
+		const first = /--- worker1 ---\n([\s\S]*?)(?:\n--- worker\d+ ---|$)/.exec(prompt)?.[1] ?? "";
+		return fauxAssistantMessage(`The workers agree; worker1's patch is the cleanest.\n\n\`\`\`diff\n${first.trim()}\n\`\`\``);
+	}
 	if (who === "single") {
 		if (step === 0) return fauxAssistantMessage(fauxToolCall("write", { path: "DECORUM_SMOKE_single.md", content: "written by the single agent\n" }), { stopReason: "toolUse" });
 		if (step === 1) return fauxAssistantMessage(fauxToolCall("bash", { command: "git add -A && git commit -qm 'single: smoke' && git log --oneline -1" }), { stopReason: "toolUse" });

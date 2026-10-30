@@ -1,6 +1,8 @@
 // The decorum runtime: one process that hosts the authority agent and its workers as pi sessions, owns the
 // forum, delivers forum messages between agents, enforces the rulebook at every tool call, and at the end
 // commits what is left and writes the trial's trace (forum.jsonl, one pi session file per agent, summary.json).
+// The same runtime runs the two conditions the forum is compared with: one agent alone (single), and EvoMAS's
+// majority vote (vote: N workers solve the task apart, an aggregator writes the final patch from theirs; vote.ts).
 
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join, relative } from "node:path";
@@ -15,11 +17,13 @@ import { AUTHORITY, authoritySystemPrompt, digest, WORKER_NUDGE, workerFirstProm
 import type { Rulebook } from "./rulebook.ts";
 import type { ForumHost, WorkerSpec } from "./tools.ts";
 import { authorityTools, workerTools } from "./tools.ts";
+import type { ApplyResult, WorkerReport } from "./vote.ts";
+import { AGGREGATOR, aggregatorPrompt, applyPatch, cleanPatch, failedReport, repoPathPattern, voteWorkerName, workerInstruction, worktreePatch } from "./vote.ts";
 import { commitAll, createIsolatedWorkspace, headSha, mergeBranch, prepareGit, removeStaleIndexLock, resetToBase } from "./workspace.ts";
 
 export const VERSION = "0.1.0";
 
-export type Mode = "forum" | "single";
+export type Mode = "forum" | "single" | "vote";
 export type CommitPolicy = "commit" | "leave";
 export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 
@@ -48,6 +52,15 @@ export interface RuntimeOptions {
 	commitPolicy?: CommitPolicy;
 	/** A wall-clock cap from the benchmark (its agent time limit less a margin for wrapping up); the tighter of this and the rulebook's applies. */
 	wallClockSec?: number;
+	/** Vote mode: how many workers solve the task (EvoMAS's pool has 6). At most max_live_workers work at once. */
+	voteWorkers?: number;
+	/** Vote mode: the task's id, which the aggregator's prompt names ("Instance ID: ..."). */
+	instanceId?: string;
+	/**
+	 * Vote mode: the share of the trial's dollars and wall clock kept for the aggregator. Workers are stopped when the
+	 * rest is spent, so a trial never ends with patches and no aggregator to read them.
+	 */
+	aggregatorReserve?: number;
 	now?: () => number;
 	log?: (line: string) => void;
 }
@@ -64,7 +77,7 @@ interface Usage {
 
 interface AgentHandle {
 	name: string;
-	role: "authority" | "worker";
+	role: "authority" | "worker" | "aggregator";
 	session: AgentSession;
 	model: string;
 	thinking: ThinkingLevel;
@@ -79,6 +92,8 @@ interface AgentHandle {
 	usage: Usage;
 	errors: string[];
 	lastText: string;
+	/** The whole text of the last assistant message that had text: an aggregator's answer. */
+	answer: string;
 	/** Forum messages handed to pi's steering queue in the current run, so any pi never delivered can be put back. */
 	steered: Array<{ text: string; events: ForumEvent[] }>;
 }
@@ -117,7 +132,28 @@ export interface Summary {
 	}>;
 	forum: { threads: number; posts: number; assignments: number; refusals: number; events: number };
 	refusals: Array<{ agent: string; tool: string; rule: string; reason: string; at: string }>;
+	/** Vote mode: what each worker handed the aggregator, and what became of the aggregator's answer. Null otherwise. */
+	vote: VoteSummary | null;
 	errors: string[];
+}
+
+export interface VoteSummary {
+	workers: number;
+	/** Why the workers were stopped early (their share of the budget was spent), or null. */
+	workers_stopped: string | null;
+	reports: WorkerReport[];
+	aggregator: {
+		ran: boolean;
+		/** The aggregator's whole answer, before cleaning, in characters. */
+		answer_chars: number;
+		error: string | null;
+		/** The cleaned patch, in bytes; 0 when the answer held no diff. */
+		patch_bytes: number;
+		patch_files: string[];
+		apply: ApplyResult | null;
+		/** The worker whose patch the final patch is, byte for byte, or null when the aggregator wrote its own. */
+		same_as: string | null;
+	};
 }
 
 const NAME_RE = /^[a-z][a-z0-9-]{0,23}$/;
@@ -138,6 +174,10 @@ export class ForumRuntime implements ForumHost {
 	private assignLock: Promise<unknown> = Promise.resolve();
 	private readonly errors: string[] = [];
 	private wallTimer: NodeJS.Timeout | null = null;
+	/** Vote mode: why the workers were stopped, once their share of the budget is spent; the aggregator then runs. */
+	private workersStopped: string | null = null;
+	private votePhase: "workers" | "aggregator" | null = null;
+	private vote: VoteSummary | null = null;
 
 	constructor(opts: RuntimeOptions) {
 		const now = opts.now ?? Date.now;
@@ -146,6 +186,9 @@ export class ForumRuntime implements ForumHost {
 			maxWorkerNudges: 2,
 			commitPolicy: "commit",
 			wallClockSec: undefined as unknown as number,
+			voteWorkers: 5,
+			instanceId: "",
+			aggregatorReserve: 0.15,
 			...opts,
 			workDir: opts.workDir ?? join("/tmp", "decorum-work"),
 			now,
@@ -174,29 +217,37 @@ export class ForumRuntime implements ForumHost {
 				this.stop(d.ok ? "budget.wall_clock_sec" : d.rule, d.ok ? `Wall clock of ${wall} s reached.` : d.reason);
 			}, wall * 1000);
 		}
-		this.log(`decorum ${VERSION}: mode=${this.o.mode} rulebook=${this.rulebook.name} authority=${modelId(this.o.authorityModel)} worker=${this.o.mode === "forum" ? modelId(this.o.workerModel) : "-"} repo=${this.o.repo}`);
-		let endReason = "authority_done";
+		const vote = this.o.mode === "vote";
+		this.log(
+			`decorum ${VERSION}: mode=${this.o.mode} rulebook=${this.rulebook.name} ${vote ? "aggregator" : "authority"}=${modelId(this.o.authorityModel)} worker=${this.o.mode === "single" ? "-" : modelId(this.o.workerModel)}${vote ? ` workers=${this.o.voteWorkers}` : ""} repo=${this.o.repo}`,
+		);
+		let endReason = vote ? "vote_done" : "authority_done";
 		try {
-			const authority = await this.createAgent({
-				name: AUTHORITY,
-				role: "authority",
-				cwd: this.o.repo,
-				model: this.o.authorityModel,
-				thinking: this.o.authorityThinking,
-				appendPrompt:
-					this.o.mode === "forum"
-						? authoritySystemPrompt(this.rulebook, { repo: this.o.repo, workerModel: modelId(this.o.workerModel), commitPolicy: this.o.commitPolicy })
-						: "",
-				customTools: (h) => (this.o.mode === "forum" ? authorityTools(this, h) : []),
-			});
-			endReason = await this.authorityLoop(authority);
+			if (vote) {
+				if (!baseSha) throw new Error(`${this.o.repo} has no commit to diff the workers' work against.`);
+				endReason = await this.voteTrial(baseSha);
+			} else {
+				const authority = await this.createAgent({
+					name: AUTHORITY,
+					role: "authority",
+					cwd: this.o.repo,
+					model: this.o.authorityModel,
+					thinking: this.o.authorityThinking,
+					appendPrompt:
+						this.o.mode === "forum"
+							? authoritySystemPrompt(this.rulebook, { repo: this.o.repo, workerModel: modelId(this.o.workerModel), commitPolicy: this.o.commitPolicy })
+							: "",
+					customTools: (h) => (this.o.mode === "forum" ? authorityTools(this, h) : []),
+				});
+				endReason = await this.authorityLoop(authority);
+			}
 		} catch (e) {
 			endReason = "error";
 			this.errors.push(errorText(e));
 			this.log(`error: ${errorText(e)}`);
 		}
 		if (this.stopped) endReason = this.stopped;
-		await this.stopAll(this.stopped ? this.stopReason : "The authority ended the trial.");
+		await this.stopAll(this.stopped ? this.stopReason : vote ? "The vote is over." : "The authority ended the trial.");
 		if (this.wallTimer) clearTimeout(this.wallTimer);
 		let autoCommitted = false;
 		let commitsUndone = 0;
@@ -244,6 +295,162 @@ export class ForumRuntime implements ForumHost {
 			if (this.stopped) return this.stopped;
 			this.authorityWakes++;
 			prompt = digest(this.drain(m), this.workerStatusLine());
+		}
+	}
+
+	// ---------- majority vote ----------
+
+	/**
+	 * EvoMAS's majority vote. worker1..workerN each get the instruction alone, as the single agent does, each in its
+	 * own worktree branched from the base (the instruction names that worktree where it names the checkout, and a
+	 * worker's tool call that touches the shared checkout is refused). (EvoMAS ran its workers one after another in one checkout and showed each
+	 * the patches of the workers before it; that leak is not copied, so here they are independent.) Each worker's
+	 * patch, or EvoMAS's error line when it made none, goes to the aggregator, which may read the checkout but not
+	 * change it, and answers with the final patch. The answer is cleaned to a diff and applied to the checkout, which
+	 * is what is graded.
+	 */
+	private async voteTrial(baseSha: string): Promise<string> {
+		const n = this.o.voteWorkers;
+		const names = Array.from({ length: n }, (_, i) => voteWorkerName(i + 1));
+		const voteDir = join(this.o.outDir, "vote");
+		mkdirSync(voteDir, { recursive: true });
+		const thread = this.forum.openThread(AGGREGATOR, "Majority vote", `${n} workers each solve the task alone; ${AGGREGATOR} reads every worker's patch and answers with the final patch.`);
+		const v: VoteSummary = {
+			workers: n,
+			workers_stopped: null,
+			reports: [],
+			aggregator: { ran: false, answer_chars: 0, error: null, patch_bytes: 0, patch_files: [], apply: null, same_as: null },
+		};
+		this.vote = v;
+
+		// The workers: at most max_live_workers at once, each stopped when the workers' share of the budget is spent.
+		this.votePhase = "workers";
+		const wall = this.rulebook.budget.wall_clock_sec;
+		const share = 1 - this.o.aggregatorReserve;
+		const shareTimer =
+			wall === null
+				? null
+				: setTimeout(() => this.stopWorkers(`the workers' share of the wall clock (${Math.round(wall * share)} s of ${wall} s) is spent; the rest is kept for ${AGGREGATOR}.`), wall * share * 1000);
+		const reports = new Map<string, WorkerReport>();
+		const queue = [...names];
+		const lanes = Math.max(1, Math.min(n, this.rulebook.budget.max_live_workers));
+		try {
+			await Promise.all(
+				Array.from({ length: lanes }, async () => {
+					for (let name = queue.shift(); name; name = queue.shift()) reports.set(name, await this.voteWorker(name, thread.id, baseSha, voteDir));
+				}),
+			);
+		} finally {
+			if (shareTimer) clearTimeout(shareTimer);
+		}
+		v.reports = names.map((name) => reports.get(name)!);
+		v.workers_stopped = this.workersStopped;
+		if (this.stopped) return this.stopped;
+
+		// The aggregator: EvoMAS's prompt, read-only tools (EvoMAS gave it read_file, list_files and search_in_files).
+		this.votePhase = "aggregator";
+		const prompt = aggregatorPrompt(this.o.repo, this.o.instanceId, this.o.instruction, v.reports);
+		writeFileSync(join(voteDir, "aggregator_prompt.md"), prompt);
+		const agg = await this.createAgent({
+			name: AGGREGATOR,
+			role: "aggregator",
+			cwd: this.o.repo,
+			model: this.o.authorityModel,
+			thinking: this.o.authorityThinking,
+			appendPrompt: "",
+			customTools: () => [],
+			tools: ["read", "grep", "find", "ls"],
+		});
+		v.aggregator.ran = true;
+		this.log(`${AGGREGATOR} started with ${v.reports.filter((r) => r.ok).length} of ${n} patches`);
+		await this.runPrompt(agg, prompt);
+		const answer = agg.answer;
+		writeFileSync(join(voteDir, "aggregator_answer.md"), answer);
+		v.aggregator.answer_chars = answer.length;
+		// EvoMAS's smolagents runner fails an empty answer with these words; the trial then has no patch.
+		if (!answer.trim()) v.aggregator.error = agg.errors.at(-1) ?? "Agent returned empty response - execution may have failed";
+		if (answer.trim()) this.forum.post(thread.id, AGGREGATOR, answer);
+
+		const patch = cleanPatch(answer);
+		const patchFile = join(voteDir, "final.patch");
+		writeFileSync(patchFile, patch);
+		v.aggregator.patch_bytes = Buffer.byteLength(patch);
+		v.aggregator.patch_files = [...patch.matchAll(/^diff --git a\/(\S+) b\//gm)].map((m) => m[1]!);
+		v.aggregator.same_as = patch.trim() ? (v.reports.find((r) => r.ok && r.report.trim() === patch.trim())?.worker ?? null) : null;
+		let outcome: string;
+		if (!patch) outcome = v.aggregator.error ? `${AGGREGATOR} failed: ${v.aggregator.error}` : `${AGGREGATOR}'s answer holds no diff; nothing to apply.`;
+		else {
+			const r = applyPatch(this.o.repo, patchFile);
+			v.aggregator.apply = r;
+			outcome = r.applied
+				? `Applied the final patch (${v.aggregator.patch_files.length} files) with ${r.method}${v.aggregator.same_as ? `; it is ${v.aggregator.same_as}'s patch` : "; it is no single worker's patch"}.`
+				: `The final patch did not apply:\n${r.output}`;
+		}
+		this.forum.note("runtime", outcome);
+		this.log(outcome.split("\n")[0]!);
+		this.forum.closeThread(thread.id, outcome.split("\n")[0]!);
+		return v.aggregator.apply?.applied ? "vote_done" : "vote_no_patch";
+	}
+
+	/** One vote worker, start to finish; its report is its patch, or EvoMAS's error line when it made none. */
+	private async voteWorker(name: string, threadId: string, baseSha: string, voteDir: string): Promise<WorkerReport> {
+		const before = this.stopped ? this.stopReason : this.workersStopped;
+		if (before) {
+			const error = `not started: ${before}`;
+			this.forum.note("runtime", `${name} was not started: ${before}`);
+			return { worker: name, ok: false, report: failedReport(name, error), patch_bytes: 0, files: [], error };
+		}
+		const ws = createIsolatedWorkspace(this.o.repo, join(this.o.workDir, "worktrees"), name);
+		const instruction = workerInstruction(this.o.instruction, this.o.repo, ws.dir);
+		this.forum.assign(threadId, name, "", instruction);
+		this.totalWorkers++;
+		const w = await this.createAgent({
+			name,
+			role: "worker",
+			cwd: ws.dir,
+			branch: ws.branch,
+			model: this.o.workerModel,
+			thinking: this.o.workerThinking,
+			appendPrompt: "",
+			customTools: () => [],
+			linked: ws.linked,
+		});
+		this.log(`${name} started in ${ws.dir}`);
+		w.loop = this.runPrompt(w, instruction);
+		await w.loop;
+		w.loop = null;
+		w.finished = true;
+		const p = worktreePatch(ws.dir, baseSha);
+		writeFileSync(join(voteDir, `${name}.patch`), p.patch);
+		const error = p.patch ? null : (p.error ?? w.errors.at(-1) ?? "No output generated");
+		if (p.patch) this.forum.finish(name, "finished", `Patch: ${p.files.length} files (${p.files.join(", ")}), ${Buffer.byteLength(p.patch)} bytes.`);
+		else this.forum.finish(name, "stopped", `No patch: ${error}`);
+		this.log(`${name} done: ${p.patch ? `${p.files.length} files changed` : `no patch (${error})`}`);
+		return { worker: name, ok: !!p.patch, report: p.patch || failedReport(name, error!), patch_bytes: Buffer.byteLength(p.patch), files: p.files, error };
+	}
+
+	/** True once the workers have been stopped; stops them now if they have spent their share of the dollars. */
+	private checkWorkerShare(): boolean {
+		const usd = this.rulebook.budget.usd_per_trial;
+		if (this.votePhase === "workers" && !this.workersStopped && usd !== null) {
+			const cost = this.state().costUsd;
+			if (cost >= usd * (1 - this.o.aggregatorReserve)) {
+				this.stopWorkers(`the workers have spent $${cost.toFixed(2)}, their share of the $${usd} budget; the rest is kept for ${AGGREGATOR}.`);
+			}
+		}
+		return this.workersStopped !== null;
+	}
+
+	/** End the worker phase: running workers are stopped, and what each left in its worktree is its patch. */
+	private stopWorkers(reason: string): void {
+		if (this.workersStopped || this.votePhase !== "workers") return;
+		this.workersStopped = reason;
+		this.forum.note("runtime", `Workers stopped: ${reason}`);
+		this.log(`workers stopped: ${reason}`);
+		for (const a of this.agents.values()) {
+			if (a.role !== "worker") continue;
+			a.session.clearQueue();
+			if (a.running) a.session.abort().catch(() => undefined);
 		}
 	}
 
@@ -310,6 +517,8 @@ export class ForumRuntime implements ForumHost {
 	// ---------- message delivery ----------
 
 	private route(ev: ForumEvent): void {
+		// In a vote the forum is only the trial's trace: no agent hears from another.
+		if (this.o.mode === "vote") return;
 		let recipients: string[] = [];
 		if (ev.kind === "post") {
 			// the thread's participants, plus anyone named as @name, wherever they work
@@ -517,13 +726,17 @@ export class ForumRuntime implements ForumHost {
 
 	private async createAgent(spec: {
 		name: string;
-		role: "authority" | "worker";
+		role: "authority" | "worker" | "aggregator";
 		cwd: string;
 		branch?: string;
 		model: Model<any>;
 		thinking: ThinkingLevel;
 		appendPrompt: string;
 		customTools: (name: string) => ToolDefinition[];
+		/** pi's built-in tools for this agent; default all of read, bash, edit, write, grep, find, ls. */
+		tools?: string[];
+		/** A worktree's entries linked from the checkout (node_modules, .venv): paths into them are not the shared checkout. */
+		linked?: string[];
 	}): Promise<AgentHandle> {
 		const agentDir = join(this.o.workDir, "pi-agent");
 		const runtime = this;
@@ -544,6 +757,15 @@ export class ForumRuntime implements ForumHost {
 							if (!d.ok) {
 								runtime.stop(d.rule, d.reason, spec.name, event.toolName);
 								return { block: true, reason: d.reason, terminate: true };
+							}
+							if (spec.role === "worker" && runtime.o.mode === "vote") {
+								if (runtime.checkWorkerShare()) return { block: true, reason: `Stopped: ${runtime.workersStopped}`, terminate: true };
+								// a vote worker works only in its own copy: the shared checkout is where the other workers and the grader are
+								if (repoPathPattern(runtime.o.repo, spec.linked).test(JSON.stringify(event.input ?? {}))) {
+									const reason = `${runtime.o.repo} is the shared checkout, which workers may not use. Your own copy of the repository is ${spec.cwd}: read, change and test the code there.`;
+									runtime.forum.refusal(spec.name, event.toolName, "vote.own_copy", reason);
+									return { block: true, reason };
+								}
 							}
 							// the manager rule binds the authority only, and only when there is a forum to manage
 							if (spec.role === "authority" && runtime.o.mode === "forum") {
@@ -568,7 +790,7 @@ export class ForumRuntime implements ForumHost {
 			thinkingLevel: spec.thinking,
 			modelRuntime: this.o.modelRuntime,
 			resourceLoader: loader,
-			tools: ["read", "bash", "edit", "write", "grep", "find", "ls", ...customTools.map((t) => t.name)],
+			tools: [...(spec.tools ?? ["read", "bash", "edit", "write", "grep", "find", "ls"]), ...customTools.map((t) => t.name)],
 			customTools,
 			sessionManager: SessionManager.create(spec.cwd, join(this.o.outDir, "sessions", spec.name)),
 			settingsManager: SettingsManager.inMemory({ compaction: { enabled: true }, retry: { enabled: true, maxRetries: 4 } }),
@@ -590,6 +812,7 @@ export class ForumRuntime implements ForumHost {
 			usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, costUsd: 0, llmCalls: 0, compactions: 0 },
 			errors: [],
 			lastText: "",
+			answer: "",
 			steered: [],
 		};
 		session.subscribe((ev) => {
@@ -621,10 +844,14 @@ export class ForumRuntime implements ForumHost {
 			}
 			handle.usage.llmCalls++;
 			const textOut = m.content.filter((c) => c.type === "text").map((c) => (c as { text: string }).text).join("\n").trim();
-			if (textOut) handle.lastText = textOut.slice(0, 2000);
+			if (textOut) {
+				handle.lastText = textOut.slice(0, 2000);
+				handle.answer = textOut;
+			}
 			if (m.stopReason === "error" && m.errorMessage) handle.errors.push(m.errorMessage);
 			const d = checkBudget(this.rulebook, this.state());
 			if (!d.ok) this.stop(d.rule, d.reason);
+			else if (this.o.mode === "vote") this.checkWorkerShare();
 		});
 		this.agents.set(spec.name, handle);
 		return handle;
@@ -698,9 +925,9 @@ export class ForumRuntime implements ForumHost {
 			rulebook: this.rulebook,
 			models: {
 				authority: modelId(this.o.authorityModel),
-				worker: this.o.mode === "forum" ? modelId(this.o.workerModel) : null,
+				worker: this.o.mode === "single" ? null : modelId(this.o.workerModel),
 				authority_thinking: this.o.authorityThinking,
-				worker_thinking: this.o.mode === "forum" ? this.o.workerThinking : null,
+				worker_thinking: this.o.mode === "single" ? null : this.o.workerThinking,
 			},
 			repo: this.o.repo,
 			started_at: x.startedIso,
@@ -739,6 +966,7 @@ export class ForumRuntime implements ForumHost {
 				events: this.forum.events.length,
 			},
 			refusals,
+			vote: this.vote,
 			errors: this.errors,
 		};
 	}

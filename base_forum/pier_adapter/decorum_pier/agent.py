@@ -4,9 +4,13 @@
 workers (pi sessions in one Node process, ``base_forum/runtime``) work in the task checkout, the rulebook is
 enforced at every tool call, and the trial's trace lands in ``/logs/agent/decorum``. ``DecorumSingle`` runs
 the same runtime with one agent and no forum, the single-agent condition the forum is compared with.
+``DecorumVote`` runs EvoMAS's majority vote on the same runtime: N workers solve the task apart, each in its own
+worktree, and an aggregator (the -m model) writes the final patch from theirs.
 
     pier run -p deep-swe/tasks --agent-import-path decorum_pier:DecorumForum \\
         -m moonshotai/kimi-k3 --ak worker_model=moonshotai/kimi-k2.7-code --ak rulebook=base-0
+    pier run -p ... --agent-import-path decorum_pier:DecorumVote \\
+        -m moonshotai/kimi-k2.7-code --ak worker_model=moonshotai/kimi-k2.7-code --ak workers=5
 
 Build-time install (network open): Node and the runtime's npm dependencies, pinned by the runtime's
 package-lock.json. Setup (network closed): the runtime's source and the rulebook are uploaded. Run: only the
@@ -114,6 +118,8 @@ class DecorumForum(BaseInstalledAgent):
         max_workers: int | str | None = None,
         max_live_workers: int | str | None = None,
         budget_usd: float | str | None = None,
+        workers: int | str = 5,
+        aggregator_reserve: float | str | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(*args, **kwargs)
@@ -149,13 +155,23 @@ class DecorumForum(BaseInstalledAgent):
             if number < 0 or (whole and not number.is_integer()):
                 raise ValueError(f"{name} must be a {'whole ' if whole else ''}number >= 0; got {value!r}")
             self.budget_flags += [flag, str(int(number)) if whole or number.is_integer() else repr(number)]
+        # Vote mode: how many workers, and the share of the dollars and the clock kept for the aggregator.
+        try:
+            self.workers = int(str(workers))
+        except ValueError:
+            self.workers = 0
+        if not 1 <= self.workers <= 20 or str(workers).strip() != str(self.workers):
+            raise ValueError(f"workers must be a whole number from 1 to 20; got {workers!r}")
+        self.aggregator_reserve = None if aggregator_reserve in (None, "", "none") else float(aggregator_reserve)
+        if self.aggregator_reserve is not None and not 0 <= self.aggregator_reserve <= 0.9:
+            raise ValueError(f"aggregator_reserve must be a share from 0 to 0.9; got {aggregator_reserve!r}")
         for name, level in (("authority_thinking", authority_thinking), ("worker_thinking", worker_thinking)):
             if level not in THINKING:
                 raise ValueError(f"{name} must be one of {sorted(THINKING)}; got {level!r}")
         if not faux:
             if not self.model_name:
                 raise ValueError("Give the authority's model with -m provider/model-id, e.g. -m moonshotai/kimi-k3")
-            if self.MODE == "forum" and not worker_model:
+            if self.MODE != "single" and not worker_model:
                 raise ValueError("Give the workers' model with --ak worker_model=provider/model-id")
             for m in self._models():
                 if _provider(m) not in PROVIDERS:
@@ -170,7 +186,7 @@ class DecorumForum(BaseInstalledAgent):
 
     def _models(self) -> list[str]:
         models = [self.model_name] if self.model_name else []
-        if self.MODE == "forum" and self.worker_model:
+        if self.MODE != "single" and self.worker_model:
             models.append(self.worker_model)
         return models
 
@@ -296,9 +312,25 @@ done
             args += ["--faux", self.faux]
         else:
             args += ["--authority-model", self.model_name or ""]
-            if self.MODE == "forum":
+            if self.MODE != "single":
                 args += ["--worker-model", self.worker_model or ""]
+        if self.MODE == "vote":
+            args += ["--workers", str(self.workers), "--instance-id", self._instance_id()]
+            if self.aggregator_reserve is not None:
+                args += ["--aggregator-reserve", repr(self.aggregator_reserve)]
         return " ".join(shlex.quote(a) for a in args)
+
+    def _instance_id(self) -> str:
+        """The task's id, for the aggregator's prompt: the task folder's name, from the trial's config.json."""
+        trial = Path(self.logs_dir).parent
+        try:
+            path = json.loads((trial / "config.json").read_text())["task"]["path"]
+            if path:
+                return Path(path).name
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+        # Pier names a trial <task id, cut short>__<suffix>
+        return trial.name.rsplit("__", 1)[0]
 
     @with_prompt_template
     async def run(self, instruction: str, environment: BaseEnvironment, context: AgentContext) -> None:
@@ -354,6 +386,16 @@ class DecorumSingle(DecorumForum):
         return "decorum-single"
 
 
+class DecorumVote(DecorumForum):
+    """EvoMAS's majority vote on the same runtime: N independent workers, and an aggregator (the -m model)."""
+
+    MODE = "vote"
+
+    @staticmethod
+    def name() -> str:
+        return "decorum-vote"
+
+
 def _context_metadata(summary: dict[str, Any]) -> dict[str, Any]:
     return {
         "mode": summary.get("mode"),
@@ -363,4 +405,18 @@ def _context_metadata(summary: dict[str, Any]) -> dict[str, Any]:
         "workers": sum(1 for a in summary.get("agents", []) if a.get("role") == "worker"),
         "forum": summary.get("forum"),
         "refusals": len(summary.get("refusals", [])),
+        "vote": _vote_metadata(summary.get("vote")),
+    }
+
+
+def _vote_metadata(vote: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not vote:
+        return None
+    agg = vote.get("aggregator") or {}
+    return {
+        "workers": vote.get("workers"),
+        "patches": sum(1 for r in vote.get("reports", []) if r.get("ok")),
+        "workers_stopped": vote.get("workers_stopped"),
+        "applied": bool((agg.get("apply") or {}).get("applied")),
+        "same_as": agg.get("same_as"),
     }
