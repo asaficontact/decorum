@@ -21,14 +21,19 @@ import { authorityTools, workerTools } from "./tools.ts";
 import type { AgentReport, ApplyResult, LayerSpec, Topology } from "./evomas.ts";
 import {
 	AGGREGATOR,
+	AGGREGATOR_MIN_SEC,
+	AGGREGATOR_WARN_SEC,
 	applyPatch,
 	cleanPatch,
 	DEFAULT_AGENTS,
 	DEFAULT_RESERVE,
 	EMPTY_ANSWER,
 	failedReport,
+	layerEnds,
 	readerPrompt,
 	repoPathPattern,
+	retryPrompt,
+	timeWarning,
 	topologyLayers,
 	workerInstruction,
 	worktreePatch,
@@ -177,6 +182,8 @@ export interface EvomasSummary {
 		apply: ApplyResult | null;
 		/** The earlier agent whose report, cleaned, is the final patch, or null when the aggregator wrote its own. */
 		same_as: string | null;
+		/** When the first patch did not apply: that patch, and the length of the corrected answer asked for once (the fields above then describe the corrected one). */
+		retry?: { first: { answer_chars: number; patch_bytes: number; patch_files: string[]; apply: ApplyResult | null }; answer_chars: number } | null;
 	};
 }
 
@@ -343,13 +350,10 @@ export class ForumRuntime implements ForumHost {
 			agents_per_layer: n,
 			reserve: this.o.aggregatorReserve,
 			layers: layers.map((l) => ({ role: l.role, kind: l.kind, stopped: null, reports: [] })),
-			aggregator: { ran: false, answer_chars: 0, error: null, patch_bytes: 0, patch_files: [], apply: null, same_as: null },
+			aggregator: { ran: false, answer_chars: 0, error: null, patch_bytes: 0, patch_files: [], apply: null, same_as: null, retry: null },
 		};
 		this.evomas = e;
-		// Each layer ends by its share of the dollars and the clock: the coding layer by 1 - reserve, then the readers'
-		// layers (the aggregator last) split the reserve equally.
-		const readers = layers.filter((l) => l.kind === "reader").length + 1;
-		const ends = [...layers.map((l, i) => (l.kind === "coder" ? 1 - this.o.aggregatorReserve : 1 - this.o.aggregatorReserve + (this.o.aggregatorReserve * (i - layers.findIndex((x) => x.kind === "reader") + 1)) / readers)), 1];
+		const ends = layerEnds(layers, this.o.aggregatorReserve, this.rulebook.budget.wall_clock_sec);
 		const reports: AgentReport[] = [];
 
 		for (let li = 0; li < layers.length && !this.stopped; li++) {
@@ -382,33 +386,87 @@ export class ForumRuntime implements ForumHost {
 		const thread = this.forum.openThread(AGGREGATOR, "Final patch", `${AGGREGATOR} reads every report and answers with the final patch.`);
 		let answer = "";
 		const done = await this.runLayer(layers.length, 1, async () => {
-			const r = await this.readerAgent(AGGREGATOR, AGGREGATOR, thread.id, reports, dir);
-			answer = this.agents.get(AGGREGATOR)?.answer ?? "";
-			return [r];
+			const warn = this.warnBeforeWallClock();
+			try {
+				const r = await this.readerAgent(AGGREGATOR, AGGREGATOR, thread.id, reports, dir);
+				answer = this.agents.get(AGGREGATOR)?.answer ?? "";
+				return [r];
+			} finally {
+				if (warn) clearTimeout(warn);
+			}
 		});
 		e.aggregator.ran = true;
 		e.aggregator.answer_chars = answer.length;
 		if (!answer.trim()) e.aggregator.error = done.reports[0]?.error ?? EMPTY_ANSWER;
-		const patch = cleanPatch(answer);
-		const patchFile = join(dir, "final.patch");
-		writeFileSync(patchFile, patch);
-		e.aggregator.patch_bytes = Buffer.byteLength(patch);
-		e.aggregator.patch_files = patchFiles(patch);
-		e.aggregator.same_as = patch.trim() ? (reports.find((r) => r.ok && cleanPatch(r.report).trim() === patch.trim())?.agent ?? null) : null;
-		let outcome: string;
-		if (!patch) outcome = e.aggregator.error ? `${AGGREGATOR} failed: ${e.aggregator.error}` : `${AGGREGATOR}'s answer holds no diff; nothing to apply.`;
-		else {
-			const r = applyPatch(this.o.repo, patchFile);
-			e.aggregator.apply = r;
-			outcome = r.applied
-				? `Applied the final patch (${e.aggregator.patch_files.length} files) with ${r.method}${e.aggregator.same_as ? `; it is ${e.aggregator.same_as}'s patch` : "; it is no earlier agent's patch"}.`
-				: `The final patch did not apply:\n${r.output}`;
+		let outcome = this.applyFinal(answer, reports, dir);
+		// A patch that does not apply goes back to the aggregator once, with what git said (not in EvoMAS).
+		const a = this.agents.get(AGGREGATOR);
+		if (e.aggregator.apply && !e.aggregator.apply.applied && a && !this.stopped) {
+			const prompt = retryPrompt(this.o.repo, e.aggregator.apply.output);
+			writeFileSync(join(dir, `${AGGREGATOR}_retry_prompt.md`), prompt);
+			this.forum.note("runtime", outcome);
+			this.log(`${AGGREGATOR}'s patch did not apply; asking it once to correct it`);
+			const first = { answer_chars: answer.length, patch_bytes: e.aggregator.patch_bytes, patch_files: e.aggregator.patch_files, apply: e.aggregator.apply };
+			let again = "";
+			await this.runLayer(layers.length, 1, async () => {
+				const warn = this.warnBeforeWallClock();
+				try {
+					a.finished = false;
+					a.answer = "";
+					a.loop = this.runPrompt(a, prompt);
+					await a.loop;
+				} finally {
+					a.loop = null;
+					a.finished = true;
+					if (warn) clearTimeout(warn);
+				}
+				again = a.answer;
+				return [];
+			});
+			writeFileSync(join(dir, `${AGGREGATOR}_retry_answer.md`), again);
+			e.aggregator.retry = { first, answer_chars: again.length };
+			if (again.trim()) {
+				answer = again;
+				e.aggregator.answer_chars = again.length;
+				outcome = this.applyFinal(again, reports, dir);
+			} else outcome = `${AGGREGATOR} gave no corrected patch${this.stopped ? ` (${this.stopReason})` : ""}; the first patch did not apply.`;
 		}
 		this.forum.note("runtime", outcome);
 		this.log(outcome.split("\n")[0]!);
 		this.forum.closeThread(thread.id, outcome.split("\n")[0]!);
 		const word = topology.replace("-", "_");
 		return e.aggregator.apply?.applied ? `${word}_done` : `${word}_no_patch`;
+	}
+
+	/** Clean the aggregator's answer to the final patch and apply it to the checkout; the outcome, for the forum. */
+	private applyFinal(answer: string, reports: AgentReport[], dir: string): string {
+		const e = this.evomas!;
+		const patch = cleanPatch(answer);
+		const patchFile = join(dir, "final.patch");
+		writeFileSync(patchFile, patch);
+		e.aggregator.patch_bytes = Buffer.byteLength(patch);
+		e.aggregator.patch_files = patchFiles(patch);
+		e.aggregator.same_as = patch.trim() ? (reports.find((r) => r.ok && cleanPatch(r.report).trim() === patch.trim())?.agent ?? null) : null;
+		e.aggregator.apply = null;
+		if (!patch) return e.aggregator.error ? `${AGGREGATOR} failed: ${e.aggregator.error}` : `${AGGREGATOR}'s answer holds no diff; nothing to apply.`;
+		const r = applyPatch(this.o.repo, patchFile);
+		e.aggregator.apply = r;
+		return r.applied
+			? `Applied the final patch (${e.aggregator.patch_files.length} files) with ${r.method}${e.aggregator.same_as ? `; it is ${e.aggregator.same_as}'s patch` : "; it is no earlier agent's patch"}.`
+			: `The final patch did not apply:\n${r.output}`;
+	}
+
+	/** Tell the aggregator, once, shortly before the wall clock ends the trial, to answer now: a cut-off aggregator leaves no patch. */
+	private warnBeforeWallClock(): NodeJS.Timeout | null {
+		const wall = this.rulebook.budget.wall_clock_sec;
+		if (wall === null) return null;
+		const at = this.startedAtMs + (wall - AGGREGATOR_WARN_SEC) * 1000 - this.o.now();
+		return setTimeout(() => {
+			const a = this.agents.get(AGGREGATOR);
+			if (!a?.running) return;
+			this.log(`${AGGREGATOR} warned: ${AGGREGATOR_WARN_SEC} s of the wall clock left`);
+			a.session.steer(timeWarning(AGGREGATOR_WARN_SEC)).catch((err: unknown) => a.errors.push(`steer failed: ${errorText(err)}`));
+		}, Math.max(0, at));
 	}
 
 	/** Run one layer until it is done or its share of the budget (`end`, a share of the trial's) is spent. */

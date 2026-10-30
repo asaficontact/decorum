@@ -88,9 +88,12 @@ layer; `runtime/src/evomas.ts` follows it:
    whole answer. A layer's readers run all at once: in a peer review, reviewers read the creators' patches, revisers read
    those and the reviewers' answers, and the aggregator reads all 3N.
 3. **The aggregator's answer** is cleaned as EvoMAS cleans it (`clean_swe_bench_output`: take a fenced diff, keep the
-   source-file diff blocks, drop trailing prose) and applied to the checkout as the SWE-bench harness applies a
-   prediction (`git apply`, then `git apply --reject`, then `patch --fuzz=5`). If it fails, answers with no diff, or
-   its patch does not apply, the trial has no patch, as in EvoMAS.
+   source-file diff blocks, drop trailing prose) and applied to the checkout: `git apply`, then the same with every
+   hunk header's line counts retaken from the hunk (`--recount`), then also accepting hunks with no context
+   (`--unidiff-zero`), then also ignoring whitespace (`--ignore-whitespace -C1`), then `patch --fuzz=3 -l`. A way
+   that applies anything other than the patch's own added and removed lines is undone and the next is tried. If the
+   patch still does not apply, the aggregator is asked once more, with the error, for a corrected patch. If it fails,
+   or answers with no diff, the trial has no patch.
 
 **What EvoMAS's code does, and what its names suggest.** Nothing counts votes, and nothing asks a reviewer to review:
 EvoMAS has review and revise prompt templates and its own peer-review routine, but its executor never calls that
@@ -107,9 +110,18 @@ with a diff instead of editing the code would leave no patch. EvoMAS captured a 
 new files; here they are kept. And because a trial has one budget, a share of the dollars and the wall clock is kept
 for the read-only layers (`AGGREGATOR_RESERVE`, 0.15 for a vote, 0.45 for peer review, split equally between its
 reviewers, revisers and aggregator): each layer is stopped when its share is spent, and what each agent has done so
-far is its report.
+far is its report. The aggregator keeps at least 15 minutes of the clock (at most 40% of it); when the reserve would
+leave it less, the layers before it end proportionally sooner. 150 s before the clock ends the trial, a running
+aggregator is told to answer now.
 
-A trial also leaves `decorum/evomas/`: each coding agent's patch, each reader's prompt and answer, and the final patch;
+**Applying the aggregator's patch, and its one retry.** EvoMAS's aggregator types its whole patch out as text, and
+graded it as the SWE-bench harness applies a prediction (`git apply`, `git apply --reject`, `patch --fuzz=5`). Kimi
+K2.7 aggregators get the code right but often miscount a hunk's lines in its header, which `git apply` rejects as a
+corrupt patch: in two 20-task runs (October 2026) 28 of 32 aggregator patches failed plain `git apply`, and 30 of the 32
+apply here, each exactly as written. `patch --fuzz=5` is not used: on one task it applied a patch with lines
+lost. The retry with git's error is not in EvoMAS either.
+
+A trial also leaves `decorum/evomas/`: each coding agent's patch, each reader's prompt and answer, the aggregator's retry prompt and answer when it had one, and the final patch;
 `summary.json`'s `evomas` has every report, layer by layer, and which earlier report, if any, the final patch is.
 
 ```bash
@@ -279,7 +291,7 @@ why it failed. Start the viewer with `--no-retry` to hide the button.
 ## Developing
 
 ```bash
-cd base_forum/runtime && npm ci && npm test && npx tsc --noEmit      # 62 tests, scripted agents, no key
+cd base_forum/runtime && npm ci && npm test && npx tsc --noEmit      # 69 tests, scripted agents, no key
 cd base_forum/pier_adapter && uv run --with pytest --with-editable . pytest -q
 cd base_forum/viewer && uv run --no-project --with pytest pytest -q
 cd base_forum && uv run --no-project --with pytest pytest -q scripts/tests
