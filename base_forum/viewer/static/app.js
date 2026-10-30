@@ -39,10 +39,11 @@ const S = {
 
 // the agent that leads a trial: the forum's authority, or a majority vote's aggregator
 const isLead = (name) => name === "authority" || name === "aggregator";
-const MODE_WORD = { single: "single agent", vote: "majority vote", forum: "forum" };
+const MODE_WORD = { single: "single agent", vote: "majority vote", "peer-review": "peer review", forum: "forum" };
+const EVOMAS_MODES = ["vote", "peer-review"];
 const LEAD_ABOUT = {
   authority: ["Authority", "Manages the team: plans, assigns workers, verifies", "Manages the team: writes the plan, assigns and briefs workers, follows and verifies their work, and commits."],
-  aggregator: ["Aggregator", "Reads every worker's patch, answers with the final patch", "Reads the task and every worker's patch (it may read the code, not change it) and answers with the final patch, which is applied to the checkout."],
+  aggregator: ["Aggregator", "Reads every earlier report, answers with the final patch", "Reads the task and every report before it, a coding agent's patch or a reader's answer (it may read the code, not change it), and answers with the final patch, which is applied to the checkout."],
 };
 
 function colorOf(name) {
@@ -112,7 +113,7 @@ function shortDate(iso) {
   return d.toLocaleString(undefined, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit", ...(sameYear ? {} : { year: "numeric" }) });
 }
 function defaultLabel(r) {
-  const kind = [r.mode === "single" || r.mode === "vote" ? MODE_WORD[r.mode] : null, r.faux ? "scripted" : null].filter(Boolean).join(", ");
+  const kind = [r.mode !== "forum" ? MODE_WORD[r.mode] : null, r.dataset ? r.dataset.name : null, r.faux ? "scripted" : null].filter(Boolean).join(", ");
   const when = shortDate(r.started_at);
   return `${BENCH_WORD[r.benchmark] || r.benchmark || "Run"}${when ? `, ${when}` : ` ${r.job}`}${kind ? ` (${kind})` : ""}`;
 }
@@ -307,10 +308,34 @@ function renderRunOverview() {
   fact(r.status === "running" ? "Spent so far" : "Cost", money(r.cost_usd));
   if (r.faux) fact("Agents", "scripted, no model calls");
   else {
-    fact(r.mode === "vote" ? "Aggregator" : "Authority", r.authority_model);
-    fact("Workers", r.mode === "single" ? null : `${r.mode === "vote" && r.workers ? `${r.workers} × ` : ""}${r.worker_model || ""}` || null);
+    fact(EVOMAS_MODES.includes(r.mode) ? "Aggregator" : "Authority", r.authority_model);
+    fact(r.mode === "peer-review" ? "Per stage" : "Workers", r.mode === "single" ? null : `${EVOMAS_MODES.includes(r.mode) && r.workers ? `${r.workers} × ` : ""}${r.worker_model || ""}` || null);
   }
-  fact("Rulebook", r.rulebook);
+  if (!EVOMAS_MODES.includes(r.mode)) fact("Rulebook", r.rulebook); // a vote or a peer review has no rulebook
+  if (r.dataset) fact("Dataset", `${r.dataset.name}${r.dataset.changed ? " (since changed)" : ""}`);
+  // the run's tasks as a named dataset: compare the runs on it, or save them as one
+  const BENCH_KEY = { "SWE-bench Pro": "swebenchpro", DeepSWE: "deepswe" };
+  if (r.dataset) {
+    const b = el("button", "chip", "Compare runs on this dataset");
+    b.type = "button";
+    b.addEventListener("click", () => { IN.cmp = r.dataset.slug; setPage("insights"); });
+    facts.append(b);
+  } else if ((r.task_ids || []).length && BENCH_KEY[r.benchmark] && r.status !== "starting") {
+    const b = el("button", "chip", `Save these ${r.task_ids.length} tasks as a dataset…`);
+    b.type = "button";
+    b.addEventListener("click", async () => {
+      const got = await askName({ title: `Save the tasks of “${runLabel(r)}” as a dataset`, text: "Then every setup can be run on exactly these tasks and compared with this run (Insights, Compare on a dataset). A dataset never changes once saved; it is kept in base_forum/tasks/datasets/ and shared through git.", placeholder: "e.g. Ansible five" });
+      if (!got) return;
+      try {
+        const res = await postJSON("api/datasets", { benchmark: BENCH_KEY[r.benchmark], name: got.name, description: got.description, tasks: r.task_ids, how: `the tasks of run ${r.job}` });
+        if (typeof IN !== "undefined") IN.datasets = null; // the Insights list reloads with it
+        toast(`Saved the dataset “${res.name}” (${res.tasks} tasks).`);
+      } catch (e) {
+        toast(`Could not save: ${e.message}`);
+      }
+    });
+    facts.append(b);
+  }
   $("r-problem").hidden = !r.problem;
   $("r-problem").textContent = r.problem || "";
   const graded = r.counts.passed + r.counts.not_passed;
@@ -548,11 +573,11 @@ function renderHead() {
   fact(running ? "Spent so far" : "Cost", money(t.cost_usd));
   const auth = S.agents.find((a) => isLead(a.role));
   const worker = S.agents.find((a) => a.role === "worker");
-  fact(t.mode === "vote" ? "Aggregator" : "Authority", t.models?.authority || auth?.model);
+  fact(EVOMAS_MODES.includes(t.mode) ? "Aggregator" : "Authority", t.models?.authority || auth?.model);
   fact("Workers", t.models?.worker || worker?.model);
-  if (t.mode !== "vote") fact("Rulebook", t.rulebook);
-  if (t.vote) fact("Final patch", t.vote.applied ? (t.vote.same_as ? `${t.vote.same_as}'s, applied` : "the aggregator's own, applied") : "none applied");
-  if (t.end_reason && !["authority_done", "vote_done"].includes(t.end_reason)) fact("Ended by", t.end_reason.replace("budget.", "budget: ").replaceAll("_", " "));
+  if (!EVOMAS_MODES.includes(t.mode)) fact("Rulebook", t.rulebook);
+  if (t.evomas) fact("Final patch", t.evomas.applied ? (t.evomas.same_as ? `${t.evomas.same_as}'s, applied` : "the aggregator's own, applied") : "none applied");
+  if (t.end_reason && !["authority_done", "vote_done", "peer_review_done"].includes(t.end_reason)) fact("Ended by", t.end_reason.replace("budget.", "budget: ").replaceAll("_", " "));
   const note = $("t-note");
   note.hidden = !t.replay;
   note.textContent = "A replay: a recorded real trial played back at its original pace, so the page has something live to show.";
@@ -818,6 +843,29 @@ async function getJSON(url) {
   const r = await fetch(url, { cache: "no-store" });
   if (!r.ok) throw new Error(`${r.status}`);
   return r.json();
+}
+async function postJSON(url, body) {
+  const r = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json", "X-Decorum-Viewer": "1" }, body: JSON.stringify(body) });
+  const out = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(out.error || `${r.status}`);
+  return out;
+}
+// Ask for a name and a description (saving a dataset or a setup); resolves to { name, description } or null.
+function askName({ title, text, placeholder }) {
+  const d = $("name-dialog");
+  $("nd-title").textContent = title;
+  $("nd-text").textContent = text;
+  $("nd-name").value = "";
+  $("nd-name").placeholder = placeholder || "";
+  $("nd-desc").value = "";
+  return new Promise((resolve) => {
+    const done = (v) => { $("nd-form").onsubmit = null; $("nd-cancel").onclick = null; d.onclose = null; resolve(v); };
+    $("nd-form").onsubmit = (e) => { e.preventDefault(); const name = $("nd-name").value.trim(); if (!name) return; d.close(); done({ name, description: $("nd-desc").value.trim() }); };
+    $("nd-cancel").onclick = () => { d.close(); done(null); };
+    d.onclose = () => done(null);
+    d.showModal();
+    $("nd-name").focus();
+  });
 }
 
 function fromHash() {

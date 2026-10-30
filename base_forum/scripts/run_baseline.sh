@@ -6,14 +6,17 @@
 #   BENCHMARK=swebenchpro base_forum/scripts/run_baseline.sh    # SWE-bench Pro V2: the 10 tasks in tasks/swebenchpro-10.tsv
 #   MODE=single base_forum/scripts/run_baseline.sh              # the same tasks, one agent, no forum
 #   MODE=vote WORKERS=5 base_forum/scripts/run_baseline.sh      # EvoMAS's majority vote: 5 workers, one aggregator
+#   MODE=peer-review WORKERS=6 base_forum/scripts/run_baseline.sh   # EvoMAS's peer review: 6 creators, reviewers, revisers
+#   DATASET=collaborators-10 MODE=vote base_forum/scripts/run_baseline.sh   # a named dataset (tasks/datasets/)
 #   N_TASKS=1 base_forum/scripts/run_baseline.sh                # just the first task, to check the setup
 #   DRY_RUN=1 base_forum/scripts/run_baseline.sh                # print the pier command and stop
 #   FAUX=smoke N_TASKS=1 base_forum/scripts/run_baseline.sh     # scripted agents, no key, no cost: checks Docker + Pier
 #
 # Settings (environment variables, defaults in brackets):
 #   BENCHMARK [deepswe]                deepswe | swebenchpro (SWE-bench Pro V2, Scale's Harbor tasks)
-#   MODE [forum]                       forum | single | vote
-#   AUTHORITY_MODEL [moonshotai/kimi-k3]  in vote mode, the aggregator's model (AUTHORITY_THINKING is its thinking)
+#   MODE [forum]                       forum | single | vote | peer-review
+#   AUTHORITY_MODEL [moonshotai/kimi-k3]  in vote and peer-review mode, the aggregator's model (AUTHORITY_THINKING its
+#                                      thinking); the other agents run on WORKER_MODEL
 #   WORKER_MODEL [moonshotai/kimi-k2.7-code]
 #   AUTHORITY_THINKING [max]           off | minimal | low | medium | high | xhigh | max (the leaderboard ran K3 at max)
 #   WORKER_THINKING [high]
@@ -23,8 +26,11 @@
 #   CONCURRENCY [2]                    trials at once
 #   MIN_WORKERS, MAX_WORKERS          the fewest and most workers per task (default: the rulebook's, 3 and 6 in base-0)
 #   MAX_LIVE_WORKERS, BUDGET_USD       workers at once, and the spend cap per task in dollars (default: the rulebook's)
-#   WORKERS [5]                        vote mode: how many workers solve each task (1-20; EvoMAS's pool has 6)
-#   AGGREGATOR_RESERVE [0.15]          vote mode: the share of the dollars and the clock kept for the aggregator
+#   WORKERS [5 vote, 6 peer-review]    vote and peer-review mode: the agents in each layer (1-20; EvoMAS's pools have 6)
+#   AGGREGATOR_RESERVE [0.15, 0.45]    vote and peer-review mode: the share of the dollars and the clock kept for the
+#                                      read-only layers after the coding agents
+#   DATASET                            a named dataset (scripts/datasets.py list): its tasks and its benchmark, instead
+#                                      of TASKS and BENCHMARK; the run records it as <name>@<hash>
 #   RETRIES [0]                        retry a trial that fails on infrastructure (Docker, network, a crash) up to N
 #                                      times during the run; Pier never retries a timeout or a grading error this way.
 #                                      After a run, scripts/retry_failed.py retries any failed task, timeouts included.
@@ -41,6 +47,18 @@
 set -euo pipefail
 
 BASE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+die() { echo "run_baseline: $*" >&2; exit 2; }
+
+# A named dataset sets the tasks and the benchmark (scripts/datasets.py).
+DATASET_REF=""
+if [ -n "${DATASET:-}" ]; then
+  [ -z "${TASKS:-}" ] || die "give DATASET or TASKS, not both"
+  ds_tasks="$(mktemp "${TMPDIR:-/tmp}/decorum-dataset.XXXXXX")"
+  ds_line="$(python3 "$BASE/scripts/datasets.py" resolve "$DATASET" --tasks-out "$ds_tasks")" || die "no dataset '$DATASET' (python3 base_forum/scripts/datasets.py list)"
+  ds_bench="${ds_line%%$'\t'*}"; DATASET_REF="${ds_line#*$'\t'}"
+  if [ -n "${BENCHMARK:-}" ] && [ "$BENCHMARK" != "$ds_bench" ]; then die "dataset $DATASET is $ds_bench, but BENCHMARK is $BENCHMARK"; fi
+  BENCHMARK="$ds_bench"; TASKS="$ds_tasks"
+fi
 BENCHMARK="${BENCHMARK:-deepswe}"
 MODE="${MODE:-forum}"
 AUTHORITY_MODEL="${AUTHORITY_MODEL:-moonshotai/kimi-k3}"
@@ -56,8 +74,6 @@ DEEPSWE_DIR="${DEEPSWE_DIR:-$BASE/.deep-swe}"
 SWEPRO_DIR="${SWEPRO_DIR:-$BASE/.swebench-pro}"
 JOBS_DIR="${JOBS_DIR:-$BASE/jobs}"
 MARGIN_SEC=120
-
-die() { echo "run_baseline: $*" >&2; exit 2; }
 
 case "$BENCHMARK" in
   deepswe)
@@ -84,9 +100,10 @@ case "$MODE" in
   forum) AGENT=decorum_pier:DecorumForum ;;
   single) AGENT=decorum_pier:DecorumSingle ;;
   vote) AGENT=decorum_pier:DecorumVote ;;
-  *) die "MODE must be forum, single or vote, got '$MODE'" ;;
+  peer-review) AGENT=decorum_pier:DecorumPeerReview ;;
+  *) die "MODE must be forum, single, vote or peer-review, got '$MODE'" ;;
 esac
-JOB_NAME="${JOB_NAME:-${FAUX:+faux-}$BENCHMARK-$MODE-$(basename "$RULEBOOK" .yaml)-$(date -u +%Y%m%dT%H%M%SZ)}"
+JOB_NAME="${JOB_NAME:-${FAUX:+faux-}$BENCHMARK-$MODE-${DATASET:-$(basename "$RULEBOOK" .yaml)}-$(date -u +%Y%m%dT%H%M%SZ)}"
 
 command -v pier >/dev/null || die "pier is not installed: uv tool install datacurve-pier --with-editable \"$BASE/pier_adapter\""
 command -v docker >/dev/null && docker info >/dev/null 2>&1 || die "Docker is not running"
@@ -162,10 +179,11 @@ if [ "$MODE" = forum ]; then
   if [ -n "${MIN_WORKERS:-}" ]; then cmd+=(--ak "min_workers=$MIN_WORKERS"); fi
   if [ -n "${MAX_WORKERS:-}" ]; then cmd+=(--ak "max_workers=$MAX_WORKERS"); fi
 fi
-if [ "$MODE" = vote ]; then
-  cmd+=(--ak "workers=${WORKERS:-5}")
+if [ "$MODE" = vote ] || [ "$MODE" = peer-review ]; then
+  if [ -n "${WORKERS:-}" ]; then cmd+=(--ak "workers=$WORKERS"); fi
   if [ -n "${AGGREGATOR_RESERVE:-}" ]; then cmd+=(--ak "aggregator_reserve=$AGGREGATOR_RESERVE"); fi
 fi
+if [ -n "$DATASET_REF" ]; then cmd+=(--ak "dataset=$DATASET_REF"); fi
 if [ "$MODE" != single ] && [ -n "${MAX_LIVE_WORKERS:-}" ]; then cmd+=(--ak "max_live_workers=$MAX_LIVE_WORKERS"); fi
 if [ -n "${BUDGET_USD:-}" ]; then cmd+=(--ak "budget_usd=$BUDGET_USD"); fi
 
@@ -173,8 +191,9 @@ case "$MODE" in
   forum) team="authority $AUTHORITY_MODEL ($AUTHORITY_THINKING), workers $WORKER_MODEL ($WORKER_THINKING)" ;;
   single) team="one agent, $AUTHORITY_MODEL ($AUTHORITY_THINKING)" ;;
   vote) team="${WORKERS:-5} workers $WORKER_MODEL ($WORKER_THINKING), aggregator $AUTHORITY_MODEL ($AUTHORITY_THINKING)" ;;
+  peer-review) team="${WORKERS:-6} creators, reviewers and revisers $WORKER_MODEL ($WORKER_THINKING), aggregator $AUTHORITY_MODEL ($AUTHORITY_THINKING)" ;;
 esac
-echo "job $JOB_NAME: $BENCHMARK, ${#ids[@]} tasks, mode $MODE, rulebook $RULEBOOK, $team"
+echo "job $JOB_NAME: $BENCHMARK${DATASET_REF:+, dataset $DATASET_REF}, ${#ids[@]} tasks, mode $MODE, rulebook $RULEBOOK, $team"
 echo "time limit: the tasks' ${limit} s (the runtime stops by ${WALL_CLOCK_SEC} s at the latest, sooner if the rulebook says so); commit: $COMMIT; sandbox: ${CPUS:-task default} CPUs, ${MEMORY_MB:-task default} MB"
 printf '%q ' "${cmd[@]}"; echo
 [ -n "${DRY_RUN:-}" ] && exit 0

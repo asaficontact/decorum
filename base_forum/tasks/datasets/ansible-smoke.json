@@ -1,0 +1,10 @@
+{
+  "name": "Ansible smoke",
+  "benchmark": "swebenchpro",
+  "description": "One SWE-bench Pro task solved by every setup tried on it so far: a quick end-to-end check of a setup.",
+  "how": "paste a list",
+  "created_at": "2026-10-30T04:26:53+00:00",
+  "tasks": [
+    "instance_ansible__ansible-12734fa21c08a0ce8c84e533abdc560db2eb1955-v7eee2454f617569fd6889f2211f75bc02a35f9f8"
+  ]
+}

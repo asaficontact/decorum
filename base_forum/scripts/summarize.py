@@ -69,7 +69,8 @@ def load(job: Path) -> list[dict]:
         result = json.loads(rfile.read_text())
         s_path = trial / "agent" / "decorum" / "summary.json"
         s = json.loads(s_path.read_text()) if s_path.exists() else {}
-        workers = [a for a in s.get("agents", []) if a.get("role") == "worker"]
+        # every agent but the one that leads (the authority, or a vote's or a peer review's aggregator)
+        workers = [a for a in s.get("agents", []) if a.get("role") not in (None, "authority", "aggregator")]
         exc = result.get("exception_info") or {}
         reward, graded_by = _reward(result, trial)
         rows.append(

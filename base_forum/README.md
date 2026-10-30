@@ -6,19 +6,23 @@ assigns workers to them (one or several per thread, each with a persona and inst
 verifies the work, and commits. A **typed rulebook** is enforced at every tool call. The base rulebook, `base-0`,
 keeps the forum open and enforces three things: the authority manages and does not edit files itself, it runs
 the task with a team of 3 to 6 workers, and the trial's limits. It runs on DeepSWE and on SWE-bench Pro V2.
-The same runtime runs the two conditions the forum is compared with: one agent alone, and EvoMAS's majority vote
-(see [Majority vote](#majority-vote-evomas)).
+The same runtime runs the conditions the forum is compared with: one agent alone, and two of EvoMAS's systems,
+majority vote and peer review (see [EvoMAS's systems](#evomass-systems-majority-vote-and-peer-review)). Runs are
+compared on **named datasets** (see [Named datasets and setups](#named-datasets-and-setups)).
 
 ```
 base_forum/
   rulebooks/base-0.yaml     the minimal rulebook (every key typed; unknown keys are refused)
   runtime/                  the forum runtime: Node 24 + pi (TypeScript run directly, no build step)
-  pier_adapter/             decorum_pier: the Pier agents DecorumForum, DecorumSingle and DecorumVote
+  pier_adapter/             decorum_pier: the Pier agents DecorumForum, DecorumSingle, DecorumVote, DecorumPeerReview
   scripts/run_baseline.sh   run N DeepSWE tasks with Pier + Docker
   scripts/summarize.py      one table per job, against the leaderboard's Kimi K3 reference
   scripts/retry_failed.py   run a job's failed tasks again, in the same job, keeping the failed attempts
   scripts/regrade.sh        grade a trial's patch by hand when Pier's verifier step fails
   scripts/watch.py          follow a running job live in the terminal
+  scripts/datasets.py       named datasets and team setups: list, show, save, resolve
+  tasks/datasets/           the named datasets, one JSON file each, shared through git
+  tasks/setups/             the named team setups
   viewer/                   Forum Decorum, the viewer: runs, forums, team analysis and insights, live
   tasks/baseline-10.tsv     DeepSWE: the 10 baseline tasks, with Kimi K3 / K2.7-code reference pass rates
   tasks/swebenchpro-10.tsv  SWE-bench Pro V2: the 10 tasks the collaborators use, with Scale's 2025 per-task results
@@ -55,45 +59,84 @@ Inside, one Node process hosts every agent as a pi session:
    uncommitted (DeepSWE grades `git diff base..HEAD`), writes `summary.json`, and Pier grades the patch in a
    clean container.
 
-## Majority vote (EvoMAS)
+## EvoMAS's systems: majority vote and peer review
 
-`MODE=vote` (Pier agent `DecorumVote`) runs the majority-vote system of EvoMAS (amazon-science/EvoMAS,
-`mas_pools/swebench/majority_vote.yaml`) on this runtime, so it differs from the forum only in how the team is
-organised:
+`MODE=vote` (Pier agent `DecorumVote`) and `MODE=peer-review` (`DecorumPeerReview`) run two systems of EvoMAS
+(amazon-science/EvoMAS, `mas_pools/swebench/majority_vote.yaml` and `peer_review.yaml`) on this runtime, so they
+differ from the forum only in how the team is organised. EvoMAS runs every system through one DAG executor, layer by
+layer; `runtime/src/evomas.ts` follows it:
 
-1. **Workers** `worker1`..`workerN` (`WORKERS`, default 5; EvoMAS's pool has 6) on `WORKER_MODEL` each get the
-   instruction exactly as the single agent does, with pi's coding tools, each in its own git worktree branched from
-   the task's base. At most `MAX_LIVE_WORKERS` work at once. Where the instruction names the checkout ("A code
-   repository is available in the `/app` directory"), a worker's copy names its own worktree, and any worker tool
-   call that touches the shared checkout is refused with that reason (rule `vote.own_copy`), so workers stay apart. A worker's patch is everything it changed (committed or
-   not, new files included) against the base. A worker that changed nothing is reported as EvoMAS reports it:
-   `Error: Agent workerN execution failed: No output generated`.
-2. **The aggregator** (`AUTHORITY_MODEL` at `AUTHORITY_THINKING`) gets EvoMAS's prompt word for word: the task
-   query (`Repository: ...`, `Instance ID: ...`, the instruction, and the instruction to answer with only a git
-   diff), then `Context from other agents:` with each worker's report under `--- workerN ---`. Like EvoMAS's
-   aggregator it may read the code (pi's `read`, `grep`, `find`, `ls`) but not change it or run anything. Nothing
-   counts votes: it reads every patch and answers with one, copying a worker's or writing its own.
-3. **The answer** is cleaned as EvoMAS cleans it (`clean_swe_bench_output`: take a fenced diff, keep the source-file
-   diff blocks, drop trailing prose) and applied to the checkout as the SWE-bench harness applies a prediction
-   (`git apply`, then `git apply --reject`, then `patch --fuzz=5`). If the aggregator fails, answers with no diff,
-   or its patch does not apply, the trial has no patch, as in EvoMAS.
+| | layers | then |
+|---|---|---|
+| `vote` | `worker1`..`workerN` (coding) | the aggregator |
+| `peer-review` | `creator1`..`creatorN` (coding), then `reviewer1`..`reviewerN`, then `reviser1`..`reviserN` | the aggregator |
 
-Where it differs from EvoMAS, on purpose: EvoMAS ran its workers one after another in one checkout and showed each
-the patches of the workers before it (worker 6 saw five patches); here they are independent. EvoMAS's workers were
-SWE-agent, given the aggregator's task query (with its "answer only with a diff" lines, which SWE-agent ignores: its
-patch is read from the checkout); here they are the same pi agent as the forum's and the single agent's, given the
-plain instruction, since a worker that answered with a diff instead of editing the code would leave no patch. EvoMAS captured a worker's patch
-with `git diff HEAD`, which loses new files; here they are kept. And because the trial has one budget, 15% of the
-dollars and of the wall clock is kept for the aggregator (`AGGREGATOR_RESERVE`): when the workers have spent the
-rest they are stopped, and what each has done so far is its patch.
+`N` is `WORKERS` (default 5 for a vote, 6 for peer review, as in EvoMAS).
 
-A vote trial also leaves `decorum/vote/`: each worker's patch, the aggregator's prompt and its answer, and the
-final patch; `summary.json`'s `vote` says which worker's patch, if any, the final one is.
+1. **Coding agents** (workers, creators) on `WORKER_MODEL` each get the instruction exactly as the single agent does,
+   with pi's coding tools, each in its own git worktree branched from the task's base. At most `MAX_LIVE_WORKERS`
+   work at once. Where the instruction names the checkout ("A code repository is available in the `/app`
+   directory"), an agent's copy names its own worktree, and any tool call that touches the shared checkout is refused
+   with that reason (rule `evomas.own_copy`). An agent's report is its patch: everything it changed (committed or
+   not, new files included) against the base; one that changed nothing is reported as EvoMAS reports it:
+   `Error: Agent creator3 execution failed: No output generated`.
+2. **Readers** (reviewers and revisers on `WORKER_MODEL`, the aggregator on `AUTHORITY_MODEL` at
+   `AUTHORITY_THINKING`) each get EvoMAS's prompt word for word: the task query (`Repository: ...`, `Instance ID:
+   ...`, the instruction, and the instruction to answer with only a git diff), then `Context from other agents:` with
+   every report made before its layer, in order, under `--- creator1 ---` and so on. Like EvoMAS's CodeAgents they may
+   read the code (pi's `read`, `grep`, `find`, `ls`) but not change it or run anything. A reader's report is its
+   whole answer. A layer's readers run all at once: in a peer review, reviewers read the creators' patches, revisers read
+   those and the reviewers' answers, and the aggregator reads all 3N.
+3. **The aggregator's answer** is cleaned as EvoMAS cleans it (`clean_swe_bench_output`: take a fenced diff, keep the
+   source-file diff blocks, drop trailing prose) and applied to the checkout as the SWE-bench harness applies a
+   prediction (`git apply`, then `git apply --reject`, then `patch --fuzz=5`). If it fails, answers with no diff, or
+   its patch does not apply, the trial has no patch, as in EvoMAS.
+
+**What EvoMAS's code does, and what its names suggest.** Nothing counts votes, and nothing asks a reviewer to review:
+EvoMAS has review and revise prompt templates and its own peer-review routine, but its executor never calls that
+routine and its agent runners ignore an agent's `prompt`, so on SWE-bench a reviewer, a reviser and the aggregator get
+the same prompt and differ only in what they have seen. That is what is copied here, since it is what produced
+EvoMAS's results.
+
+**Where it differs from EvoMAS, on purpose.** EvoMAS ran SWE-bench agents one after another and showed each the
+reports of the agents before it in its own layer (creator 6 saw five patches); here an agent sees only the layers
+before its own, as EvoMAS's executor does elsewhere. EvoMAS's coding agents were SWE-agent, given the readers' task
+query (whose "answer only with a diff" lines SWE-agent ignores: its patch is read from the checkout); here they are
+the same pi agent as the forum's and the single agent's, given the plain instruction, since an agent that answered
+with a diff instead of editing the code would leave no patch. EvoMAS captured a patch with `git diff HEAD`, which loses
+new files; here they are kept. And because a trial has one budget, a share of the dollars and the wall clock is kept
+for the read-only layers (`AGGREGATOR_RESERVE`, 0.15 for a vote, 0.45 for peer review, split equally between its
+reviewers, revisers and aggregator): each layer is stopped when its share is spent, and what each agent has done so
+far is its report.
+
+A trial also leaves `decorum/evomas/`: each coding agent's patch, each reader's prompt and answer, and the final patch;
+`summary.json`'s `evomas` has every report, layer by layer, and which earlier report, if any, the final patch is.
 
 ```bash
-BENCHMARK=swebenchpro MODE=vote WORKERS=5 AUTHORITY_MODEL=moonshotai/kimi-k2.7-code AUTHORITY_THINKING=high \
+DATASET=collaborators-10 MODE=peer-review WORKERS=6 \
+  AUTHORITY_MODEL=moonshotai/kimi-k2.7-code AUTHORITY_THINKING=high WORKER_MODEL=moonshotai/kimi-k2.7-code \
   base_forum/scripts/run_baseline.sh
 ```
+
+## Named datasets and setups
+
+A **dataset** is a named list of one benchmark's tasks, in `tasks/datasets/<name>.json`, committed so everyone runs
+the same tasks under the same name: *Collaborator's 10*, *HARD-51*, *Baseline 10* (DeepSWE) and *Ansible smoke* (one
+task every setup has solved, for a quick end-to-end check). A dataset never changes once saved; a changed list is a
+new name. A run records the dataset it ran as `<name>@<hash>` (the hash is of the benchmark and the task ids), so runs
+of the forum, the single agent, the majority vote and peer review on one dataset can be compared task by task.
+
+- **Run on one:** New run → Tasks → **A dataset**, or `DATASET=<name> base_forum/scripts/run_baseline.sh` (it sets the
+  tasks and the benchmark).
+- **Save one:** choose tasks any way on the run sheet and **Save these tasks as a dataset…**; or on a run's page,
+  **Save these tasks as a dataset…**; or `python3 base_forum/scripts/datasets.py save --name ... --from-job <job>`
+  (or `--tasks ...`, `--tasks-file ...`). `datasets.py list` lists them.
+- **Compare:** Insights → **Compare on a dataset**: one row per task, one column per run on it, passed or not and the
+  cost. Runs from before datasets existed that ran exactly a dataset's tasks are included (marked ○).
+
+A **setup** is a named team and its run settings (mode, models, thinking, workers, spend cap, tasks at once,
+retries), in `tasks/setups/<name>.json`: New run → Team → **Saved setups** loads one, **Save this team as a setup…**
+saves the one shown. Saving a dataset or a setup is off when starting runs is.
 
 ## The rulebook
 
@@ -121,9 +164,10 @@ Each rule's value is shown to every agent in its system prompt (`describeRules`)
 - `decorum/summary.json` — models, rulebook, end reason, cost and tokens per agent, assignments, refusals.
 - `decorum/runtime.log`, `decorum/stdout.txt` — the runtime's own log.
 - `trajectory.json` — ATIF v1.7 for Pier's viewer (`pier view`): the authority as the root, each worker as an
-  embedded subagent trajectory referenced from the `assign_workers` call that started it. In a vote the aggregator
+  embedded subagent trajectory referenced from the `assign_workers` call that started it. In a vote or a peer review the aggregator
   is the root.
-- `decorum/vote/` (vote mode) — `workerN.patch`, `aggregator_prompt.md`, `aggregator_answer.md`, `final.patch`.
+- `decorum/evomas/` (vote and peer review) — each coding agent's `<name>.patch`, each reader's `<name>_prompt.md`
+  and `<name>_answer.md`, and `final.patch`. (A vote from before peer review left `decorum/vote/`.)
 
 ## Running the baseline (macOS or Linux, Docker)
 
@@ -140,6 +184,8 @@ N_TASKS=1 base_forum/scripts/run_baseline.sh       # one real task: checks the k
 base_forum/scripts/run_baseline.sh                 # the 10 baseline tasks, forum mode
 MODE=single base_forum/scripts/run_baseline.sh     # the same 10, one Kimi K3 agent and no forum
 MODE=vote WORKERS=5 base_forum/scripts/run_baseline.sh   # the same 10, EvoMAS's majority vote: 5 workers, an aggregator
+MODE=peer-review base_forum/scripts/run_baseline.sh      # the same 10, EvoMAS's peer review: 6 per stage, an aggregator
+DATASET=hard-51 MODE=single base_forum/scripts/run_baseline.sh   # a named dataset sets the tasks and the benchmark
 ```
 
 **SWE-bench Pro** (V2, Scale's Harbor tasks from `scaleapi/SWE-bench_Pro-os`, fetched into `base_forum/.swebench-pro`
@@ -188,12 +234,13 @@ leaderboard's Kimi K3 pass rate for that task. `pier view base_forum/jobs/<job>`
 
 **＋ New run** (top of the left column) opens the run sheet:
 1. **Benchmark:** SWE-bench Pro V2 (642 tasks) or DeepSWE v1.1 (113).
-2. **Tasks:** chosen at random with a seed (the default), by difficulty (four bands, from how often published attempts
-   solved each task), the same tasks as an earlier run, picked by hand, pasted ids, or the first N. You can narrow
-   them to a repository, a language or HARD-51, and load the saved lists (`tasks/*.tsv`).
-3. **Team:** the authority's and the workers' models and thinking, the fewest and most workers per task, and how
-   many at once. Or **majority vote**: the workers' model and thinking, how many workers and how many at once, and
-   the aggregator's model and thinking. Or one agent instead of the forum.
+2. **Tasks:** a named dataset, or chosen at random with a seed (the default), by difficulty (four bands, from how
+   often published attempts solved each task), the same tasks as an earlier run, picked by hand, pasted ids, or the
+   first N. You can narrow them to a repository, a language or HARD-51, and save what you chose as a dataset.
+3. **Team:** a saved setup, or the authority's and the workers' models and thinking, the fewest and most workers per
+   task, and how many at once. Or **majority vote** or **peer review**: the agents' model and thinking, how many per
+   layer and how many coding agents at once, and the aggregator's model and thinking. Or one agent instead of the
+   forum. **Save this team as a setup…** keeps it under a name.
 4. **Run:** a name, tasks at once, the spend cap per task, retries on a crash, and **scripted agents** (no model
    calls, no cost: checks Docker, Pier and the tasks).
 
@@ -206,8 +253,8 @@ sees it. Start the viewer with `--no-start` to hide the button. When the page is
 The catalogues the page chooses from are in `tasks/catalog/`, built by `scripts/build_catalog.py` from the public
 data (sources in the script). The worker range and the spend cap reach the runtime as `MIN_WORKERS`, `MAX_WORKERS`,
 `MAX_LIVE_WORKERS` and `BUDGET_USD` (also usable with `run_baseline.sh` directly). They override the rulebook's
-budget for that run only, and are checked the same way. A majority-vote run sends `WORKERS` and `MAX_LIVE_WORKERS`
-instead of the range.
+budget for that run only, and are checked the same way. A majority-vote or peer-review run sends `WORKERS` and
+`MAX_LIVE_WORKERS` instead of the range; a run on a dataset sends `DATASET` instead of a task list.
 
 ## When a task fails: retrying it
 
@@ -232,7 +279,7 @@ why it failed. Start the viewer with `--no-retry` to hide the button.
 ## Developing
 
 ```bash
-cd base_forum/runtime && npm ci && npm test && npx tsc --noEmit      # 57 tests, scripted agents, no key
+cd base_forum/runtime && npm ci && npm test && npx tsc --noEmit      # 62 tests, scripted agents, no key
 cd base_forum/pier_adapter && uv run --with pytest --with-editable . pytest -q
 cd base_forum/viewer && uv run --no-project --with pytest pytest -q
 cd base_forum && uv run --no-project --with pytest pytest -q scripts/tests
@@ -242,4 +289,5 @@ pier run -p <task> --agent-import-path decorum_pier:DecorumForum --ak faux=smoke
 ```
 
 `--faux smoke` replaces both models with scripted agents (an authority that opens a thread and assigns two workers who
-each write a file; in vote mode, workers that each write a file and an aggregator that answers with worker1's patch). It exercises the whole path, Pier and Docker included, without a key, and scores 0 on a real task.
+each write a file; in vote and peer-review mode, coding agents that each write a file and readers that answer with the first
+report's patch). It exercises the whole path, Pier and Docker included, without a key, and scores 0 on a real task.

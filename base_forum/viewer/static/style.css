@@ -531,3 +531,22 @@ button.primary:disabled { opacity: .45; cursor: default; }
   #newrun .tmap { grid-template-columns: minmax(0, 1fr); }
 }
 @media (prefers-reduced-motion: reduce) { #newrun .tile:hover { transform: none; } }
+
+/* compare on a dataset (Insights), and the save dialog */
+.in-cmp-top { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin: 6px 0; }
+.in-cmp-top select { max-width: 100%; }
+.in-cmp-wrap { overflow-x: auto; }
+.in-cmp { border-collapse: collapse; font-size: 13px; }
+.in-cmp th, .in-cmp td { padding: 6px 10px; border-bottom: 1px solid var(--line, rgba(127,127,127,.2)); text-align: left; vertical-align: top; }
+.in-cmp th { font-weight: 600; white-space: nowrap; }
+.in-cmp-task { max-width: 420px; }
+.in-cmp-c { text-align: center !important; white-space: nowrap; }
+.in-cmp-c.pass, .in-cmp-c.pass .row-link { color: var(--a5); font-weight: 600; }
+.in-cmp-c.fail, .in-cmp-c.fail .row-link { color: var(--a1); font-weight: 600; }
+.in-cmp-c.none { color: var(--faint); }
+.in-cmp-total td { font-weight: 600; border-bottom: 0; }
+.nd-form { display: grid; gap: 10px; }
+.nd-form label { display: grid; gap: 4px; }
+.nd-form input, .nd-form textarea { width: 100%; box-sizing: border-box; font: inherit; }
+#newrun .ds-list .same-run { display: grid; grid-template-columns: 1fr; gap: 2px; text-align: left; }
+#newrun .ds-list .same-run b { white-space: normal; }

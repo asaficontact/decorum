@@ -1,0 +1,19 @@
+{
+  "name": "Baseline 10",
+  "benchmark": "deepswe",
+  "description": "The 10 DeepSWE tasks of the first baseline (tasks/baseline-10.tsv has the leaderboard's Kimi K3 / K2.7-code pass rates).",
+  "how": "from tasks/baseline-10.tsv",
+  "created_at": "2026-10-30T04:18:37+00:00",
+  "tasks": [
+    "onedump-dump-encryption-pipeline",
+    "igel-persist-feature-schema",
+    "obsidian-linter-auto-table-of-contents",
+    "bandit-incremental-cache-control",
+    "go-critic-doc-link-checker",
+    "clack-async-autocomplete-options",
+    "csstree-shorthand-expansion-compression",
+    "mobly-grouped-test-barriers",
+    "cliffy-config-file-parsing",
+    "participle-grammar-conflict-analysis"
+  ]
+}

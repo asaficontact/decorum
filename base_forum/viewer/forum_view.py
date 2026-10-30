@@ -35,6 +35,10 @@ try:  # one definition of "failed" for the Retry button and the command line
     import retry_failed
 except ImportError:  # the viewer copied away from base_forum: no retry
     retry_failed = None
+try:  # named datasets and team setups, shared with run_baseline.sh and the command line
+    import datasets
+except ImportError:
+    datasets = None
 ATTEMPTS = ".attempts"
 DEFAULT_JOBS = HERE.parent / "jobs"
 CATALOG_DIR = HERE.parent / "tasks" / "catalog"
@@ -72,19 +76,8 @@ RUN_SETTINGS = (
     "BUDGET_USD",
     "WORKERS",
     "AGGREGATOR_RESERVE",
+    "DATASET",
 )
-PRESET_FILES = {
-    "deepswe": [
-        ("Baseline 10", "baseline-10.tsv", "the 10 tasks of the first baseline")
-    ],
-    "swebenchpro": [
-        (
-            "Collaborator's 10",
-            "swebenchpro-10.tsv",
-            "the 10 tasks your collaborator runs",
-        )
-    ],
-}
 FORUM_TOOLS = {
     "open_thread",
     "assign_workers",
@@ -370,7 +363,7 @@ class TrialState:
             "mode": (summary or {}).get("mode"),
             "rulebook": ((summary or {}).get("rulebook") or {}).get("name"),
             "models": (summary or {}).get("models"),
-            "vote": _vote_brief((summary or {}).get("vote")),
+            "evomas": _evomas_brief(summary),
             "threads": sum(1 for e in self.events if e.get("kind") == "thread_opened"),
             "posts": sum(1 for e in self.events if e.get("kind") == "post"),
             "workers": len(workers),
@@ -389,7 +382,7 @@ class TrialState:
                 finished[e["assignment"]["worker"]] = e["assignment"]
         agents = []
         # the agent that leads the trial: the forum's authority, or a majority vote's aggregator (shown once it starts)
-        lead = "aggregator" if ov.get("mode") == "vote" else "authority"
+        lead = "aggregator" if ov.get("mode") in ("vote", "peer-review") else "authority"
         names = [
             *([lead] if lead == "authority" or lead in self.sessions else []),
             *[n for n in assigned if n != lead],
@@ -442,20 +435,41 @@ class TrialState:
 
 
 def _mode_of(import_path: str) -> str:
-    """The condition a run ran, from its Pier agent: DecorumSingle, DecorumVote, or the forum."""
+    """The condition a run ran, from its Pier agent: DecorumSingle, DecorumVote, DecorumPeerReview, or the forum."""
     if "Single" in import_path:
         return "single"
+    if "PeerReview" in import_path:
+        return "peer-review"
     return "vote" if "Vote" in import_path else "forum"
 
 
-def _vote_brief(vote: dict | None) -> dict | None:
-    """What became of a majority vote: how many workers made a patch, and whose patch was applied."""
-    if not vote:
+def _dataset_of(ref: object) -> dict | None:
+    """The named dataset a run recorded (<slug>@<hash>), with its name, and whether the dataset is still the same."""
+    parts = datasets.split_ref(ref) if datasets and isinstance(ref, str) else None
+    if not parts:
         return None
-    agg = vote.get("aggregator") or {}
+    slug, h = parts
+    known = next((d for d in datasets.load_datasets() if d["slug"] == slug), None)
+    return {"ref": ref, "slug": slug, "name": known["name"] if known else slug, "changed": bool(known) and known["hash"] != h}
+
+
+def _evomas_brief(summary: dict | None) -> dict | None:
+    """What became of a vote or a peer review: patches made, and whose report the applied patch is."""
+    s = summary or {}
+    e = s.get("evomas")
+    if e:
+        coders = [r for layer in e.get("layers") or [] if layer.get("kind") == "coder" for r in layer.get("reports") or []]
+        agents = e.get("agents_per_layer")
+    elif s.get("vote"):  # a vote from before peer review
+        e = s["vote"]
+        coders, agents = e.get("reports") or [], e.get("workers")
+    else:
+        return None
+    agg = e.get("aggregator") or {}
     return {
-        "workers": vote.get("workers"),
-        "patches": sum(1 for r in vote.get("reports") or [] if r.get("ok")),
+        "topology": e.get("topology", "vote"),
+        "workers": agents,
+        "patches": sum(1 for r in coders if r.get("ok")),
         "applied": bool((agg.get("apply") or {}).get("applied")),
         "same_as": agg.get("same_as"),
     }
@@ -667,44 +681,113 @@ class Store:
     # ---------- starting a run ----------
 
     def catalog(self) -> dict:
-        """The benchmarks the New run page chooses from, with their tasks and saved lists (read once)."""
+        """The benchmarks the New run page chooses from, with their tasks (read once), and the named datasets and team
+        setups (read each time: one may have been saved since)."""
         if self._catalog is None:
             cats = {}
             for key in ("swebenchpro", "deepswe"):
                 cat = _read_json(CATALOG_DIR / f"{key}.json")
-                if not cat:
-                    continue
-                known = {t["id"] for t in cat["tasks"]}
-                presets = []
-                for name, file, about in PRESET_FILES.get(key, []):
-                    f = HERE.parent / "tasks" / file
-                    if f.exists():
-                        ids = [
-                            ln.split("\t")[0]
-                            for ln in f.read_text().splitlines()
-                            if ln
-                            and not ln.startswith("#")
-                            and not ln.startswith("task\t")
-                        ]
-                        presets.append(
-                            {
-                                "name": name,
-                                "about": about,
-                                "ids": [i for i in ids if i in known],
-                            }
-                        )
-                hard = [t["id"] for t in cat["tasks"] if t.get("hard51")]
-                if hard:
-                    presets.append(
-                        {
-                            "name": "HARD-51",
-                            "about": "Scale's hard subset of V2",
-                            "ids": hard,
-                        }
-                    )
-                cats[key] = {**cat, "presets": presets}
+                if cat:
+                    cats[key] = cat
             self._catalog = cats
-        return {"benchmarks": self._catalog, "start": self.start_enabled}
+        sets = datasets.load_datasets() if datasets else []
+        out = {}
+        for key, cat in self._catalog.items():
+            known = {t["id"] for t in cat["tasks"]}
+            out[key] = {
+                **cat,
+                "datasets": [
+                    {
+                        "slug": d["slug"],
+                        "ref": datasets.ref_of(d),
+                        "name": d["name"],
+                        "description": d.get("description", ""),
+                        "how": d.get("how", ""),
+                        "created_at": d.get("created_at"),
+                        "ids": [i for i in d["tasks"] if i in known],
+                        "missing": sum(1 for i in d["tasks"] if i not in known),
+                    }
+                    for d in sets
+                    if d["benchmark"] == key
+                ],
+            }
+        return {
+            "benchmarks": out,
+            "setups": datasets.load_setups() if datasets else [],
+            "start": self.start_enabled,
+            "save": self.start_enabled and datasets is not None,
+        }
+
+    def save_dataset(self, body: dict) -> dict:
+        """Save the chosen tasks as a new named dataset (base_forum/tasks/datasets/<slug>.json)."""
+        if not self.start_enabled or datasets is None:
+            raise PermissionError("saving datasets is switched off in this viewer")
+        key = body.get("benchmark")
+        cats = self.catalog()["benchmarks"]
+        if key not in cats:
+            raise ValueError(f"benchmark must be one of {', '.join(cats)}")
+        with self.lock:
+            d = datasets.save_dataset(
+                body.get("name"),
+                key,
+                body.get("tasks"),
+                body.get("description", ""),
+                body.get("how", ""),
+                known_tasks={t["id"] for t in cats[key]["tasks"]},
+            )
+        return {"slug": d["slug"], "ref": datasets.ref_of(d), "name": d["name"], "tasks": len(d["tasks"])}
+
+    def save_setup(self, body: dict) -> dict:
+        """Save a team and its run settings as a new named setup (base_forum/tasks/setups/<slug>.json)."""
+        if not self.start_enabled or datasets is None:
+            raise PermissionError("saving setups is switched off in this viewer")
+        with self.lock:
+            s = datasets.save_setup(body.get("name"), body.get("team"), body.get("run"), body.get("description", ""))
+        return {"slug": s["slug"], "name": s["name"]}
+
+    def compare(self, slug: str) -> dict:
+        """Every run on a dataset, task by task: the runs that recorded it, and older runs of exactly its tasks."""
+        if datasets is None:
+            raise KeyError(slug)
+        d = datasets.load_dataset(slug)
+        want = set(d["tasks"])
+        rows = []
+        for r in self.runs():
+            ref = datasets.split_ref(r.get("dataset", {}).get("ref") if r.get("dataset") else None)
+            recorded = ref is not None and ref[0] == slug
+            same = set(r.get("task_ids") or []) == want
+            if not (recorded or same):
+                continue
+            cells = {}
+            for t in r["trials"]:
+                if t["task"] in want:
+                    cells[t["task"]] = {"status": t["status"], "reward": t["reward"], "cost_usd": t["cost_usd"], "trial": t["trial"]}
+            graded = [c for c in cells.values() if c["reward"] is not None]
+            rows.append(
+                {
+                    "job": r["job"],
+                    "name": r.get("name"),
+                    "mode": r["mode"],
+                    "authority_model": r.get("authority_model"),
+                    "worker_model": r.get("worker_model"),
+                    "workers": r.get("workers"),
+                    "faux": r.get("faux"),
+                    "status": r["status"],
+                    "started_at": r.get("started_at"),
+                    "how": "recorded" if recorded else "same tasks",
+                    "changed": recorded and ref[1] != d["hash"],
+                    "cells": cells,
+                    "passed": sum(1 for c in graded if c["reward"] >= 1),
+                    "graded": len(graded),
+                    "cost_usd": round(sum(c["cost_usd"] or 0 for c in cells.values()), 4),
+                }
+            )
+        titles = {t["id"]: t.get("title") for cat in (self._catalog or {}).values() for t in cat["tasks"]}
+        return {
+            "dataset": {"slug": d["slug"], "ref": datasets.ref_of(d), "name": d["name"], "benchmark": d["benchmark"], "description": d.get("description", "")},
+            "tasks": [{"id": t, "title": titles.get(t)} for t in d["tasks"]],
+            "runs": rows,
+        }
 
     def start(self, body: dict) -> dict:
         """Check a New run request, write its task list, and start run_baseline.sh with it in the background."""
@@ -736,8 +819,17 @@ class Store:
             return v
 
         mode = body.get("mode", "forum")
-        if mode not in ("forum", "single", "vote"):
-            raise ValueError("mode must be forum, single or vote")
+        if mode not in ("forum", "single", "vote", "peer-review"):
+            raise ValueError("mode must be forum, single, vote or peer-review")
+        evomas = mode in ("vote", "peer-review")
+        # a named dataset: the tasks must be exactly its tasks, and the run records it
+        dataset = None
+        if body.get("dataset") is not None:
+            if datasets is None:
+                raise ValueError("datasets are not available in this viewer")
+            dataset = datasets.load_dataset(str(body["dataset"]))
+            if dataset["benchmark"] != key or tasks != list(dict.fromkeys(dataset["tasks"])):
+                raise ValueError(f"the tasks are not those of dataset {dataset['name']!r}")
         scripted = body.get("scripted") is True
         models = {
             "authority_model": body.get("authority_model"),
@@ -750,7 +842,7 @@ class Store:
             mode != "single" and models["worker_model"] is None
         ):
             raise ValueError(
-                "authority_model is required, and worker_model in forum and vote mode"
+                "authority_model is required, and worker_model in forum, vote and peer-review mode"
             )
         for name in ("authority_thinking", "worker_thinking"):
             if body.get(name, "high") not in THINKING:
@@ -758,9 +850,9 @@ class Store:
         lo, hi = whole("min_workers", 0, 8, 3), whole("max_workers", 1, 8, 6)
         if lo > hi:
             raise ValueError(f"min_workers ({lo}) is more than max_workers ({hi})")
-        workers = whole("workers", 1, 20, 5)
+        workers = whole("workers", 1, 20, 6 if mode == "peer-review" else 5)
         live, conc, retries = (
-            whole("max_live_workers", 1, 20 if mode == "vote" else 8, 4),
+            whole("max_live_workers", 1, 20 if evomas else 8, 4),
             whole("concurrency", 1, 12, 2),
             whole("retries", 0, 3, 0),
         )
@@ -788,7 +880,8 @@ class Store:
                     )
         root = self.roots[0]
         stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-        job = f"{re.sub(r'[^a-z0-9]+', '-', name.lower()).strip('-')[:40] or f'{key}-{mode}'}-{stamp}"
+        default = f"{key}-{mode}" + (f"-{dataset['slug']}" if dataset else "")
+        job = f"{re.sub(r'[^a-z0-9]+', '-', name.lower()).strip('-')[:40] or default}-{stamp}"
         with self.lock:
             if (root / job).exists() or job in self.starting:
                 raise RuntimeError(
@@ -799,7 +892,7 @@ class Store:
             tsv.write_text("task\n" + "\n".join(tasks) + "\n")
             env = {
                 "BENCHMARK": key,
-                "TASKS": str(tsv),
+                **({"DATASET": dataset["slug"]} if dataset else {"TASKS": str(tsv)}),
                 "MODE": mode,
                 "JOB_NAME": job,
                 "JOBS_DIR": str(root),
@@ -819,7 +912,7 @@ class Store:
                         "MAX_LIVE_WORKERS": str(live),
                     }
                 )
-            if mode == "vote":
+            if evomas:
                 env.update(
                     {
                         "WORKER_MODEL": models["worker_model"],
@@ -844,7 +937,8 @@ class Store:
                 "name": name or None,
                 "authority_model": models["authority_model"],
                 "worker_model": models["worker_model"],
-                "workers": workers if mode == "vote" else None,
+                "workers": workers if evomas else None,
+                "dataset": {"ref": datasets.ref_of(dataset), "slug": dataset["slug"], "name": dataset["name"]} if dataset else None,
                 "scripted": scripted,
                 "at": datetime.now(UTC).isoformat(),
             }
@@ -899,6 +993,7 @@ class Store:
                     "authority_model": s["authority_model"],
                     "worker_model": s["worker_model"],
                     "workers": s.get("workers"),
+                    "dataset": s.get("dataset"),
                     "faux": s["scripted"],
                     "started_at": s["at"],
                     "finished_at": None,
@@ -1296,7 +1391,8 @@ class Store:
                         or (trials[0]["rulebook"] if trials else None),
                         "authority_model": agent.get("model_name"),
                         "worker_model": kw.get("worker_model"),
-                        "workers": kw.get("workers") if _mode_of(import_path) == "vote" else None,
+                        "workers": kw.get("workers") if _mode_of(import_path) in ("vote", "peer-review") else None,
+                        "dataset": _dataset_of(kw.get("dataset")),
                         "faux": bool(kw.get("faux")),
                         "started_at": _local_iso(res.get("started_at"))
                         or min(
@@ -1505,7 +1601,7 @@ def make_handler(store: Store, extra_hosts: tuple[str, ...] = ()):
             if not self._host_ok():
                 return self._send(421, b'{"error":"unknown host"}', "application/json")
             u = urlparse(self.path)
-            if u.path not in ("/api/runs/rename", "/api/runs/retry", "/api/runs/start"):
+            if u.path not in ("/api/runs/rename", "/api/runs/retry", "/api/runs/start", "/api/datasets", "/api/setups"):
                 return self._send(404, b'{"error":"not found"}', "application/json")
             # Only the page itself may write: a custom header forces a CORS preflight that a foreign page cannot pass.
             if self.headers.get("X-Decorum-Viewer") != "1" or not (
@@ -1527,6 +1623,10 @@ def make_handler(store: Store, extra_hosts: tuple[str, ...] = ()):
                     raise TypeError("the body must be a JSON object")
                 if u.path == "/api/runs/start":
                     return self._json(store.start(body))
+                if u.path == "/api/datasets":
+                    return self._json(store.save_dataset(body))
+                if u.path == "/api/setups":
+                    return self._json(store.save_setup(body))
                 if u.path == "/api/runs/retry":
                     return self._json(
                         store.retry(str(body.get("job", "")), body.get("tasks"))
@@ -1557,6 +1657,11 @@ def make_handler(store: Store, extra_hosts: tuple[str, ...] = ()):
                 return self._json(
                     {"now": datetime.now(UTC).isoformat(), "runs": store.runs()}
                 )
+            if u.path == "/api/datasets/compare":
+                try:
+                    return self._json(store.compare(q.get("dataset", "")))
+                except (KeyError, ValueError) as e:
+                    return self._send(404, json.dumps({"error": str(e)}).encode(), "application/json")
             if u.path == "/api/insights":
                 jobs = [j for j in q.get("jobs", "").split(",") if j] or None
                 return self._json(store.insights(jobs))

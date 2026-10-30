@@ -1,0 +1,21 @@
+{
+  "name": "K2.7 peer review",
+  "description": "EvoMAS peer review, 6 per stage with all 6 creators at once, everything on Kimi K2.7 Code at high thinking.",
+  "created_at": "2026-10-30T04:27:46+00:00",
+  "team": {
+    "mode": "peer-review",
+    "authority": "moonshotai/kimi-k2.7-code",
+    "worker": "moonshotai/kimi-k2.7-code",
+    "athink": "high",
+    "wthink": "high",
+    "min": 3,
+    "max": 6,
+    "live": 6,
+    "n": 6
+  },
+  "run": {
+    "concurrency": 3,
+    "retries": 0,
+    "budget": 10
+  }
+}
