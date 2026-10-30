@@ -1,12 +1,21 @@
-// Majority vote, as EvoMAS runs it on SWE-bench (amazon-science/EvoMAS, mas_pools/swebench/majority_vote.yaml):
-// N workers each solve the task on their own, every worker's patch is put in front of one aggregator, and the
-// aggregator's answer, cleaned to a diff, is the trial's patch. EvoMAS calls it a vote, but nothing counts or
-// compares patches: the aggregator reads them all and writes the final one, copying one or combining several as
-// it sees fit. This file holds the parts that must match EvoMAS word for word: the aggregator's prompt
-// (src/utils/mas_runner.py, the task query for a smolagents-backend MAS, plus the context block from
-// src/agents/runners/smolagents.py), a worker's report when it produced nothing (src/mas/runtime.py), and the
-// cleaning of the aggregator's answer (src/utils/output_cleaner.py, clean_swe_bench_output). Applying the cleaned
-// patch follows the SWE-bench harness, which is what graded EvoMAS's predictions.
+// EvoMAS's multi-agent systems on SWE-bench (amazon-science/EvoMAS, mas_pools/swebench/), as its code runs them.
+// EvoMAS runs every system through one DAG executor (src/mas/runtime.py, _execute_dag): the agents run layer by
+// layer, and each one is handed the task plus every report made before it. On SWE-bench its coding agents
+// (SWE-agent) change the checkout and report their patch; every other agent (a smolagents CodeAgent that may read the
+// repository but not change it) gets the same task query, with every earlier report under "Context from other
+// agents", and answers with a patch. The last agent, the aggregator, has the final say: its answer, cleaned to a
+// diff, is the trial's patch. Two of its systems are here:
+//
+//   vote (majority_vote.yaml):        worker1..N (coding)  -> aggregator
+//   peer-review (peer_review.yaml):   creator1..N (coding) -> reviewer1..N -> reviser1..N -> aggregator
+//
+// Nothing counts votes, and nothing asks a reviewer to review: EvoMAS's review and revise prompt templates and its
+// own peer-review routine are never called on this path (its runners ignore an agent's `prompt`), so its reviewers,
+// revisers and aggregator differ only by what they have seen. This file holds the parts that must match EvoMAS word
+// for word: the task query (src/utils/mas_runner.py, for a smolagents-backend MAS) and the context block
+// (src/agents/runners/smolagents.py), a failed agent's report (src/mas/runtime.py), and the cleaning of the final
+// answer (src/utils/output_cleaner.py, clean_swe_bench_output). Applying the cleaned patch follows the SWE-bench
+// harness, which is what graded EvoMAS's predictions.
 
 import { execFileSync } from "node:child_process";
 import { rmSync } from "node:fs";
@@ -15,21 +24,49 @@ import { git } from "./workspace.ts";
 
 export const AGGREGATOR = "aggregator";
 
-/** EvoMAS names its workers worker1..workerN; the aggregator reads those names in its prompt. */
-export function voteWorkerName(i: number): string {
-	return `worker${i}`;
+export type Topology = "vote" | "peer-review";
+
+/** One layer of agents: coding agents change their own copy of the checkout; readers read and answer. */
+export interface LayerSpec {
+	/** The agents' role and name prefix: worker -> worker1..workerN, as EvoMAS names them. */
+	role: string;
+	kind: "coder" | "reader";
+	count: number;
 }
 
-/** What one worker hands the aggregator: its patch, or EvoMAS's error line when it produced none. */
-export interface WorkerReport {
-	worker: string;
+/** The layers before the aggregator, each of N agents. */
+export function topologyLayers(topology: Topology, n: number): LayerSpec[] {
+	if (topology === "vote") return [{ role: "worker", kind: "coder", count: n }];
+	return [
+		{ role: "creator", kind: "coder", count: n },
+		{ role: "reviewer", kind: "reader", count: n },
+		{ role: "reviser", kind: "reader", count: n },
+	];
+}
+
+/** The default number of agents per layer: 5 for a vote (EvoMAS's pool has 6), 6 for peer review (as EvoMAS). */
+export const DEFAULT_AGENTS: Record<Topology, number> = { vote: 5, "peer-review": 6 };
+
+/**
+ * The default share of the trial's dollars and wall clock kept for the read-only layers after the coding agents: the
+ * aggregator alone in a vote, three layers in peer review.
+ */
+export const DEFAULT_RESERVE: Record<Topology, number> = { vote: 0.15, "peer-review": 0.45 };
+
+/** What one agent hands the agents after it: a coding agent's patch, a reader's answer, or EvoMAS's error line. */
+export interface AgentReport {
+	agent: string;
 	ok: boolean;
-	/** The text the aggregator reads for this worker. */
+	/** The text the agents after it read for this agent. */
 	report: string;
+	/** A coding agent's patch, or a reader's answer cleaned to a diff, in bytes. */
 	patch_bytes: number;
 	files: string[];
 	error: string | null;
 }
+
+/** smolagents' words for an agent that answered nothing (SmolagentsRunner.run). */
+export const EMPTY_ANSWER = "Agent returned empty response - execution may have failed";
 
 const escape = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
@@ -46,7 +83,7 @@ export function repoPathPattern(repo: string, linked: string[] = []): RegExp {
 }
 
 /**
- * A vote worker's instruction: the task's, with the shared checkout's path replaced by the worker's own copy. A
+ * A coding agent's instruction: the task's, with the shared checkout's path replaced by the agent's own copy. A
  * benchmark's instruction names the checkout ("A code repository is available in the /app directory"); a worker
  * that took it at its word would change the shared checkout, where the other workers and the grader are.
  */
@@ -54,9 +91,9 @@ export function workerInstruction(instruction: string, repo: string, dir: string
 	return instruction.replace(repoPathPattern(repo), dir);
 }
 
-/** EvoMAS's runtime turns a worker with no output into this report (MasRuntime._execute_agent). */
-export function failedReport(worker: string, error: string): string {
-	return `Error: Agent ${worker} execution failed: ${error}`;
+/** EvoMAS's runtime turns an agent with no output into this report (MasRuntime._execute_agent). */
+export function failedReport(agent: string, error: string): string {
+	return `Error: Agent ${agent} execution failed: ${error}`;
 }
 
 /** The task query EvoMAS gives a smolagents-backend MAS on SWE-bench, verbatim (MasRunner.run_single_task). */
@@ -85,12 +122,12 @@ diff --git a/path/to/file.py b/path/to/file.py
 Do NOT include any explanations, markdown formatting, or other text. ONLY output the raw diff patch.`;
 }
 
-/** The aggregator's whole input: the task query, then every worker's report (SmolagentsRunner.run). */
-export function aggregatorPrompt(repo: string, instanceId: string, instruction: string, reports: Array<{ worker: string; report: string }>): string {
+/** A reader's whole input: the task query, then every report made before it, in order (SmolagentsRunner.run). */
+export function readerPrompt(repo: string, instanceId: string, instruction: string, reports: Array<{ agent: string; report: string }>): string {
 	let prompt = taskQuery(repo, instanceId, instruction);
 	if (reports.length) {
 		prompt += "\n\nContext from other agents:\n";
-		for (const r of reports) prompt += `\n--- ${r.worker} ---\n${r.report}\n`;
+		for (const r of reports) prompt += `\n--- ${r.agent} ---\n${r.report}\n`;
 	}
 	return prompt;
 }

@@ -48,10 +48,11 @@ function agentOf(ctx: Context): string {
 	const w = /worker "([a-z0-9-]+)"/.exec(sys);
 	if (w) return w[1]!;
 	if (sys.includes('You are "authority"')) return "authority";
-	// vote mode: a worker works in worktrees/workerN; the aggregator's prompt holds the workers' reports
-	const v = /worktrees\/(worker\d+)/.exec(sys);
+	// EvoMAS's systems: a coding agent works in worktrees/<name>. Readers all get EvoMAS's one prompt, so they are
+	// told apart only by the reports they hold: "reader" policies see them in the prompt.
+	const v = /worktrees\/([a-z]+\d+)/.exec(sys);
 	if (v) return v[1]!;
-	if (seenOf({ ...ctx, messages: ctx.messages.slice(0, 1) }).includes("Context from other agents:")) return "aggregator";
+	if (seenOf({ ...ctx, messages: ctx.messages.slice(0, 1) }).includes("Context from other agents:")) return "reader";
 	return "single";
 }
 

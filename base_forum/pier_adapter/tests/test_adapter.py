@@ -16,13 +16,13 @@ from pathlib import Path
 import pytest
 from pier.models.trajectories import Trajectory
 
-from decorum_pier.agent import RUNTIME_DIR, DecorumForum, DecorumSingle, DecorumVote
+from decorum_pier.agent import RUNTIME_DIR, DecorumForum, DecorumPeerReview, DecorumSingle, DecorumVote, _evomas_metadata
 from decorum_pier.atif import build_trajectory
 
 
 def make(tmp_path: Path, cls=DecorumForum, **kw):
     kw.setdefault("model_name", "moonshotai/kimi-k3")
-    if cls in (DecorumForum, DecorumVote):
+    if cls in (DecorumForum, DecorumVote, DecorumPeerReview):
         kw.setdefault("worker_model", "moonshotai/kimi-k2.7-code")
     return cls(logs_dir=tmp_path, **kw)
 
@@ -141,13 +141,14 @@ def test_vote_runs_n_workers_and_an_aggregator_with_the_tasks_id(tmp_path):
     assert DecorumVote.name() == "decorum-vote"
     assert "--mode vote" in cmd
     assert "--authority-model moonshotai/kimi-k2.7-code --worker-model moonshotai/kimi-k2.7-code" in cmd
-    assert "--workers 6 --instance-id instance_x__y-abcdef0123" in cmd
+    assert "--instance-id instance_x__y-abcdef0123 --workers 6" in cmd
     assert "--aggregator-reserve" not in cmd
     assert "--aggregator-reserve 0.25" in make(trial / "agent", cls=DecorumVote, aggregator_reserve="0.25")._command()
     # without a config.json, the trial folder's name less Pier's suffix
     bare = tmp_path / "instance_x__y-abc__Q2" / "agent"
     bare.mkdir(parents=True)
-    assert make(bare, cls=DecorumVote, workers=5)._command().endswith("--workers 5 --instance-id instance_x__y-abc")
+    assert make(bare, cls=DecorumVote, workers=5)._command().endswith("--instance-id instance_x__y-abc --workers 5")
+    assert "--workers" not in make(bare, cls=DecorumVote)._command(), "without workers= the runtime's default (5) applies"
     assert "--workers" not in make(tmp_path)._command(), "the forum takes no worker count"
     for bad in ("0", "21", "2.5", "many"):
         with pytest.raises(ValueError, match="workers must be a whole number from 1 to 20"):
@@ -158,15 +159,48 @@ def test_vote_runs_n_workers_and_an_aggregator_with_the_tasks_id(tmp_path):
         DecorumVote(logs_dir=tmp_path, model_name="moonshotai/kimi-k2.7-code")
 
 
+def test_peer_review_runs_creators_reviewers_revisers_and_an_aggregator(tmp_path):
+    pr = make(tmp_path, cls=DecorumPeerReview, model_name="moonshotai/kimi-k2.7-code", workers="4", aggregator_reserve="0.5", dataset="hard-51@1a2b3c4d5e6f")
+    cmd = pr._command()
+    assert DecorumPeerReview.name() == "decorum-peer-review"
+    assert "--mode peer-review" in cmd and "--workers 4" in cmd and "--aggregator-reserve 0.5" in cmd
+    assert "--worker-model moonshotai/kimi-k2.7-code" in cmd
+    assert "dataset" not in cmd, "the dataset is recorded in the job's config, not given to the runtime"
+    assert pr.dataset == "hard-51@1a2b3c4d5e6f"
+    with pytest.raises(ValueError, match="worker_model"):
+        DecorumPeerReview(logs_dir=tmp_path, model_name="moonshotai/kimi-k2.7-code")
+
+
+def test_the_trials_metadata_says_what_became_of_a_vote_or_a_peer_review():
+    rep = lambda name, ok: {"agent": name, "ok": ok}
+    peer = {
+        "evomas": {
+            "topology": "peer-review",
+            "agents_per_layer": 2,
+            "layers": [
+                {"role": "creator", "kind": "coder", "reports": [rep("creator1", True), rep("creator2", False)]},
+                {"role": "reviewer", "kind": "reader", "reports": [rep("reviewer1", True), rep("reviewer2", True)]},
+                {"role": "reviser", "kind": "reader", "reports": [rep("reviser1", True), rep("reviser2", True)]},
+            ],
+            "aggregator": {"apply": {"applied": True}, "same_as": None},
+        }
+    }
+    assert _evomas_metadata(peer) == {"topology": "peer-review", "agents_per_layer": 2, "patches": 1, "reports": 6, "applied": True, "same_as": None}
+    # a vote run before peer review existed wrote "vote"
+    old = {"vote": {"workers": 3, "reports": [rep("worker1", True)] * 3, "aggregator": {"apply": {"applied": True}, "same_as": "worker1"}}}
+    assert _evomas_metadata(old) == {"topology": "vote", "agents_per_layer": 3, "patches": 3, "reports": 3, "applied": True, "same_as": "worker1"}
+    assert _evomas_metadata({}) is None
+
+
 def test_a_vote_trajectory_has_the_aggregator_at_its_root(tmp_path):
     usage = {"input": 10, "output": 5, "cacheRead": 0, "cacheWrite": 0, "costUsd": 0.01, "llmCalls": 1}
     agents = [{"name": f"worker{i}", "role": "worker", "model": "m/w", "usage": usage, "session_file": None} for i in (1, 2)]
-    summary = {"mode": "vote", "models": {"authority": "m/a"}, "end_reason": "vote_done", "cost_usd": 0.03, "vote": {"workers": 2}}
+    summary = {"mode": "vote", "models": {"authority": "m/a"}, "end_reason": "vote_done", "cost_usd": 0.03, "evomas": {"topology": "vote"}}
     t = build_trajectory({**summary, "agents": [*agents, {"name": "aggregator", "role": "aggregator", "model": "m/a", "usage": usage, "session_file": None}]}, tmp_path, agent_name="decorum-vote", version="test")
     Trajectory.model_validate(t.to_json_dict())
     assert t.agent.model_name == "m/a"
     assert [s.trajectory_id for s in t.subagent_trajectories or []] == ["worker1", "worker2"]
-    assert t.final_metrics.extra["vote"] == {"workers": 2}
+    assert t.final_metrics.extra["evomas"] == {"topology": "vote"}
     # stopped before the aggregator started: still a trajectory, rooted at an empty aggregator
     early = build_trajectory({**summary, "agents": agents}, tmp_path, agent_name="decorum-vote", version="test")
     assert early.agent.model_name == "m/a" and len(early.subagent_trajectories or []) == 2

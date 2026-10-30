@@ -2,7 +2,8 @@
 
 The authority is the root trajectory; each worker is an embedded subagent trajectory, referenced from the
 assign_workers call that started it. The forum itself (forum.jsonl) stays beside the trajectory as the
-trial's coordination trace. In a majority vote the aggregator is the root and the workers are its subagents.
+trial's coordination trace. In a vote or a peer review (EvoMAS's systems) the aggregator is the root and every other
+agent is its subagent.
 """
 
 from __future__ import annotations
@@ -173,7 +174,7 @@ def build_trajectory(summary: dict[str, Any], out_dir: Path, *, agent_name: str,
             ),
         )
 
-    lead = "aggregator" if summary.get("mode") == "vote" else "authority"
+    lead = "aggregator" if summary.get("mode") in ("vote", "peer-review") else "authority"
     authority = next((a for a in agents if a.get("role") == lead), None)
     if authority is None and lead == "aggregator":
         # the trial stopped before the aggregator started: the root is an empty aggregator
@@ -181,7 +182,7 @@ def build_trajectory(summary: dict[str, Any], out_dir: Path, *, agent_name: str,
     if authority is None:
         raise ValueError("summary.json names no authority agent")
     root = trajectory(authority, root=True)
-    subs = [trajectory(a, root=False) for a in agents if a.get("role") == "worker"]
+    subs = [trajectory(a, root=False) for a in agents if a.get("role") not in ("authority", "aggregator")]
     if subs:
         root.subagent_trajectories = subs
     tok = summary.get("tokens") or {}
@@ -199,7 +200,7 @@ def build_trajectory(summary: dict[str, Any], out_dir: Path, *, agent_name: str,
             "rulebook": (summary.get("rulebook") or {}).get("name"),
             "forum": summary.get("forum"),
             "auto_committed": summary.get("auto_committed"),
-            "vote": summary.get("vote"),
+            "evomas": summary.get("evomas") or summary.get("vote"),
         },
     )
     root.notes = f"decorum {summary.get('mode')} trial, rulebook {(summary.get('rulebook') or {}).get('name')}, ended: {summary.get('end_reason')}. Forum trace: agent/decorum/forum.jsonl."

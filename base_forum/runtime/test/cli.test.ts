@@ -86,9 +86,9 @@ test("--mode vote --faux smoke runs a whole majority vote from the command line"
 	assert.equal(s.mode, "vote");
 	assert.equal(s.end_reason, "vote_done");
 	assert.deepEqual(s.agents.map((a: { name: string }) => a.name), ["worker1", "worker2", "worker3", "aggregator"]);
-	assert.equal(s.vote.aggregator.same_as, "worker1");
+	assert.equal(s.evomas.aggregator.same_as, "worker1");
 	assert.equal(gitOut(repo, "status", "--porcelain"), "?? DECORUM_SMOKE_worker1.md", "worker1's file, applied and left uncommitted");
-	assert.match(readFileSync(join(out, "vote", "aggregator_prompt.md"), "utf8"), /^Repository: .+\nInstance ID: smoke__smoke-1\n/);
+	assert.match(readFileSync(join(out, "evomas", "aggregator_prompt.md"), "utf8"), /^Repository: .+\nInstance ID: smoke__smoke-1\n/);
 });
 
 test("vote mode checks its flags", () => {
@@ -104,5 +104,19 @@ test("vote mode checks its flags", () => {
 	assert.match(noWorker.err, /--worker-model is required in vote mode/);
 	const mode = cli([...base.slice(0, -1), "pairs", "--faux", "smoke"]);
 	assert.equal(mode.code, 2);
-	assert.match(mode.err, /--mode must be forum, single or vote/);
+	assert.match(mode.err, /--mode must be forum, single, vote or peer-review/);
+});
+
+test("--mode peer-review --faux smoke runs creators, reviewers, revisers and an aggregator from the command line", () => {
+	const repo = gitRepo();
+	const out = tempDir();
+	const r = cli(["run", "--instruction", "Write smoke files.", "--repo", repo, "--out", out, "--work-dir", tempDir(), "--faux", "smoke",
+		"--mode", "peer-review", "--workers", "2", "--commit-policy", "leave"]);
+	assert.equal(r.code, 0, r.err);
+	const s = JSON.parse(readFileSync(join(out, "summary.json"), "utf8"));
+	assert.equal(s.end_reason, "peer_review_done");
+	assert.deepEqual(s.agents.map((a: { name: string }) => a.name), ["creator1", "creator2", "reviewer1", "reviewer2", "reviser1", "reviser2", "aggregator"]);
+	assert.equal(s.evomas.reserve, 0.45, "peer review keeps 45% for its three read-only layers by default");
+	assert.equal(s.evomas.aggregator.same_as, "creator1");
+	assert.equal(gitOut(repo, "status", "--porcelain"), "?? DECORUM_SMOKE_creator1.md");
 });
