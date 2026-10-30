@@ -576,7 +576,7 @@ function renderHead() {
   fact(EVOMAS_MODES.includes(t.mode) ? "Aggregator" : "Authority", t.models?.authority || auth?.model);
   fact("Workers", t.models?.worker || worker?.model);
   if (!EVOMAS_MODES.includes(t.mode)) fact("Rulebook", t.rulebook);
-  if (t.evomas) fact("Final patch", t.evomas.applied ? (t.evomas.same_as ? `${t.evomas.same_as}'s, applied` : "the aggregator's own, applied") : "none applied");
+  if (t.evomas) fact("Final patch", t.evomas.recovered ? `the aggregator's, recovered after the run (${t.evomas.recovered}) and regraded` : t.evomas.applied ? (t.evomas.same_as ? `${t.evomas.same_as}'s, applied` : "the aggregator's own, applied") : "none applied");
   if (t.end_reason && !["authority_done", "vote_done", "peer_review_done"].includes(t.end_reason)) fact("Ended by", t.end_reason.replace("budget.", "budget: ").replaceAll("_", " "));
   const note = $("t-note");
   note.hidden = !t.replay;

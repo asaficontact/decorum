@@ -363,7 +363,7 @@ class TrialState:
             "mode": (summary or {}).get("mode"),
             "rulebook": ((summary or {}).get("rulebook") or {}).get("name"),
             "models": (summary or {}).get("models"),
-            "evomas": _evomas_brief(summary),
+            "evomas": _evomas_brief(summary, self.path if graded_by == "regrade" else None),
             "threads": sum(1 for e in self.events if e.get("kind") == "thread_opened"),
             "posts": sum(1 for e in self.events if e.get("kind") == "post"),
             "workers": len(workers),
@@ -453,8 +453,9 @@ def _dataset_of(ref: object) -> dict | None:
     return {"ref": ref, "slug": slug, "name": known["name"] if known else slug, "changed": bool(known) and known["hash"] != h}
 
 
-def _evomas_brief(summary: dict | None) -> dict | None:
-    """What became of a vote or a peer review: patches made, and whose report the applied patch is."""
+def _evomas_brief(summary: dict | None, regraded: Path | None = None) -> dict | None:
+    """What became of a vote or a peer review: patches made, whose report the applied patch is, and, when the
+    aggregator's patch was recovered after the run and graded by a regrade, how it was recovered."""
     s = summary or {}
     e = s.get("evomas")
     if e:
@@ -472,6 +473,7 @@ def _evomas_brief(summary: dict | None) -> dict | None:
         "patches": sum(1 for r in coders if r.get("ok")),
         "applied": bool((agg.get("apply") or {}).get("applied")),
         "same_as": agg.get("same_as"),
+        "recovered": (_read_json(regraded / "regrade" / "reward.json") or {}).get("recovery_method") if regraded else None,
     }
 
 

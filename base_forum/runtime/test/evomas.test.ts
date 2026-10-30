@@ -9,7 +9,9 @@ import { test } from "node:test";
 import type { Turn } from "./helpers.ts";
 import { fauxAssistantMessage, fauxText, fauxToolCall } from "@earendil-works/pi-ai";
 import { call, gitOut, gitRepo, runTrial, say } from "./helpers.ts";
-import { readerPrompt, cleanPatch, failedReport, repoPathPattern, taskQuery, workerInstruction } from "../src/evomas.ts";
+import { applyPatch, cleanPatch, failedReport, layerEnds, readerPrompt, recountPatch, repoPathPattern, taskQuery, topologyLayers, workerInstruction } from "../src/evomas.ts";
+import { writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 
 const DIFF = `diff --git a/x.py b/x.py
 index 1111111..2222222 100644
@@ -116,7 +118,7 @@ test("three independent workers, every patch in front of the aggregator, its ans
 	assert.deepEqual(v.layers[0]!.reports.map((r) => [r.agent, r.ok, r.files]), [["worker1", true, ["a.txt"]], ["worker2", true, ["b.txt"]], ["worker3", true, ["c.txt"]]]);
 	assert.equal(v.aggregator.same_as, "worker2");
 	assert.equal(v.aggregator.apply?.applied, true);
-	assert.equal(v.aggregator.apply?.method, "git apply --verbose");
+	assert.equal(v.aggregator.apply?.method, "git apply");
 	assert.equal(gitOut(repo, "status", "--porcelain"), "?? b.txt");
 	assert.equal(gitOut(repo, "rev-list", "--count", "HEAD"), "1", "nothing was committed on the task's branch");
 	for (const f of ["worker1.patch", "worker2.patch", "worker3.patch", "aggregator_prompt.md", "aggregator_answer.md", "final.patch"]) assert.ok(existsSync(join(outDir, "evomas", f)), f);
@@ -158,13 +160,121 @@ test("the aggregator may combine patches into one no worker wrote; commit mode c
 	assert.equal(gitOut(repo, "status", "--porcelain"), "");
 });
 
-test("an answer whose patch does not apply leaves the checkout clean", async () => {
+test("an answer whose patch does not apply, twice, leaves the checkout clean", async () => {
 	const bad = "diff --git a/missing.py b/missing.py\n--- a/missing.py\n+++ b/missing.py\n@@ -1 +1 @@\n-x\n+y\n";
 	const { summary, repo } = await runTrial({ worker1: writer("a.txt"), reader: () => say(bad) }, { mode: "vote", extra: { agentsPerLayer: 1 } });
 	assert.equal(summary.end_reason, "vote_no_patch");
 	assert.equal(summary.evomas!.aggregator.apply?.applied, false);
+	assert.equal(summary.evomas!.aggregator.retry?.first.apply?.applied, false, "the aggregator was asked once more");
 	assert.equal(gitOut(repo, "status", "--porcelain"), "");
 });
+
+// From a real K2.7 aggregator: every line of the change is right, but the second hunk's header says 7 old lines
+// where it holds 6, and git rejects the whole patch as corrupt.
+const SOURCE = "a\nb\nc\nd\ne\nf\ng\nh\ni\nj\nk\nl\n";
+const MISCOUNTED = `diff --git a/s.txt b/s.txt
+--- a/s.txt
++++ b/s.txt
+@@ -1,3 +1,3 @@
+-a
++A
+ b
+ c
+@@ -7,7 +7,8 @@
+ g
+ h
+ i
++new
+ j
+ k
+ l
+`;
+
+test("recountPatch takes each hunk header's counts from its lines; an empty line inside a hunk is blank context", () => {
+	assert.match(recountPatch(MISCOUNTED), /^@@ -7,6 \+7,7 @@$/m);
+	assert.match(recountPatch(MISCOUNTED), /^@@ -1,3 \+1,3 @@$/m);
+	const blank = "diff --git a/s b/s\n--- a/s\n+++ b/s\n@@ -1,9 +1,9 @@\n x\n\n-y\n+Y\n\n";
+	assert.equal(recountPatch(blank), "diff --git a/s b/s\n--- a/s\n+++ b/s\n@@ -1,3 +1,3 @@\n x\n \n-y\n+Y\n\n", "the trailing empty line separates; it is not context");
+});
+
+const patchIn = (repo: string, text: string) => {
+	const f = join(tmpdir(), `p-${Date.now()}-${Math.random()}.patch`);
+	writeFileSync(f, text);
+	return applyPatch(repo, f);
+};
+
+test("a hand-written patch with miscounted hunks applies, with the counts retaken", () => {
+	const repo = gitRepo({ "s.txt": SOURCE });
+	const r = patchIn(repo, MISCOUNTED);
+	assert.equal(r.applied, true, r.output);
+	assert.equal(r.method, "git apply --recount");
+	assert.equal(readFileSync(join(repo, "s.txt"), "utf8"), "A\nb\nc\nd\ne\nf\ng\nh\ni\nnew\nj\nk\nl\n");
+});
+
+test("a hunk with no context lines applies where its header says", () => {
+	const repo = gitRepo({ "s.txt": SOURCE });
+	const r = patchIn(repo, "diff --git a/s.txt b/s.txt\n--- a/s.txt\n+++ b/s.txt\n@@ -5,1 +5,1 @@\n-e\n+E\n");
+	assert.equal(r.applied, true, r.output);
+	assert.equal(r.method, "git apply --recount --unidiff-zero");
+	assert.equal(readFileSync(join(repo, "s.txt"), "utf8"), SOURCE.replace("e\n", "E\n"));
+});
+
+test("a patch whose context is not in the file does not apply, and leaves no trace", () => {
+	const repo = gitRepo({ "s.txt": SOURCE });
+	const r = patchIn(repo, "diff --git a/s.txt b/s.txt\n--- a/s.txt\n+++ b/s.txt\n@@ -3,3 +3,3 @@\n zzz\n-yyy\n+YYY\n www\n");
+	assert.equal(r.applied, false);
+	assert.match(r.output, /git apply --recount: /);
+	assert.equal(gitOut(repo, "status", "--porcelain"), "");
+});
+
+test("an aggregator whose patch does not apply is asked once more, with git's error, and its corrected patch applies", async () => {
+	const repo = gitRepo({ "x.py": "a = 1\nb = 1\n" });
+	const wrong = "diff --git a/x.py b/x.py\n--- a/x.py\n+++ b/x.py\n@@ -1,2 +1,2 @@\n-a = 0\n+a = 2\n b = 1\n";
+	const right = "diff --git a/x.py b/x.py\n--- a/x.py\n+++ b/x.py\n@@ -1,2 +1,2 @@\n-a = 1\n+a = 2\n b = 1\n";
+	let retryText = "";
+	const { summary, outDir } = await runTrial(
+		{
+			worker1: writer("x.py", "a = 2\nb = 1\n"),
+			reader: (t) => {
+				const last = t.ctx.messages.at(-1)!;
+				const text = typeof last.content === "string" ? last.content : last.content.map((x) => ("text" in x ? x.text : "")).join("");
+				if (!text.startsWith("Your patch could not be applied")) return say(wrong);
+				retryText = text;
+				return say(right);
+			},
+		},
+		{ mode: "vote", repo, extra: { agentsPerLayer: 1 } },
+	);
+	assert.equal(summary.end_reason, "vote_done");
+	assert.match(retryText, /Your patch could not be applied to the repository at .+\. Applying it reported:\n\ngit apply: .*patch does not apply/s);
+	assert.match(retryText, /ONLY output the raw diff patch\.$/);
+	const agg = summary.evomas!.aggregator;
+	assert.equal(agg.retry?.first.apply?.applied, false);
+	assert.equal(agg.apply?.applied, true);
+	assert.equal(readFileSync(join(repo, "x.py"), "utf8"), "a = 2\nb = 1\n");
+	for (const f of ["aggregator_retry_prompt.md", "aggregator_retry_answer.md"]) assert.ok(existsSync(join(outDir, "evomas", f)), f);
+});
+
+test("an aggregator that answered with a patch that applies is not asked again", async () => {
+	const { summary } = await runTrial({ worker1: writer("a.txt"), reader: (t) => say(reportOf(promptOf(t), "worker1")) }, { mode: "vote", extra: { agentsPerLayer: 1 } });
+	assert.equal(summary.end_reason, "vote_done");
+	assert.equal(summary.evomas!.aggregator.retry, null);
+});
+
+test("the aggregator keeps at least AGGREGATOR_MIN_SEC of the clock; the layers before it end proportionally sooner", () => {
+	const near = (a: number[], b: number[]) => assert.deepEqual(a.map((x) => Math.round(x * 1e4) / 1e4), b);
+	// no wall clock: the reserve as configured
+	near(layerEnds(topologyLayers("vote", 4), 0.15, null), [0.85, 1]);
+	near(layerEnds(topologyLayers("peer-review", 4), 0.45, null), [0.55, 0.7, 0.85, 1]);
+	// 2880 s: 0.15 would leave the aggregator 432 s; it gets 900 s, ending the workers at 1980 s
+	near(layerEnds(topologyLayers("vote", 4), 0.15, 2880), [0.6875, 1]);
+	near(layerEnds(topologyLayers("peer-review", 4), 0.45, 2880), [0.4449, 0.5662, 0.6875, 1]);
+	// a short clock: at most 40% for the aggregator
+	near(layerEnds(topologyLayers("vote", 4), 0.15, 1000), [0.6, 1]);
+	// a reserve already larger than the floor is kept
+	near(layerEnds(topologyLayers("vote", 4), 0.5, 2880), [0.5, 1]);
+});
+
 
 test("at most max_live_workers workers work at once", async () => {
 	let live = 0;
