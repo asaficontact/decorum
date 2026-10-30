@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 import type { Turn } from "./helpers.ts";
 import { call, gitOut, gitRepo, runTrial, say } from "./helpers.ts";
-import { aggregatorPrompt, cleanPatch, failedReport, taskQuery } from "../src/vote.ts";
+import { aggregatorPrompt, cleanPatch, failedReport, repoPathPattern, taskQuery, workerInstruction } from "../src/vote.ts";
 
 const DIFF = `diff --git a/x.py b/x.py
 index 1111111..2222222 100644
@@ -203,4 +203,38 @@ test("workers that spend their share of the budget are stopped, and the aggregat
 	assert.match(summary.vote!.workers_stopped ?? "", /their share of the \$0.1 budget/);
 	assert.equal(summary.vote!.reports.filter((r) => r.ok).length, 2, "each stopped worker's work so far is its patch");
 	assert.equal(summary.end_reason, "vote_done");
+});
+
+test("a worker's instruction names its own copy where the task's names the shared checkout", () => {
+	const task = "A code repository is available in the `/app` directory. Run `cd /app && pytest`; see /app/lib/x.py. Not /application.";
+	assert.equal(
+		workerInstruction(task, "/app", "/tmp/w/worker1"),
+		"A code repository is available in the `/tmp/w/worker1` directory. Run `cd /tmp/w/worker1 && pytest`; see /tmp/w/worker1/lib/x.py. Not /application.",
+	);
+	const shared = (text: string) => repoPathPattern("/app", ["node_modules"]).test(text);
+	assert.ok(shared('{"command":"cd /app && git status"}') && shared('{"path":"/app/lib/x.py"}') && shared('{"path":"/app"}'));
+	assert.ok(!shared('{"path":"/app/node_modules/x/index.js"}'), "a linked dependency is read through the checkout");
+	assert.ok(!shared('{"path":"/application/x"}') && !shared('{"path":"/tmp/w/worker1/app/x"}') && !shared('{"command":"ls ./app"}'));
+	assert.ok(shared("It is in /app.") && !shared("see /app.d/conf"), "a dot that ends a sentence is not part of the name");
+});
+
+test("a vote worker that reaches for the shared checkout is refused and pointed at its own copy", async () => {
+	const repo = gitRepo();
+	let own = "";
+	const { summary } = await runTrial(
+		{
+			worker1: ({ step, seen }) => {
+				own = /available in (\S+)\./.exec(seen)?.[1] ?? "";
+				if (step === 0) return call("write", { path: `${repo}/shared.txt`, content: "x\n" });
+				if (step === 1) return call("write", { path: `${own}/own.txt`, content: "x\n" });
+				return say("done");
+			},
+			aggregator: () => say("none"),
+		},
+		{ mode: "vote", repo, extra: { voteWorkers: 1, instruction: `The repository is available in ${repo}.` } },
+	);
+	assert.match(own, /worktrees\/worker1$/, "the instruction names the worker's own copy");
+	assert.ok(!existsSync(join(repo, "shared.txt")), "the shared checkout was not touched");
+	assert.deepEqual(summary.refusals.map((r) => [r.agent, r.tool, r.rule]), [["worker1", "write", "vote.own_copy"]]);
+	assert.deepEqual(summary.vote!.reports[0]!.files, ["own.txt"]);
 });

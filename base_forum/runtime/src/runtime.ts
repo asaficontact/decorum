@@ -18,7 +18,7 @@ import type { Rulebook } from "./rulebook.ts";
 import type { ForumHost, WorkerSpec } from "./tools.ts";
 import { authorityTools, workerTools } from "./tools.ts";
 import type { ApplyResult, WorkerReport } from "./vote.ts";
-import { AGGREGATOR, aggregatorPrompt, applyPatch, cleanPatch, failedReport, voteWorkerName, worktreePatch } from "./vote.ts";
+import { AGGREGATOR, aggregatorPrompt, applyPatch, cleanPatch, failedReport, repoPathPattern, voteWorkerName, workerInstruction, worktreePatch } from "./vote.ts";
 import { commitAll, createIsolatedWorkspace, headSha, mergeBranch, prepareGit, removeStaleIndexLock, resetToBase } from "./workspace.ts";
 
 export const VERSION = "0.1.0";
@@ -302,7 +302,8 @@ export class ForumRuntime implements ForumHost {
 
 	/**
 	 * EvoMAS's majority vote. worker1..workerN each get the instruction alone, as the single agent does, each in its
-	 * own worktree branched from the base. (EvoMAS ran its workers one after another in one checkout and showed each
+	 * own worktree branched from the base (the instruction names that worktree where it names the checkout, and a
+	 * worker's tool call that touches the shared checkout is refused). (EvoMAS ran its workers one after another in one checkout and showed each
 	 * the patches of the workers before it; that leak is not copied, so here they are independent.) Each worker's
 	 * patch, or EvoMAS's error line when it made none, goes to the aggregator, which may read the checkout but not
 	 * change it, and answers with the final patch. The answer is cleaned to a diff and applied to the checkout, which
@@ -400,7 +401,8 @@ export class ForumRuntime implements ForumHost {
 			return { worker: name, ok: false, report: failedReport(name, error), patch_bytes: 0, files: [], error };
 		}
 		const ws = createIsolatedWorkspace(this.o.repo, join(this.o.workDir, "worktrees"), name);
-		this.forum.assign(threadId, name, "", this.o.instruction);
+		const instruction = workerInstruction(this.o.instruction, this.o.repo, ws.dir);
+		this.forum.assign(threadId, name, "", instruction);
 		this.totalWorkers++;
 		const w = await this.createAgent({
 			name,
@@ -411,9 +413,10 @@ export class ForumRuntime implements ForumHost {
 			thinking: this.o.workerThinking,
 			appendPrompt: "",
 			customTools: () => [],
+			linked: ws.linked,
 		});
 		this.log(`${name} started in ${ws.dir}`);
-		w.loop = this.runPrompt(w, this.o.instruction);
+		w.loop = this.runPrompt(w, instruction);
 		await w.loop;
 		w.loop = null;
 		w.finished = true;
@@ -732,6 +735,8 @@ export class ForumRuntime implements ForumHost {
 		customTools: (name: string) => ToolDefinition[];
 		/** pi's built-in tools for this agent; default all of read, bash, edit, write, grep, find, ls. */
 		tools?: string[];
+		/** A worktree's entries linked from the checkout (node_modules, .venv): paths into them are not the shared checkout. */
+		linked?: string[];
 	}): Promise<AgentHandle> {
 		const agentDir = join(this.o.workDir, "pi-agent");
 		const runtime = this;
@@ -753,8 +758,14 @@ export class ForumRuntime implements ForumHost {
 								runtime.stop(d.rule, d.reason, spec.name, event.toolName);
 								return { block: true, reason: d.reason, terminate: true };
 							}
-							if (spec.role === "worker" && runtime.o.mode === "vote" && runtime.checkWorkerShare()) {
-								return { block: true, reason: `Stopped: ${runtime.workersStopped}`, terminate: true };
+							if (spec.role === "worker" && runtime.o.mode === "vote") {
+								if (runtime.checkWorkerShare()) return { block: true, reason: `Stopped: ${runtime.workersStopped}`, terminate: true };
+								// a vote worker works only in its own copy: the shared checkout is where the other workers and the grader are
+								if (repoPathPattern(runtime.o.repo, spec.linked).test(JSON.stringify(event.input ?? {}))) {
+									const reason = `${runtime.o.repo} is the shared checkout, which workers may not use. Your own copy of the repository is ${spec.cwd}: read, change and test the code there.`;
+									runtime.forum.refusal(spec.name, event.toolName, "vote.own_copy", reason);
+									return { block: true, reason };
+								}
 							}
 							// the manager rule binds the authority only, and only when there is a forum to manage
 							if (spec.role === "authority" && runtime.o.mode === "forum") {

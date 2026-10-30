@@ -31,6 +31,29 @@ export interface WorkerReport {
 	error: string | null;
 }
 
+const escape = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+/**
+ * The shared checkout's path where it appears as a path (/app, /app/lib, "cd /app"), not inside another name
+ * (/application). Paths into the entries linked into a worktree (node_modules, .venv) are left out: a worker reads its
+ * installed dependencies through them.
+ */
+export function repoPathPattern(repo: string, linked: string[] = []): RegExp {
+	// a name goes on with a letter, digit, - or a dot followed by one ("/app.d"); a dot that ends a sentence does not
+	const end = "(?![\\w-]|\\.[\\w-])";
+	const keep = linked.length ? `(?!/(?:${linked.map(escape).join("|")})${end})` : "";
+	return new RegExp(`(?<![\\w./-])${escape(repo)}${keep}${end}`, "g");
+}
+
+/**
+ * A vote worker's instruction: the task's, with the shared checkout's path replaced by the worker's own copy. A
+ * benchmark's instruction names the checkout ("A code repository is available in the /app directory"); a worker
+ * that took it at its word would change the shared checkout, where the other workers and the grader are.
+ */
+export function workerInstruction(instruction: string, repo: string, dir: string): string {
+	return instruction.replace(repoPathPattern(repo), dir);
+}
+
 /** EvoMAS's runtime turns a worker with no output into this report (MasRuntime._execute_agent). */
 export function failedReport(worker: string, error: string): string {
 	return `Error: Agent ${worker} execution failed: ${error}`;

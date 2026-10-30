@@ -63,7 +63,9 @@ organised:
 
 1. **Workers** `worker1`..`workerN` (`WORKERS`, default 5; EvoMAS's pool has 6) on `WORKER_MODEL` each get the
    instruction exactly as the single agent does, with pi's coding tools, each in its own git worktree branched from
-   the task's base. At most `MAX_LIVE_WORKERS` work at once. A worker's patch is everything it changed (committed or
+   the task's base. At most `MAX_LIVE_WORKERS` work at once. Where the instruction names the checkout ("A code
+   repository is available in the `/app` directory"), a worker's copy names its own worktree, and any worker tool
+   call that touches the shared checkout is refused with that reason (rule `vote.own_copy`), so workers stay apart. A worker's patch is everything it changed (committed or
    not, new files included) against the base. A worker that changed nothing is reported as EvoMAS reports it:
    `Error: Agent workerN execution failed: No output generated`.
 2. **The aggregator** (`AUTHORITY_MODEL` at `AUTHORITY_THINKING`) gets EvoMAS's prompt word for word: the task
