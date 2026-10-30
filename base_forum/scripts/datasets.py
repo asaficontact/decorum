@@ -74,7 +74,13 @@ def _write_new(path: Path, data: dict) -> None:
         with os.fdopen(fd, "w") as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
             f.write("\n")
-        os.link(tmp, path)  # fails if the name was taken meanwhile
+        try:
+            os.link(tmp, path)  # fails if the name was taken meanwhile
+        except FileExistsError:
+            raise
+        except OSError:  # a filesystem without hard links: create the file exclusively instead
+            with open(path, "x") as f:
+                f.write(open(tmp).read())
     except FileExistsError:
         raise DatasetError(f"{path.name} already exists; give it another name") from None
     finally:

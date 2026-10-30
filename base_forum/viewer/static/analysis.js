@@ -279,7 +279,15 @@ async function loadCompare() {
     }
     sel.value = IN.cmp;
     if (!IN.cmp) return;
-    IN.cmpData = await getJSON(`api/datasets/compare?dataset=${encodeURIComponent(IN.cmp)}`);
+    try {
+      IN.cmpData = await getJSON(`api/datasets/compare?dataset=${encodeURIComponent(IN.cmp)}`);
+    } catch (e) {
+      // a run can name a dataset this checkout does not have yet (a colleague's, not pulled)
+      IN.cmpData = null;
+      $("in-cmp").replaceChildren();
+      $("in-cmp-sum").textContent = `No dataset “${IN.cmp}” in this checkout: pull the repository to get it.`;
+      return;
+    }
     renderCompare();
   } catch (e) { /* keep what is shown */ }
 }

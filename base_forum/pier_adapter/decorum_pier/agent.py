@@ -423,7 +423,7 @@ def _context_metadata(summary: dict[str, Any]) -> dict[str, Any]:
         "rulebook": (summary.get("rulebook") or {}).get("name"),
         "end_reason": summary.get("end_reason"),
         "auto_committed": summary.get("auto_committed"),
-        "workers": sum(1 for a in summary.get("agents", []) if a.get("role") == "worker"),
+        "workers": sum(1 for a in summary.get("agents", []) if a.get("role") not in (None, "authority", "aggregator")),
         "forum": summary.get("forum"),
         "refusals": len(summary.get("refusals", [])),
         "evomas": _evomas_metadata(summary),

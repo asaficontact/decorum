@@ -7,6 +7,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { test } from "node:test";
 import type { Turn } from "./helpers.ts";
+import { fauxAssistantMessage, fauxText, fauxToolCall } from "@earendil-works/pi-ai";
 import { call, gitOut, gitRepo, runTrial, say } from "./helpers.ts";
 import { readerPrompt, cleanPatch, failedReport, repoPathPattern, taskQuery, workerInstruction } from "../src/evomas.ts";
 
@@ -302,7 +303,8 @@ test("peer review: a reader layer that spends its share is stopped, and the laye
 			creator1: writer("a.txt"),
 			reader: (t) => {
 				const seen = blocks(promptOf(t));
-				if (seen.length === 1) return call("ls", { path: "." }); // a reviewer that never answers
+				// a reviewer that writes half an answer and never finishes its turn
+				if (seen.length === 1) return fauxAssistantMessage([fauxText("diff --git a/half"), fauxToolCall("ls", { path: "." })], { stopReason: "toolUse" });
 				if (seen.length === 3) aggregatorPrompt = promptOf(t);
 				return say(reportOf(promptOf(t), "creator1"));
 			},
@@ -312,7 +314,8 @@ test("peer review: a reader layer that spends its share is stopped, and the laye
 	const e = summary.evomas!;
 	assert.match(e.layers[1]!.stopped ?? "", /this layer's share/);
 	assert.equal(e.layers[1]!.reports[0]!.ok, false);
-	assert.match(aggregatorPrompt, /--- reviewer1 ---\nError: Agent reviewer1 execution failed: /, "the stopped reviewer is reported with EvoMAS's error line");
+	assert.match(aggregatorPrompt, /--- reviewer1 ---\nError: Agent reviewer1 execution failed: stopped: /, "the stopped reviewer is reported with EvoMAS's error line");
+	assert.ok(!aggregatorPrompt.includes("diff --git a/half"), "half an answer is not passed on as an answer");
 	assert.equal(e.aggregator.apply?.applied, true);
 	assert.equal(summary.end_reason, "peer_review_done");
 });

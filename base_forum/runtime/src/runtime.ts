@@ -115,6 +115,8 @@ interface AgentHandle {
 	lastText: string;
 	/** The whole text of the last assistant message that had text: an aggregator's answer. */
 	answer: string;
+	/** EvoMAS's systems: stopped mid-turn because its layer's share was spent (its answer may be cut short). */
+	cutShort: boolean;
 	/** Forum messages handed to pi's steering queue in the current run, so any pi never delivered can be put back. */
 	steered: Array<{ text: string; events: ForumEvent[] }>;
 }
@@ -412,6 +414,8 @@ export class ForumRuntime implements ForumHost {
 	/** Run one layer until it is done or its share of the budget (`end`, a share of the trial's) is spent. */
 	private async runLayer(index: number, end: number, run: () => Promise<AgentReport[]>): Promise<{ reports: AgentReport[]; stopped: string | null }> {
 		this.layer = { index, end, stopped: null };
+		// a layer that starts with its share already spent (the layers before it overran) does not start at all
+		this.checkLayerShare();
 		const wall = this.rulebook.budget.wall_clock_sec;
 		const atMs = wall === null || end >= 1 ? null : this.startedAtMs + wall * end * 1000 - this.o.now();
 		const timer =
@@ -434,6 +438,13 @@ export class ForumRuntime implements ForumHost {
 		this.forum.assign(threadId, name, "", instruction);
 		this.totalWorkers++;
 		const a = await this.createAgent({ name, role, cwd: ws.dir, branch: ws.branch, model: this.o.workerModel, thinking: this.o.workerThinking, appendPrompt: "", customTools: () => [], linked: ws.linked });
+		// the layer may have been stopped while the agent was being created; it then never starts its turn
+		const late = this.stopped ? this.stopReason : this.layer?.stopped;
+		if (late) {
+			a.finished = true;
+			this.forum.finish(name, "stopped", `Not started: ${late}`);
+			return this.notStarted(name, late);
+		}
 		this.log(`${name} started in ${ws.dir}`);
 		a.loop = this.runPrompt(a, instruction);
 		await a.loop;
@@ -467,14 +478,21 @@ export class ForumRuntime implements ForumHost {
 			customTools: () => [],
 			tools: ["read", "grep", "find", "ls"],
 		});
+		const late = this.stopped ? this.stopReason : this.layer?.stopped;
+		if (late) {
+			a.finished = true;
+			if (!lead) this.forum.finish(name, "stopped", `Not started: ${late}`);
+			return this.notStarted(name, late);
+		}
 		this.log(`${name} started with ${earlier.filter((r) => r.ok).length} of ${earlier.length} reports`);
 		a.loop = this.runPrompt(a, prompt);
 		await a.loop;
 		a.loop = null;
 		a.finished = true;
-		const answer = a.answer;
-		writeFileSync(join(dir, `${name}_answer.md`), answer);
-		const error = answer.trim() ? null : (a.errors.at(-1) ?? EMPTY_ANSWER);
+		// a reader stopped mid-turn may hold half an answer: it is reported as stopped, not passed on as an answer
+		const answer = a.cutShort ? "" : a.answer;
+		writeFileSync(join(dir, `${name}_answer.md`), a.answer);
+		const error = answer.trim() ? null : a.cutShort ? `stopped: ${this.layer?.stopped ?? this.stopReason}` : (a.errors.at(-1) ?? EMPTY_ANSWER);
 		const patch = cleanPatch(answer);
 		if (!lead) {
 			if (answer.trim()) this.forum.post(threadId, name, answer);
@@ -509,7 +527,10 @@ export class ForumRuntime implements ForumHost {
 		for (const a of this.agents.values()) {
 			if (!a.loop || a.role === "authority") continue;
 			a.session.clearQueue();
-			if (a.running) a.session.abort().catch(() => undefined);
+			if (a.running) {
+				a.cutShort = true;
+				a.session.abort().catch(() => undefined);
+			}
 		}
 	}
 
@@ -872,6 +893,7 @@ export class ForumRuntime implements ForumHost {
 			errors: [],
 			lastText: "",
 			answer: "",
+			cutShort: false,
 			steered: [],
 		};
 		session.subscribe((ev) => {
@@ -966,7 +988,7 @@ export class ForumRuntime implements ForumHost {
 		const loops = [...this.agents.values()].map((a) => a.loop).filter((l): l is Promise<void> => l !== null);
 		await Promise.allSettled(loops);
 		for (const a of this.agents.values()) {
-			if (a.role === "worker" && !a.finished) {
+			if (a.role !== "authority" && a.role !== "aggregator" && !a.finished && this.forum.assignmentOf(a.name)) {
 				a.finished = true;
 				this.forum.finish(a.name, "stopped", `(stopped: ${reason}) ${a.lastText}`.trim());
 			}

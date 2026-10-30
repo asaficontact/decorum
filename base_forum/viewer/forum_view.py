@@ -828,6 +828,12 @@ class Store:
             if datasets is None:
                 raise ValueError("datasets are not available in this viewer")
             dataset = datasets.load_dataset(str(body["dataset"]))
+            unknown_here = [t for t in dataset["tasks"] if t not in known]
+            if dataset["benchmark"] == key and unknown_here:
+                raise ValueError(
+                    f"dataset {dataset['name']!r} has {len(unknown_here)} tasks this checkout's catalog does not know "
+                    f"({', '.join(unknown_here[:3])}): pull the repository, or rebuild tasks/catalog with scripts/build_catalog.py"
+                )
             if dataset["benchmark"] != key or tasks != list(dict.fromkeys(dataset["tasks"])):
                 raise ValueError(f"the tasks are not those of dataset {dataset['name']!r}")
         scripted = body.get("scripted") is True

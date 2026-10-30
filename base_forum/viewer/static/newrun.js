@@ -740,7 +740,9 @@ function summary(full) {
   }
   const go = el("button", "primary start", s.n ? `Start ${plural(s.n, "task")}` : "Choose some tasks");
   go.type = "button";
-  go.disabled = !s.n || !CAT_START || ST.busy;
+  const dsHere = ST.mode === "dataset" ? (b.datasets || []).find((x) => x.slug === ST.dataset) : null;
+  if (dsHere && dsHere.missing) w.append(el("p", "sh-scripted", `${plural(dsHere.missing, "task")} of “${dsHere.name}” ${dsHere.missing === 1 ? "is" : "are"} not in this checkout's catalog, so it cannot run here: pull the repository, or rebuild tasks/catalog (scripts/build_catalog.py).`));
+  go.disabled = !s.n || !CAT_START || ST.busy || !!(dsHere && dsHere.missing);
   go.addEventListener("click", () => confirmStart(sel, s));
   w.append(go);
   return w;

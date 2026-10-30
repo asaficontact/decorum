@@ -53,7 +53,10 @@ die() { echo "run_baseline: $*" >&2; exit 2; }
 DATASET_REF=""
 if [ -n "${DATASET:-}" ]; then
   [ -z "${TASKS:-}" ] || die "give DATASET or TASKS, not both"
+  # a run records the dataset it ran; a part of one would be recorded as the whole
+  [ -z "${N_TASKS:-}" ] || die "give DATASET or N_TASKS, not both: save the part you want as its own dataset (scripts/datasets.py save)"
   ds_tasks="$(mktemp "${TMPDIR:-/tmp}/decorum-dataset.XXXXXX")"
+  trap 'rm -f "$ds_tasks"' EXIT
   ds_line="$(python3 "$BASE/scripts/datasets.py" resolve "$DATASET" --tasks-out "$ds_tasks")" || die "no dataset '$DATASET' (python3 base_forum/scripts/datasets.py list)"
   ds_bench="${ds_line%%$'\t'*}"; DATASET_REF="${ds_line#*$'\t'}"
   if [ -n "${BENCHMARK:-}" ] && [ "$BENCHMARK" != "$ds_bench" ]; then die "dataset $DATASET is $ds_bench, but BENCHMARK is $BENCHMARK"; fi
@@ -77,11 +80,11 @@ MARGIN_SEC=120
 
 case "$BENCHMARK" in
   deepswe)
-    TASKS="${TASKS:-$BASE/tasks/baseline-10.tsv}"
+    TASKS="${TASKS:-$BASE/tasks/baseline-10.tsv}"; REFERENCE="$BASE/tasks/baseline-10.tsv"
     CPUS="${CPUS-4}"; MEMORY_MB="${MEMORY_MB-8192}"
     COMMIT=true ;;
   swebenchpro)
-    TASKS="${TASKS:-$BASE/tasks/swebenchpro-10.tsv}"
+    TASKS="${TASKS:-$BASE/tasks/swebenchpro-10.tsv}"; REFERENCE="$BASE/tasks/swebenchpro-10.tsv"
     CPUS="${CPUS-}"; MEMORY_MB="${MEMORY_MB-}"
     COMMIT=false ;;
   *) die "BENCHMARK must be deepswe or swebenchpro, got '$BENCHMARK'" ;;
@@ -203,5 +206,6 @@ rc=0
 "${cmd[@]}" || rc=$?
 [ "$rc" -eq 0 ] || echo "run_baseline: pier exited with $rc; the summary below says which tasks have no result"
 echo
-python3 "$BASE/scripts/summarize.py" "$JOBS_DIR/$JOB_NAME" --reference "$TASKS" || true
+# a task list given as TASKS carries its own reference columns; a dataset's list has none, so the benchmark's are used
+python3 "$BASE/scripts/summarize.py" "$JOBS_DIR/$JOB_NAME" --reference "$([ -n "$DATASET_REF" ] && echo "$REFERENCE" || echo "$TASKS")" || true
 exit "$rc"
