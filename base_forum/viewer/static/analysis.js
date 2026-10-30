@@ -187,7 +187,7 @@ function renderTeams(d) {
 // with the dataviz palette validator (CVD and normal-vision separation, light and dark); every use carries a label.
 const KINDS = [["plan", "var(--a2)"], ["investigation", "var(--a3)"], ["implementation", "var(--a0)"], ["tests", "var(--a4)"], ["review", "var(--a6)"]];
 const KIND_COLOR = Object.fromEntries(KINDS);
-const IN = { bench: "all", extra: false, off: new Set(), data: null, at: 0 };
+const IN = { bench: "all", extra: false, off: new Set(), data: null, at: 0, cmp: "", cmpData: null, datasets: null };
 // The three pages: a run (or a task), Insights across runs, and New run.
 function setPage(page) {
   S.page = page;
@@ -202,7 +202,7 @@ function setPage(page) {
   closeDrawer();
   history.replaceState(null, "", page === "new" ? "#new" : "#insights");
   renderRail();
-  if (page === "insights") { renderInsightsFilters(); loadInsights(true); }
+  if (page === "insights") { renderInsightsFilters(); loadInsights(true); loadCompare(); }
   if (page === "new") NewRun.show();
 }
 $("nav-new").addEventListener("click", () => setPage("new"));
@@ -243,7 +243,7 @@ function renderInsightsFilters() {
   }
   for (const b of box.children) b.setAttribute("aria-pressed", String(!IN.off.has(b.dataset.job)));
 }
-$("in-extra").addEventListener("change", (e) => { IN.extra = e.target.checked; renderInsightsFilters(); loadInsights(true); });
+$("in-extra").addEventListener("change", (e) => { IN.extra = e.target.checked; renderInsightsFilters(); loadInsights(true); renderCompare(); });
 function selectedJobs() { return inRuns().filter((r) => !IN.off.has(r.job)).map((r) => r.job); }
 async function loadInsights(force) {
   if (S.page !== "insights") return;
@@ -256,6 +256,102 @@ async function loadInsights(force) {
     renderInsights();
   } catch (e) { /* keep what is shown */ }
 }
+// ---------- compare on a dataset ----------
+
+const MODE_NAME = { forum: "Forum", single: "Single agent", vote: "Majority vote", "peer-review": "Peer review" };
+async function loadCompare() {
+  if (S.page !== "insights") return;
+  try {
+    const sel = $("in-cmp-ds");
+    if (!IN.datasets) {
+      const cat = await getJSON("api/catalog");
+      IN.datasets = Object.entries(cat.benchmarks).flatMap(([key, b]) => (b.datasets || []).map((d) => ({ ...d, key, bench: b.name })));
+      sel.replaceChildren(...IN.datasets.map((d) => new Option(`${d.name} · ${d.bench} · ${plural(d.ids.length, "task")}`, d.slug)));
+    }
+    if (!sel.dataset.bound) {
+      sel.dataset.bound = "1";
+      sel.addEventListener("change", () => { IN.cmp = sel.value; loadCompare(); });
+    }
+    if (!IN.cmp && IN.datasets.length) {
+      // the dataset with the most runs on it
+      const used = (d) => S.runs.filter((r) => r.dataset && r.dataset.slug === d.slug).length;
+      IN.cmp = [...IN.datasets].sort((a, b) => used(b) - used(a))[0].slug;
+    }
+    sel.value = IN.cmp;
+    if (!IN.cmp) return;
+    try {
+      IN.cmpData = await getJSON(`api/datasets/compare?dataset=${encodeURIComponent(IN.cmp)}`);
+    } catch (e) {
+      // a run can name a dataset this checkout does not have yet (a colleague's, not pulled)
+      IN.cmpData = null;
+      $("in-cmp").replaceChildren();
+      $("in-cmp-sum").textContent = `No dataset “${IN.cmp}” in this checkout: pull the repository to get it.`;
+      return;
+    }
+    renderCompare();
+  } catch (e) { /* keep what is shown */ }
+}
+$("in-cmp-new").addEventListener("click", async () => {
+  const d = (IN.datasets || []).find((x) => x.slug === IN.cmp);
+  if (!d) return;
+  await NewRun.onDataset(d.key, d.slug);
+  setPage("new");
+});
+// "kimi-k3 + kimi-k2.7-code": the lead's model (authority or aggregator), then the others', when they differ
+function modelsWord(r) {
+  const short = (m) => (m || "").split("/").pop();
+  const lead = short(r.authority_model), rest = short(r.worker_model);
+  return r.mode === "single" || !rest || rest === lead ? lead : `${lead} + ${rest}`;
+}
+function renderCompare() {
+  const c = IN.cmpData;
+  const t = $("in-cmp");
+  t.replaceChildren();
+  if (!c) return;
+  const runs = c.runs.filter((r) => IN.extra || !r.faux);
+  $("in-cmp-sum").textContent = runs.length
+    ? `${plural(runs.length, "run")} on “${c.dataset.name}” (${plural(c.tasks.length, "task")}). A run that recorded the dataset is marked ●; ○ ran exactly its tasks before datasets existed. One attempt per task: a difference of a task or two is within what a rerun changes.`
+    : `No run on “${c.dataset.name}” yet${IN.extra ? "" : " (scripted runs are hidden)"}. Start one with the button above.`;
+  if (!runs.length) return;
+  const head = el("tr");
+  head.append(el("th", "", "Task"));
+  for (const r of runs) {
+    const th = el("th");
+    const b = el("button", "row-link", `${MODE_NAME[r.mode] || r.mode}${r.workers ? ` ×${r.workers}` : ""}`);
+    b.type = "button";
+    b.title = r.job;
+    b.addEventListener("click", () => { setPage("runs"); selectRun(r.job); });
+    th.append(b, el("div", "row-sub", `${r.how === "recorded" ? "●" : "○"} ${r.name || shortDate(r.started_at) || r.job}${r.changed ? " · dataset since changed" : ""}`), el("div", "row-sub", r.faux ? "scripted" : modelsWord(r)));
+    head.append(th);
+  }
+  const thead = el("thead");
+  thead.append(head);
+  const tbody = el("tbody");
+  for (const task of c.tasks) {
+    const tr = el("tr");
+    tr.append(el("td", "in-cmp-task", task.title || task.id));
+    for (const r of runs) {
+      const cell = r.cells[task.id];
+      const word = !cell ? ["–", "none", "not run"] : cell.reward == null ? (["running", "starting"].includes(cell.status) ? ["…", "run", "running"] : ["?", "none", "not graded"]) : cell.reward >= 1 ? ["✓", "pass", "passed"] : ["✗", "fail", "did not pass"];
+      const td = el("td", `in-cmp-c ${word[1]}`);
+      if (cell) {
+        const b = el("button", "row-link", word[0]);
+        b.type = "button";
+        b.title = `${word[2]}${cell.cost_usd ? ` · $${cell.cost_usd.toFixed(2)}` : ""}`;
+        b.addEventListener("click", () => openTask(r.job, cell.trial));
+        td.append(b);
+      } else td.append(word[0]);
+      tr.append(td);
+    }
+    tbody.append(tr);
+  }
+  const foot = el("tr", "in-cmp-total");
+  foot.append(el("td", "", "Passed · cost"));
+  for (const r of runs) foot.append(el("td", "in-cmp-c", `${r.passed}/${r.graded} · $${r.cost_usd.toFixed(2)}`));
+  tbody.append(foot);
+  t.append(thead, tbody);
+}
+
 function openTask(job, trial) {
   const t = S.trials.find((x) => x.job === job && x.trial === trial);
   if (t) { setPage("runs"); select(t); }

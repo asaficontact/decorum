@@ -33,7 +33,7 @@ def make_trial(
     trial = root / job / f"{task}__abc"
     (trial / "agent" / "decorum" / "sessions" / "authority").mkdir(parents=True)
     tdir = root / "tasks" / task
-    tdir.mkdir(parents=True)
+    tdir.mkdir(parents=True, exist_ok=True)
     (tdir / "task.toml").write_text(
         'display_title = "Add the demo feature"\nlanguage = "python"\nrepository_url = "https://github.com/acme/demo"\n'
     )
@@ -411,7 +411,7 @@ def test_a_swebench_pro_task_gets_its_title_and_repository_from_the_task(
     assert ov["repository"] == "ansible/ansible"
 
 
-def make_job(root: Path, job: str, dataset: str, tasks: list[str], **extra) -> Path:
+def make_job(root: Path, job: str, dataset: str, tasks: list[str], agent: str = "decorum_pier:DecorumForum", kwargs: dict | None = None, **extra) -> Path:
     d = root / job
     d.mkdir(parents=True, exist_ok=True)
     (d / "config.json").write_text(
@@ -420,11 +420,12 @@ def make_job(root: Path, job: str, dataset: str, tasks: list[str], **extra) -> P
                 "datasets": [{"path": dataset, "task_names": tasks}],
                 "agents": [
                     {
-                        "import_path": "decorum_pier:DecorumForum",
+                        "import_path": agent,
                         "model_name": "moonshotai/kimi-k3",
                         "kwargs": {
                             "rulebook": "base-0",
                             "worker_model": "moonshotai/kimi-k2.7-code",
+                            **(kwargs or {}),
                         },
                     }
                 ],
@@ -1144,11 +1145,14 @@ def test_the_catalog_has_both_benchmarks_with_their_saved_lists(jobs: Path) -> N
     assert d["start"] is True
     pro, ds = d["benchmarks"]["swebenchpro"], d["benchmarks"]["deepswe"]
     assert (len(pro["tasks"]), len(ds["tasks"])) == (642, 113)
-    assert [(p["name"], len(p["ids"])) for p in pro["presets"]] == [
-        ("Collaborator's 10", 10),
-        ("HARD-51", 51),
+    # the named datasets committed under base_forum/tasks/datasets
+    assert [(p["name"], len(p["ids"]), p["ref"].split("@")[0]) for p in pro["datasets"]] == [
+        ("Ansible smoke", 1, "ansible-smoke"),
+        ("Collaborator's 10", 10, "collaborators-10"),
+        ("HARD-51", 51, "hard-51"),
     ]
-    assert [(p["name"], len(p["ids"])) for p in ds["presets"]] == [("Baseline 10", 10)]
+    assert [(p["name"], len(p["ids"])) for p in ds["datasets"]] == [("Baseline 10", 10)]
+    assert d["save"] is True and isinstance(d["setups"], list)
 
 
 def test_a_run_started_from_the_page_writes_its_tasks_and_hands_run_baseline_its_settings(
@@ -1249,9 +1253,16 @@ def test_the_mode_of_a_run_comes_from_its_pier_agent() -> None:
     assert fv._mode_of("decorum_pier:DecorumForum") == "forum"
     assert fv._mode_of("decorum_pier:DecorumSingle") == "single"
     assert fv._mode_of("decorum_pier:DecorumVote") == "vote"
-    assert fv._vote_brief(None) is None
-    brief = fv._vote_brief({"workers": 3, "reports": [{"ok": True}, {"ok": False}, {"ok": True}], "aggregator": {"apply": {"applied": True}, "same_as": "worker3"}})
-    assert brief == {"workers": 3, "patches": 2, "applied": True, "same_as": "worker3"}
+    assert fv._mode_of("decorum_pier:DecorumPeerReview") == "peer-review"
+    assert fv._evomas_brief(None) is None
+    # a vote from before peer review wrote "vote"
+    old = {"vote": {"workers": 3, "reports": [{"ok": True}, {"ok": False}, {"ok": True}], "aggregator": {"apply": {"applied": True}, "same_as": "worker3"}}}
+    assert fv._evomas_brief(old) == {"topology": "vote", "workers": 3, "patches": 2, "applied": True, "same_as": "worker3"}
+    peer = {"evomas": {"topology": "peer-review", "agents_per_layer": 2, "layers": [
+        {"kind": "coder", "reports": [{"ok": True}, {"ok": True}]},
+        {"kind": "reader", "reports": [{"ok": True}, {"ok": False}]},
+    ], "aggregator": {"apply": {"applied": False}, "same_as": None}}}
+    assert fv._evomas_brief(peer) == {"topology": "peer-review", "workers": 2, "patches": 2, "applied": False, "same_as": None}
 
 
 @pytest.mark.parametrize(
@@ -1261,7 +1272,7 @@ def test_the_mode_of_a_run_comes_from_its_pier_agent() -> None:
         ({"tasks": []}, "non-empty list"),
         ({"tasks": ["instance_nope"]}, "not in SWE-bench Pro: instance_nope"),
         ({"authority_model": "kimi; rm -rf /"}, "must look like provider/model"),
-        ({"worker_model": None}, "worker_model in forum and vote mode"),
+        ({"worker_model": None}, "worker_model in forum, vote and peer-review mode"),
         ({"authority_thinking": "huge"}, "authority_thinking must be one of"),
         (
             {"min_workers": 6, "max_workers": 3},
@@ -1270,9 +1281,9 @@ def test_the_mode_of_a_run_comes_from_its_pier_agent() -> None:
         ({"max_workers": 9}, "max_workers must be a whole number from 1 to 8"),
         ({"concurrency": "3"}, "concurrency must be a whole number"),
         ({"budget_usd": 0}, "budget_usd must be from 1 to 1000"),
-        ({"mode": "swarm"}, "mode must be forum, single or vote"),
+        ({"mode": "swarm"}, "mode must be forum, single, vote or peer-review"),
         ({"mode": "vote", "workers": 21}, "workers must be a whole number from 1 to 20"),
-        ({"mode": "vote", "worker_model": None}, "worker_model in forum and vote mode"),
+        ({"mode": "vote", "worker_model": None}, "worker_model in forum, vote and peer-review mode"),
         ({"name": "x" * 81}, "at most 80 characters"),
     ],
 )
@@ -1467,3 +1478,98 @@ def test_the_start_endpoint_needs_the_page_header_and_can_be_switched_off(
         )
     finally:
         server.shutdown()
+
+
+@pytest.fixture
+def stores(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Named datasets and setups saved into a scratch folder, beside a copy of the committed datasets."""
+    d = tmp_path / "datasets"
+    shutil.copytree(fv.datasets.DATASETS_DIR, d)
+    monkeypatch.setattr(fv.datasets, "DATASETS_DIR", d)
+    monkeypatch.setattr(fv.datasets, "SETUPS_DIR", tmp_path / "setups")
+    return d
+
+
+def test_the_chosen_tasks_are_saved_as_a_named_dataset_once(jobs: Path, stores: Path) -> None:
+    store = fv.Store([jobs])
+    ids = start_body()["tasks"]
+    r = store.save_dataset({"benchmark": "swebenchpro", "name": "Ansible pair", "tasks": ids, "description": "two ansible tasks", "how": "picked"})
+    assert r["slug"] == "ansible-pair" and r["tasks"] == 2 and re.fullmatch(r"ansible-pair@[0-9a-f]{12}", r["ref"])
+    saved = json.loads((stores / "ansible-pair.json").read_text())
+    assert (saved["name"], saved["benchmark"], saved["tasks"], saved["how"]) == ("Ansible pair", "swebenchpro", ids, "picked")
+    assert "Ansible pair" in [x["name"] for x in store.catalog()["benchmarks"]["swebenchpro"]["datasets"]]
+    with pytest.raises(ValueError, match="already exists"):
+        store.save_dataset({"benchmark": "swebenchpro", "name": "ansible PAIR", "tasks": ids[:1]})
+    with pytest.raises(ValueError, match="not in the benchmark: instance_nope"):
+        store.save_dataset({"benchmark": "swebenchpro", "name": "Bad", "tasks": ["instance_nope"]})
+    with pytest.raises(ValueError, match="non-empty list"):
+        store.save_dataset({"benchmark": "swebenchpro", "name": "Empty", "tasks": []})
+    store.start_enabled = False
+    with pytest.raises(PermissionError, match="switched off"):
+        store.save_dataset({"benchmark": "swebenchpro", "name": "Off", "tasks": ids})
+
+
+def test_a_run_on_a_dataset_sends_the_dataset_not_a_task_list_and_is_listed_with_it(
+    jobs: Path, stores: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store, calls = starter(jobs, monkeypatch)
+    ids = start_body()["tasks"]
+    ref = store.save_dataset({"benchmark": "swebenchpro", "name": "Ansible pair", "tasks": ids})["ref"]
+    store.start(start_body(mode="peer-review", workers=3, max_live_workers=8, dataset="ansible-pair", name=""))
+    env = calls[0][0]
+    assert env["DATASET"] == "ansible-pair" and "TASKS" not in env
+    assert (env["MODE"], env["WORKERS"], env["MAX_LIVE_WORKERS"]) == ("peer-review", "3", "3")
+    assert env["JOB_NAME"].startswith("swebenchpro-peer-review-ansible-pair-")
+    [run] = store.runs()
+    assert run["dataset"]["ref"] == ref and run["mode"] == "peer-review"
+    with pytest.raises(ValueError, match="not those of dataset 'Ansible pair'"):
+        store.start(start_body(tasks=ids[:1], dataset="ansible-pair"))
+    with pytest.raises(ValueError, match="no dataset 'nope'"):
+        store.start(start_body(dataset="nope"))
+
+
+def test_runs_on_a_dataset_are_compared_task_by_task(jobs: Path, stores: Path) -> None:
+    store = fv.Store([jobs])
+    ids = ["instance_acme__x-1", "instance_acme__y-2"]
+    monkeypatch_known = {"swebenchpro": {"tasks": [{"id": i, "title": i.upper()} for i in ids]}}
+    store._catalog = monkeypatch_known
+    d = fv.datasets.save_dataset("Acme pair", "swebenchpro", ids)
+    pro = "/x/.swebench-pro/pier-tasks"
+
+    def graded(job: str, task: str, reward: float) -> None:
+        trial = make_trial(jobs, job, task)
+        finish(trial, reward)
+        # Pier names the task in result.json; a SWE-bench Pro id holds "__", so the folder name alone would not do
+        (trial / "result.json").write_text(json.dumps({"finished_at": "2026-10-27T10:00:00", "task_name": f"swebench-pro/{task}"}))
+
+    make_job(jobs, "forum-old", pro, ids)  # before datasets: the same tasks, recorded nowhere
+    graded("forum-old", ids[0], 1.0)
+    graded("forum-old", ids[1], 0.0)
+    make_job(jobs, "peer-new", pro, ids, agent="decorum_pier:DecorumPeerReview", kwargs={"dataset": fv.datasets.ref_of(d), "workers": 6})
+    graded("peer-new", ids[0], 1.0)
+    graded("peer-new", ids[1], 1.0)
+    make_job(jobs, "other", pro, ids[:1])  # other tasks: not compared
+    c = store.compare("acme-pair")
+    assert c["dataset"]["ref"] == fv.datasets.ref_of(d)
+    assert [t["title"] for t in c["tasks"]] == ["INSTANCE_ACME__X-1", "INSTANCE_ACME__Y-2"]
+    by = {r["job"]: r for r in c["runs"]}
+    assert set(by) == {"forum-old", "peer-new"}
+    assert (by["peer-new"]["how"], by["peer-new"]["mode"], by["peer-new"]["passed"], by["peer-new"]["graded"]) == ("recorded", "peer-review", 2, 2)
+    assert (by["forum-old"]["how"], by["forum-old"]["passed"]) == ("same tasks", 1)
+    assert by["forum-old"]["cells"][ids[1]]["reward"] == 0.0
+    assert not by["peer-new"]["changed"]
+
+
+def test_a_team_setup_is_saved_and_offered_with_the_catalog(jobs: Path, stores: Path) -> None:
+    store = fv.Store([jobs])
+    team = {"mode": "peer-review", "authority": "moonshotai/kimi-k2.7-code", "athink": "high", "worker": "moonshotai/kimi-k2.7-code", "wthink": "high", "min": 3, "max": 6, "live": 6, "n": 6}
+    run = {"concurrency": 2, "budget": 10, "retries": 0}
+    assert store.save_setup({"name": "K2.7 peer review", "team": team, "run": run})["slug"] == "k2-7-peer-review"
+    [s] = store.catalog()["setups"]
+    assert (s["name"], s["team"]["mode"], s["team"]["n"], s["run"]["budget"]) == ("K2.7 peer review", "peer-review", 6, 10)
+    with pytest.raises(ValueError, match="already exists"):
+        store.save_setup({"name": "K2.7 Peer Review", "team": team, "run": run})
+    with pytest.raises(ValueError, match="mode must be one of"):
+        store.save_setup({"name": "Bad", "team": {**team, "mode": "swarm"}, "run": run})
+    with pytest.raises(ValueError, match="worker must look like provider/model"):
+        store.save_setup({"name": "Bad", "team": {**team, "worker": "x; rm"}, "run": run})

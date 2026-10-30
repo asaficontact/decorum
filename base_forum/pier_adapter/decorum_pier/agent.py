@@ -4,13 +4,16 @@
 workers (pi sessions in one Node process, ``base_forum/runtime``) work in the task checkout, the rulebook is
 enforced at every tool call, and the trial's trace lands in ``/logs/agent/decorum``. ``DecorumSingle`` runs
 the same runtime with one agent and no forum, the single-agent condition the forum is compared with.
-``DecorumVote`` runs EvoMAS's majority vote on the same runtime: N workers solve the task apart, each in its own
-worktree, and an aggregator (the -m model) writes the final patch from theirs.
+``DecorumVote`` and ``DecorumPeerReview`` run two of EvoMAS's systems on the same runtime: N coding agents solve the
+task apart, each in its own worktree; in peer review N reviewers and then N revisers read every earlier report; and an
+aggregator (the -m model) writes the final patch.
 
     pier run -p deep-swe/tasks --agent-import-path decorum_pier:DecorumForum \\
         -m moonshotai/kimi-k3 --ak worker_model=moonshotai/kimi-k2.7-code --ak rulebook=base-0
     pier run -p ... --agent-import-path decorum_pier:DecorumVote \\
         -m moonshotai/kimi-k2.7-code --ak worker_model=moonshotai/kimi-k2.7-code --ak workers=5
+    pier run -p ... --agent-import-path decorum_pier:DecorumPeerReview \\
+        -m moonshotai/kimi-k2.7-code --ak worker_model=moonshotai/kimi-k2.7-code --ak workers=6
 
 Build-time install (network open): Node and the runtime's npm dependencies, pinned by the runtime's
 package-lock.json. Setup (network closed): the runtime's source and the rulebook are uploaded. Run: only the
@@ -118,8 +121,9 @@ class DecorumForum(BaseInstalledAgent):
         max_workers: int | str | None = None,
         max_live_workers: int | str | None = None,
         budget_usd: float | str | None = None,
-        workers: int | str = 5,
+        workers: int | str | None = None,
         aggregator_reserve: float | str | None = None,
+        dataset: str | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(*args, **kwargs)
@@ -155,13 +159,18 @@ class DecorumForum(BaseInstalledAgent):
             if number < 0 or (whole and not number.is_integer()):
                 raise ValueError(f"{name} must be a {'whole ' if whole else ''}number >= 0; got {value!r}")
             self.budget_flags += [flag, str(int(number)) if whole or number.is_integer() else repr(number)]
-        # Vote mode: how many workers, and the share of the dollars and the clock kept for the aggregator.
-        try:
-            self.workers = int(str(workers))
-        except ValueError:
-            self.workers = 0
-        if not 1 <= self.workers <= 20 or str(workers).strip() != str(self.workers):
-            raise ValueError(f"workers must be a whole number from 1 to 20; got {workers!r}")
+        # Vote and peer review: the agents in each layer (default: the runtime's, 5 and 6), and the share of the
+        # dollars and the clock kept for the read-only layers after the coding agents (default 0.15 and 0.45).
+        self.workers: int | None = None
+        if workers not in (None, "", "none"):
+            try:
+                self.workers = int(str(workers))
+            except ValueError:
+                self.workers = 0
+            if not 1 <= self.workers <= 20 or str(workers).strip() != str(self.workers):
+                raise ValueError(f"workers must be a whole number from 1 to 20; got {workers!r}")
+        # The named dataset the run's tasks come from (<name>@<hash>; scripts/datasets.py); recorded, not used.
+        self.dataset = dataset or None
         self.aggregator_reserve = None if aggregator_reserve in (None, "", "none") else float(aggregator_reserve)
         if self.aggregator_reserve is not None and not 0 <= self.aggregator_reserve <= 0.9:
             raise ValueError(f"aggregator_reserve must be a share from 0 to 0.9; got {aggregator_reserve!r}")
@@ -314,8 +323,10 @@ done
             args += ["--authority-model", self.model_name or ""]
             if self.MODE != "single":
                 args += ["--worker-model", self.worker_model or ""]
-        if self.MODE == "vote":
-            args += ["--workers", str(self.workers), "--instance-id", self._instance_id()]
+        if self.MODE in ("vote", "peer-review"):
+            args += ["--instance-id", self._instance_id()]
+            if self.workers is not None:
+                args += ["--workers", str(self.workers)]
             if self.aggregator_reserve is not None:
                 args += ["--aggregator-reserve", repr(self.aggregator_reserve)]
         return " ".join(shlex.quote(a) for a in args)
@@ -373,7 +384,7 @@ done
         (self.logs_dir / "trajectory.json").write_text(format_trajectory_json(trajectory.to_json_dict()))
         if trajectory.final_metrics:
             populate_context_from_final_metrics(context, trajectory.final_metrics)
-        context.metadata = {**(context.metadata or {}), "decorum": _context_metadata(summary)}
+        context.metadata = {**(context.metadata or {}), "decorum": {**_context_metadata(summary), "dataset": self.dataset}}
 
 
 class DecorumSingle(DecorumForum):
@@ -396,27 +407,48 @@ class DecorumVote(DecorumForum):
         return "decorum-vote"
 
 
+class DecorumPeerReview(DecorumForum):
+    """EvoMAS's peer review on the same runtime: N creators, N reviewers, N revisers, and an aggregator (the -m model)."""
+
+    MODE = "peer-review"
+
+    @staticmethod
+    def name() -> str:
+        return "decorum-peer-review"
+
+
 def _context_metadata(summary: dict[str, Any]) -> dict[str, Any]:
     return {
         "mode": summary.get("mode"),
         "rulebook": (summary.get("rulebook") or {}).get("name"),
         "end_reason": summary.get("end_reason"),
         "auto_committed": summary.get("auto_committed"),
-        "workers": sum(1 for a in summary.get("agents", []) if a.get("role") == "worker"),
+        "workers": sum(1 for a in summary.get("agents", []) if a.get("role") not in (None, "authority", "aggregator")),
         "forum": summary.get("forum"),
         "refusals": len(summary.get("refusals", [])),
-        "vote": _vote_metadata(summary.get("vote")),
+        "evomas": _evomas_metadata(summary),
     }
 
 
-def _vote_metadata(vote: dict[str, Any] | None) -> dict[str, Any] | None:
-    if not vote:
+def _evomas_metadata(summary: dict[str, Any]) -> dict[str, Any] | None:
+    """What became of a vote or a peer review (and of a vote from before peer review, whose summary says ``vote``)."""
+    e = summary.get("evomas")
+    if e:
+        reports = [r for layer in e.get("layers") or [] for r in layer.get("reports") or []]
+        coders = [r for layer in e.get("layers") or [] if layer.get("kind") == "coder" for r in layer.get("reports") or []]
+        agents = e.get("agents_per_layer")
+    elif summary.get("vote"):
+        e = summary["vote"]
+        reports = coders = e.get("reports") or []
+        agents = e.get("workers")
+    else:
         return None
-    agg = vote.get("aggregator") or {}
+    agg = e.get("aggregator") or {}
     return {
-        "workers": vote.get("workers"),
-        "patches": sum(1 for r in vote.get("reports", []) if r.get("ok")),
-        "workers_stopped": vote.get("workers_stopped"),
+        "topology": e.get("topology", "vote"),
+        "agents_per_layer": agents,
+        "patches": sum(1 for r in coders if r.get("ok")),
+        "reports": len(reports),
         "applied": bool((agg.get("apply") or {}).get("applied")),
         "same_as": agg.get("same_as"),
     }

@@ -48,6 +48,16 @@
         <p class="in-banner" id="in-banner"></p>
       </header>
 
+      <section class="in-sec" aria-labelledby="in-h-cmp">
+        <h3 id="in-h-cmp">Compare on a dataset</h3>
+        <div class="in-cmp-top">
+          <select id="in-cmp-ds" aria-label="Dataset"></select>
+          <button type="button" id="in-cmp-new">New run on this dataset</button>
+        </div>
+        <p class="ta-sub" id="in-cmp-sum">Every run on a named dataset, task by task: the forum, the single agent, the majority vote and peer review on the same tasks.</p>
+        <div class="in-cmp-wrap"><table class="in-cmp" id="in-cmp"></table></div>
+      </section>
+
       <section class="in-sec" aria-labelledby="in-h-search">
         <h3 id="in-h-search">Search what was said</h3>
         <form class="in-search" id="in-search-form" role="search">
@@ -207,6 +217,15 @@
   <div class="rd-actions"><button type="button" id="rd-cancel">Cancel</button><button type="button" class="primary" id="rd-go">Retry</button></div>
 </dialog>
 <script src="app.js"></script>
+<dialog class="start-dialog" id="name-dialog" aria-labelledby="nd-title">
+  <h3 id="nd-title">Save</h3>
+  <p id="nd-text"></p>
+  <form id="nd-form" method="dialog" class="nd-form">
+    <label>Name <input id="nd-name" maxlength="60" required autocomplete="off"></label>
+    <label>Description (optional) <textarea id="nd-desc" rows="2" maxlength="500"></textarea></label>
+    <div class="sd-actions"><button type="button" id="nd-cancel">Cancel</button><button type="submit" class="primary" id="nd-go">Save</button></div>
+  </form>
+</dialog>
 <dialog class="start-dialog" id="start-dialog" aria-labelledby="sd-title">
   <h3 id="sd-title">Start?</h3>
   <p id="sd-text"></p>

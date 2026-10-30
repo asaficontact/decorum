@@ -20,6 +20,7 @@ const MODELS = [
 // Ordered by what the literature supports: at 10 to 50 tasks nothing reliably beats a seeded random draw
 // (2506.07673, 2510.08730); difficulty strata cover every band (2610.29927) but have no direct test on agents yet.
 const MODES = [
+  ["dataset", "A dataset", "A named, saved list of tasks: the same tasks for every setup you compare"],
   ["random", "At random", "Drawn at random. Keep the seed to run the same tasks again"],
   ["difficulty", "By difficulty", "Spread over how hard the tasks are, and over repositories"],
   ["same", "Same as a run", "The tasks of an earlier run, for a fair comparison"],
@@ -109,6 +110,11 @@ function pickTasks(bench, st) {
   const pool = narrow(all, st.filters);
   const n = Math.max(0, Math.min(st.n, pool.length));
   if (st.mode === "paste") return parsePaste(st.paste, all).found;
+  if (st.mode === "dataset") {
+    const d = (bench.datasets || []).find((x) => x.slug === st.dataset);
+    const byId = new Map(all.map((t) => [t.id, t]));
+    return d ? d.ids.map((id) => byId.get(id)).filter(Boolean) : [];
+  }
   if (st.mode === "pick") return all.filter((t) => st.picked.has(t.id));
   if (st.mode === "same") {
     const r = (st.sameRuns || [])[st.sameRun || 0];
@@ -171,9 +177,11 @@ const BAND_WORD = { easy: "Easy", medium: "Medium", hard: "Hard", "very hard": "
 
 let CAT = null; // /api/catalog's benchmarks
 let CAT_START = true;
+let CAT_SAVE = false; // saving datasets and setups (off when the page is served beyond this computer)
+let SETUPS = [];
 const ST = {
   benchKey: "swebenchpro", sameRuns: [], scripted: false, busy: false,
-  mode: "random", n: 10, seed: 7, order: "first", paste: "", picked: new Set(), sameRun: 0,
+  mode: "random", n: 10, seed: 7, order: "first", paste: "", picked: new Set(), sameRun: 0, dataset: "",
   filters: { repo: "", language: "", band: "", category: "", hard51: false, q: "" },
   mix: "match", custom: { easy: 3, medium: 3, hard: 2, "very hard": 2 }, spread: true,
   team: { mode: "forum", authority: "moonshotai/kimi-k3", athink: "max", worker: "moonshotai/kimi-k2.7-code", wthink: "high", min: 3, max: 6, live: 4, n: 5 },
@@ -266,7 +274,8 @@ function benchCards(compact) {
       ST.picked = new Set();
       ST.filters = { repo: "", language: "", band: "", category: "", hard51: false, q: "" };
       ST.sameRun = 0;
-      if (ST.mode === "pick" || ST.mode === "same") ST.mode = "random"; // those were the other benchmark's tasks
+      if (ST.mode === "pick" || ST.mode === "same" || ST.mode === "dataset") ST.mode = "random"; // those were the other benchmark's tasks
+      ST.dataset = "";
       render();
     });
     w.append(card);
@@ -320,16 +329,26 @@ function modeBody() {
   const b = bench();
   const w = el("div", "mode-body");
   const nField = () => field("How many", stepper(ST.n, 1, b.tasks.length, (v) => { ST.n = v; refresh(); }, "Number of tasks"), `of ${b.tasks.length}`);
-  const presets = el("div", "presets");
-  presets.append(el("span", "f-hint", "Saved lists"));
-  for (const p of b.presets) {
-    const c = el("button", "chip", `${p.name} (${p.ids.length})`);
-    c.type = "button";
-    c.title = p.about;
-    c.addEventListener("click", () => { ST.picked = new Set(p.ids); ST.mode = "pick"; render(); });
-    presets.append(c);
-  }
-  if (ST.mode === "random") {
+  if (ST.mode === "dataset") {
+    const list = el("div", "same-list ds-list");
+    const sets = b.datasets || [];
+    if (!sets.length) list.append(el("p", "f-hint", `No dataset for ${b.name} yet: choose tasks another way, then save them as one.`));
+    if (!ST.dataset && sets.length) ST.dataset = sets[0].slug;
+    for (const d of sets) {
+      const c = el("button", "same-run");
+      c.type = "button";
+      c.setAttribute("aria-pressed", String(ST.dataset === d.slug));
+      // runs that recorded it, and runs of exactly its tasks from before datasets existed
+      const want = [...d.ids].sort().join("\n");
+      const used = S.runs.filter((r) => (r.dataset && r.dataset.slug === d.slug) || (!r.dataset && [...(r.task_ids || [])].sort().join("\n") === want)).length;
+      c.append(el("b", "", d.name), el("span", "", [plural(d.ids.length, "task"), d.how, used ? `${plural(used, "run")} on it` : "no run yet"].filter(Boolean).join(" · ")));
+      if (d.description) c.append(el("span", "", d.description));
+      c.title = d.ref;
+      c.addEventListener("click", () => { ST.dataset = d.slug; render(); });
+      list.append(c);
+    }
+    w.append(list, el("p", "why", "A dataset never changes once saved, and every run records the one it ran, so runs of the forum, the single agent, the majority vote and peer review on it can be compared task by task (Insights, “Compare on a dataset”)."));
+  } else if (ST.mode === "random") {
     const seed = el("div", "row");
     seed.append(field("Seed", stepper(ST.seed, 0, 99999, (v) => { ST.seed = v; refresh(); }, "Seed")));
     const again = el("button", "ghost", "Draw again");
@@ -386,8 +405,41 @@ function modeBody() {
     r.append(nField(), field("Order", segmented([["first", "First N"], ["even", "Spread evenly"]], ST.order, (v) => { ST.order = v; refresh(); }, "Order")));
     w.append(r, narrowRow(), el("p", "why caution", "The benchmark lists its tasks by repository, so the first N come from only one or two repositories. Use it to try the setup, not to measure."));
   }
-  if (ST.mode !== "same") w.append(presets);
+  if (ST.mode !== "dataset") w.append(saveDatasetRow());
   return w;
+}
+
+// The chosen tasks, saved as a named dataset (base_forum/tasks/datasets/<name>.json).
+function saveDatasetRow() {
+  const w = el("div", "presets");
+  const n = selection().length;
+  const b = el("button", "chip", n === 1 ? "Save this task as a dataset…" : n ? `Save these ${n} tasks as a dataset…` : "Save as a dataset…");
+  b.type = "button";
+  b.disabled = !n || !CAT_SAVE;
+  b.title = CAT_SAVE ? "A named list everyone who pulls the repository can run again" : "Saving is switched off in this viewer";
+  b.addEventListener("click", async () => {
+    const got = await askName({ title: `Save ${plural(n, "task")} as a dataset`, text: `A dataset never changes once saved: it is kept in base_forum/tasks/datasets/ and shared through git.`, placeholder: "e.g. Ansible five" });
+    if (!got) return;
+    try {
+      const res = await postJSON("api/datasets", { benchmark: ST.benchKey, name: got.name, description: got.description, tasks: selection().map((t) => t.id), how: howChosen() });
+      await reloadCatalog();
+      if (typeof IN !== "undefined") IN.datasets = null; // the Insights list reloads with it
+      ST.mode = "dataset";
+      ST.dataset = res.slug;
+      toast(`Saved the dataset “${res.name}” (${plural(res.tasks, "task")}).`);
+      render();
+    } catch (e) {
+      toast(`Could not save: ${e.message}`);
+    }
+  });
+  w.append(b);
+  return w;
+}
+// How the current tasks were chosen, in words, kept with a dataset.
+function howChosen() {
+  const m = MODES.find((x) => x[0] === ST.mode)[1].toLowerCase();
+  const f = Object.entries(ST.filters).filter(([, v]) => v).map(([k, v]) => (k === "hard51" ? "HARD-51" : `${k} ${v}`));
+  return `${m}${ST.mode === "random" || ST.mode === "difficulty" ? `, seed ${ST.seed}` : ""}${f.length ? `, from ${f.join(", ")}` : ""}`;
 }
 
 function pickTable() {
@@ -550,20 +602,29 @@ function seats() {
 }
 function teamControls() {
   const w = el("div", "team");
-  w.append(field("The team", segmented([["forum", "The forum: an authority and workers"], ["vote", "Majority vote: workers, then an aggregator"], ["single", "One agent, no forum"]], ST.team.mode, (v) => { ST.team.mode = v; render(); }, "Mode")));
-  const vote = ST.team.mode === "vote";
+  w.append(setupsRow());
+  w.append(field("The team", segmented([["forum", "The forum: an authority and workers"], ["vote", "Majority vote: workers, then an aggregator"], ["peer-review", "Peer review: create, review, revise, aggregate"], ["single", "One agent, no forum"]], ST.team.mode, (v) => {
+    if (v === "peer-review" && ST.team.mode !== "peer-review" && ST.team.n === 5) ST.team.n = 6; // EvoMAS's peer review has 6 per stage
+    if (v === "vote" && ST.team.mode === "peer-review" && ST.team.n === 6) ST.team.n = 5;
+    ST.team.mode = v;
+    render();
+  }, "Mode")));
+  const vote = ST.team.mode === "vote" || ST.team.mode === "peer-review";
+  const peer = ST.team.mode === "peer-review";
   const lead = vote ? "Aggregator" : "Authority";
   const a = el("div", "nr-who");
   a.append(el("h4", "", lead), modelPicker(ST.team.authority, (v) => { ST.team.authority = v; render(); }, `${lead} model`), field("Thinking", thinkingPicker(ST.team.athink, (v) => { ST.team.athink = v; render(); }, `${lead} thinking`)));
-  if (vote) a.append(el("p", "f-hint", "Reads the task and every worker's patch, and answers with the final patch (EvoMAS's aggregator). It may read the code, not change it."));
+  if (vote) a.append(el("p", "f-hint", `Reads the task and every ${peer ? "creator's patch and every reviewer's and reviser's answer" : "worker's patch"}, and answers with the final patch (EvoMAS's aggregator). It may read the code, not change it.`));
   w.append(a);
   if (vote) {
     const wk = el("div", "nr-who");
-    wk.append(el("h4", "", "Workers"), modelPicker(ST.team.worker, (v) => { ST.team.worker = v; render(); }, "Worker model"), field("Thinking", thinkingPicker(ST.team.wthink, (v) => { ST.team.wthink = v; render(); }, "Worker thinking")));
+    wk.append(el("h4", "", peer ? "Creators, reviewers and revisers" : "Workers"), modelPicker(ST.team.worker, (v) => { ST.team.worker = v; render(); }, "Worker model"), field("Thinking", thinkingPicker(ST.team.wthink, (v) => { ST.team.wthink = v; render(); }, "Worker thinking")));
     const range = el("div", "range");
-    range.append(field("Workers", stepper(ST.team.n, 1, 20, (v) => { ST.team.n = v; render(); }, "Workers per task")),
-      field("At once", stepper(Math.min(ST.team.live, ST.team.n), 1, ST.team.n, (v) => { ST.team.live = v; refresh(); }, "Most workers working at the same time")));
-    wk.append(el("h5", "", "Workers per task"), range, el("p", "f-hint", `Each of the ${ST.team.n} workers solves the task alone in its own copy of the repository, as the single agent does; none sees another's work. 15% of the spend cap and of the time is kept for the aggregator.`));
+    range.append(field(peer ? "Per stage" : "Workers", stepper(ST.team.n, 1, 20, (v) => { ST.team.n = v; render(); }, peer ? "Agents in each stage" : "Workers per task")),
+      field(peer ? "Creators at once" : "At once", stepper(Math.min(ST.team.live, ST.team.n), 1, ST.team.n, (v) => { ST.team.live = v; refresh(); }, "Most coding agents working at the same time")));
+    wk.append(el("h5", "", peer ? "Agents per stage" : "Workers per task"), range, el("p", "f-hint", peer
+      ? `${ST.team.n} creators each solve the task alone in their own copy of the repository, as the single agent does. Then ${ST.team.n} reviewers read the creators' patches, ${ST.team.n} revisers read those and the reviews, and the aggregator reads all ${3 * ST.team.n} and answers with the final patch; no agent sees the others in its own stage. Readers may read the code, not change it. 45% of the spend cap and of the time is kept for the three reading stages.`
+      : `Each of the ${ST.team.n} workers solves the task alone in its own copy of the repository, as the single agent does; none sees another's work. 15% of the spend cap and of the time is kept for the aggregator.`));
     w.append(wk);
   }
   if (ST.team.mode === "forum") {
@@ -576,6 +637,40 @@ function teamControls() {
     wk.append(el("h5", "", "Workers per task"), seats(), range, el("p", "f-hint", `The authority decides how many it needs, between ${ST.team.min} and ${ST.team.max}; the rulebook refuses anything outside that.`));
     w.append(wk);
   }
+  return w;
+}
+// Named teams: load one, or save the team and run settings shown as one (base_forum/tasks/setups/<name>.json).
+function setupsRow() {
+  const w = el("div", "presets");
+  w.append(el("span", "f-hint", "Saved setups"));
+  for (const s of SETUPS) {
+    const c = el("button", "chip", s.name);
+    c.type = "button";
+    c.title = s.description || `${s.team.mode}: ${s.team.worker}`;
+    c.addEventListener("click", () => {
+      ST.team = { ...ST.team, ...s.team };
+      ST.run = { ...ST.run, ...s.run };
+      toast(`Loaded the setup “${s.name}”.`);
+      render();
+    });
+    w.append(c);
+  }
+  const save = el("button", "chip", "Save this team as a setup…");
+  save.type = "button";
+  save.disabled = !CAT_SAVE;
+  save.addEventListener("click", async () => {
+    const got = await askName({ title: "Save this team as a setup", text: "The team, its models and thinking, the workers, and the run's spend cap, tasks at once and retries, under a name, in base_forum/tasks/setups/.", placeholder: "e.g. K2.7 peer review" });
+    if (!got) return;
+    try {
+      const res = await postJSON("api/setups", { name: got.name, description: got.description, team: ST.team, run: { concurrency: ST.run.concurrency, budget: ST.run.budget, retries: ST.run.retries } });
+      await reloadCatalog();
+      toast(`Saved the setup “${res.name}”.`);
+      render();
+    } catch (e) {
+      toast(`Could not save: ${e.message}`);
+    }
+  });
+  w.append(save);
   return w;
 }
 function runControls() {
@@ -609,7 +704,8 @@ function summary(full) {
   const line = (k, v) => { const r = el("div", "sh-line"); r.append(el("span", "sh-k", k), el("span", "sh-v", v)); return r; };
   w.append(el("div", "sh-title", ST.run.name || "New run"));
   w.append(line("§ Benchmark", `${b.name} ${b.version}`));
-  w.append(line("§ Tasks", `${plural(s.n, "task")}, ${MODES.find((m) => m[0] === ST.mode)[1].toLowerCase()}${ST.mode === "random" ? `, seed ${ST.seed}` : ""}`));
+  const ds = ST.mode === "dataset" ? (b.datasets || []).find((x) => x.slug === ST.dataset) : null;
+  w.append(line("§ Tasks", ds ? `${plural(s.n, "task")}, the dataset “${ds.name}”` : `${plural(s.n, "task")}, ${MODES.find((m) => m[0] === ST.mode)[1].toLowerCase()}${ST.mode === "random" ? `, seed ${ST.seed}` : ""}`));
   const bar = el("div", "sh-bar");
   for (const band of BANDS) {
     if (!s.bands[band]) continue;
@@ -644,7 +740,9 @@ function summary(full) {
   }
   const go = el("button", "primary start", s.n ? `Start ${plural(s.n, "task")}` : "Choose some tasks");
   go.type = "button";
-  go.disabled = !s.n || !CAT_START || ST.busy;
+  const dsHere = ST.mode === "dataset" ? (b.datasets || []).find((x) => x.slug === ST.dataset) : null;
+  if (dsHere && dsHere.missing) w.append(el("p", "sh-scripted", `${plural(dsHere.missing, "task")} of “${dsHere.name}” ${dsHere.missing === 1 ? "is" : "are"} not in this checkout's catalog, so it cannot run here: pull the repository, or rebuild tasks/catalog (scripts/build_catalog.py).`));
+  go.disabled = !s.n || !CAT_START || ST.busy || !!(dsHere && dsHere.missing);
   go.addEventListener("click", () => confirmStart(sel, s));
   w.append(go);
   return w;
@@ -655,6 +753,7 @@ function teamLine(thinking) {
   const th = (x) => (thinking ? ` (${x})` : "");
   if (t.mode === "forum") return `${modelName(t.authority)}${th(t.athink)} leads ${t.min} to ${t.max} ${modelName(t.worker)} workers${th(t.wthink)}`;
   if (t.mode === "vote") return `${t.n} ${modelName(t.worker)} workers${th(t.wthink)}, ${Math.min(t.live, t.n)} at once, then ${modelName(t.authority)}${th(t.athink)} aggregates`;
+  if (t.mode === "peer-review") return `${t.n} ${modelName(t.worker)} creators, reviewers and revisers${th(t.wthink)}, then ${modelName(t.authority)}${th(t.athink)} aggregates`;
   return `${modelName(t.authority)}${th(t.athink)} alone`;
 }
 function request(sel) {
@@ -662,15 +761,18 @@ function request(sel) {
   return {
     benchmark: ST.benchKey, tasks: sel.map((x) => x.id), mode: t.mode, scripted: ST.scripted,
     authority_model: t.authority, authority_thinking: t.athink, worker_model: t.worker, worker_thinking: t.wthink,
-    min_workers: t.min, max_workers: t.max, max_live_workers: t.mode === "vote" ? Math.min(t.live, t.n) : t.live, workers: t.n,
+    min_workers: t.min, max_workers: t.max, max_live_workers: t.mode === "vote" || t.mode === "peer-review" ? Math.min(t.live, t.n) : t.live, workers: t.n,
+    ...(ST.mode === "dataset" && ST.dataset ? { dataset: ST.dataset } : {}),
     concurrency: ST.run.concurrency, retries: ST.run.retries, budget_usd: ST.run.budget, name: ST.run.name.trim(),
   };
 }
 function commandText(sel) {
   const r = request(sel);
-  const lines = [`# the ${plural(sel.length, "task")} are written to base_forum/tasks/runs/<run>.tsv, then:`, `BENCHMARK=${r.benchmark} MODE=${r.mode} TASKS=base_forum/tasks/runs/<run>.tsv \\`, `AUTHORITY_MODEL=${r.authority_model} AUTHORITY_THINKING=${r.authority_thinking} \\`];
+  const lines = r.dataset
+    ? [`# the dataset ${r.dataset} (base_forum/tasks/datasets/${r.dataset}.json) sets the tasks and the benchmark:`, `DATASET=${r.dataset} MODE=${r.mode} \\`, `AUTHORITY_MODEL=${r.authority_model} AUTHORITY_THINKING=${r.authority_thinking} \\`]
+    : [`# the ${plural(sel.length, "task")} are written to base_forum/tasks/runs/<run>.tsv, then:`, `BENCHMARK=${r.benchmark} MODE=${r.mode} TASKS=base_forum/tasks/runs/<run>.tsv \\`, `AUTHORITY_MODEL=${r.authority_model} AUTHORITY_THINKING=${r.authority_thinking} \\`];
   if (r.mode === "forum") lines.push(`WORKER_MODEL=${r.worker_model} WORKER_THINKING=${r.worker_thinking} MIN_WORKERS=${r.min_workers} MAX_WORKERS=${r.max_workers} MAX_LIVE_WORKERS=${r.max_live_workers} \\`);
-  if (r.mode === "vote") lines.push(`WORKER_MODEL=${r.worker_model} WORKER_THINKING=${r.worker_thinking} WORKERS=${r.workers} MAX_LIVE_WORKERS=${r.max_live_workers} \\`);
+  if (r.mode === "vote" || r.mode === "peer-review") lines.push(`WORKER_MODEL=${r.worker_model} WORKER_THINKING=${r.worker_thinking} WORKERS=${r.workers} MAX_LIVE_WORKERS=${r.max_live_workers} \\`);
   lines.push(`CONCURRENCY=${r.concurrency} RETRIES=${r.retries} BUDGET_USD=${r.budget_usd}${r.scripted ? " FAUX=smoke" : ""} \\`, "base_forum/scripts/run_baseline.sh");
   return lines.join("\n");
 }
@@ -747,15 +849,25 @@ function sameRuns() {
     .map((r) => ({ name: runLabel(r), when: shortDate(r.started_at), ids: r.task_ids }));
 }
 
+async function reloadCatalog() {
+  const d = await getJSON("api/catalog");
+  CAT = d.benchmarks;
+  CAT_START = d.start;
+  CAT_SAVE = !!d.save;
+  SETUPS = d.setups || [];
+  if (!CAT[ST.benchKey]) ST.benchKey = Object.keys(CAT)[0];
+}
 async function show() {
-  if (!CAT) {
-    const d = await getJSON("api/catalog");
-    CAT = d.benchmarks;
-    CAT_START = d.start;
-    if (!CAT[ST.benchKey]) ST.benchKey = Object.keys(CAT)[0];
-  }
+  if (!CAT) await reloadCatalog();
   render();
 }
+// Open New run on a named dataset (from Insights, or a run's page).
+async function onDataset(benchKey, slug) {
+  await reloadCatalog();
+  if (CAT[benchKey]) ST.benchKey = benchKey;
+  ST.mode = "dataset";
+  ST.dataset = slug;
+}
 $("sd-cancel").addEventListener("click", () => $("start-dialog").close());
-window.NewRun = { show };
+window.NewRun = { show, onDataset };
 })();
