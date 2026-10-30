@@ -1,9 +1,12 @@
 #!/usr/bin/env node
-// decorum-forum: run one trial of the base forum (or a single agent) on a repository.
+// decorum-forum: run one trial of the base forum (or a single agent, or EvoMAS's majority vote) on a repository.
 //
 //   node src/main.ts run --instruction-file task.md --repo /app --out /logs/agent/decorum \
 //     --mode forum --authority-model moonshotai/kimi-k3 --worker-model moonshotai/kimi-k2.7-code \
 //     [--rulebook rulebooks/base-0.yaml] [--authority-thinking high] [--worker-thinking high]
+//
+// In vote mode --workers N workers on --worker-model each solve the task, and the aggregator, on --authority-model
+// at --authority-thinking, writes the final patch from theirs.
 //
 // Exit 0: the trial ran (whatever its end reason; see summary.json). Exit 2: a configuration error, named.
 // Exit 1: the runtime crashed; summary.json may be missing.
@@ -19,8 +22,9 @@ import type { CommitPolicy, Mode, ThinkingLevel } from "./runtime.ts";
 import { ForumRuntime } from "./runtime.ts";
 
 const THINKING = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
-const USAGE = `usage: decorum-forum run --instruction-file F --repo DIR --out DIR [--mode forum|single]
+const USAGE = `usage: decorum-forum run --instruction-file F --repo DIR --out DIR [--mode forum|single|vote]
   --authority-model provider/id [--worker-model provider/id] [--rulebook FILE]
+  [--workers N] [--instance-id ID] [--aggregator-reserve F]   (vote: N workers, the task's id, the aggregator's share 0-0.9)
   [--authority-thinking LEVEL] [--worker-thinking LEVEL] [--work-dir DIR] [--faux smoke]
   [--commit-policy commit|leave] [--wall-clock-sec N] [--max-authority-wakes N]
   [--min-workers N] [--max-workers N] [--max-live-workers N] [--budget-usd X]   (override the rulebook's budget)`;
@@ -55,6 +59,9 @@ async function main(argv: string[]): Promise<number> {
 			"max-workers": { type: "string" },
 			"max-live-workers": { type: "string" },
 			"budget-usd": { type: "string" },
+			workers: { type: "string", default: "5" },
+			"instance-id": { type: "string", default: "" },
+			"aggregator-reserve": { type: "string", default: "0.15" },
 		},
 		strict: true,
 	});
@@ -67,7 +74,13 @@ async function main(argv: string[]): Promise<number> {
 	const repo = resolve(need("repo"));
 	const outDir = resolve(need("out"));
 	const mode = v.mode as Mode;
-	if (mode !== "forum" && mode !== "single") throw new ConfigError(`--mode must be forum or single, got "${mode}".`);
+	if (mode !== "forum" && mode !== "single" && mode !== "vote") throw new ConfigError(`--mode must be forum, single or vote, got "${mode}".`);
+	const voteWorkers = Number(v.workers);
+	if (!Number.isInteger(voteWorkers) || voteWorkers < 1 || voteWorkers > 20) throw new ConfigError(`--workers must be a whole number from 1 to 20, got "${v.workers}".`);
+	const aggregatorReserve = Number(v["aggregator-reserve"]);
+	if (v["aggregator-reserve"]!.trim() === "" || !(aggregatorReserve >= 0 && aggregatorReserve <= 0.9)) {
+		throw new ConfigError(`--aggregator-reserve must be a share from 0 to 0.9, got "${v["aggregator-reserve"]}".`);
+	}
 	for (const k of ["authority-thinking", "worker-thinking"] as const) {
 		if (!THINKING.includes(v[k]!)) throw new ConfigError(`--${k} must be one of ${THINKING.join(", ")}.`);
 	}
@@ -107,9 +120,9 @@ async function main(argv: string[]): Promise<number> {
 		workerSpec = "faux/worker";
 	}
 	if (!authoritySpec) throw new ConfigError(`--authority-model is required.\n${USAGE}`);
-	if (mode === "forum" && !workerSpec) throw new ConfigError("--worker-model is required in forum mode.");
+	if (mode !== "single" && !workerSpec) throw new ConfigError(`--worker-model is required in ${mode} mode.`);
 	const authorityModel = await resolveModel(modelRuntime, authoritySpec);
-	const workerModel = mode === "forum" ? await resolveModel(modelRuntime, workerSpec!) : authorityModel;
+	const workerModel = mode === "single" ? authorityModel : await resolveModel(modelRuntime, workerSpec!);
 
 	const rt = new ForumRuntime({
 		instruction,
@@ -126,6 +139,9 @@ async function main(argv: string[]): Promise<number> {
 		commitPolicy,
 		wallClockSec,
 		maxAuthorityWakes: v["max-authority-wakes"] ? Number(v["max-authority-wakes"]) : undefined,
+		voteWorkers,
+		instanceId: v["instance-id"],
+		aggregatorReserve,
 		log,
 	});
 	const onSignal = (sig: string) => rt.stop("signal", `Received ${sig}.`);

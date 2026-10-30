@@ -70,6 +70,8 @@ RUN_SETTINGS = (
     "MAX_WORKERS",
     "MAX_LIVE_WORKERS",
     "BUDGET_USD",
+    "WORKERS",
+    "AGGREGATOR_RESERVE",
 )
 PRESET_FILES = {
     "deepswe": [
@@ -368,6 +370,7 @@ class TrialState:
             "mode": (summary or {}).get("mode"),
             "rulebook": ((summary or {}).get("rulebook") or {}).get("name"),
             "models": (summary or {}).get("models"),
+            "vote": _vote_brief((summary or {}).get("vote")),
             "threads": sum(1 for e in self.events if e.get("kind") == "thread_opened"),
             "posts": sum(1 for e in self.events if e.get("kind") == "post"),
             "workers": len(workers),
@@ -385,10 +388,12 @@ class TrialState:
             if e.get("kind") == "finished":
                 finished[e["assignment"]["worker"]] = e["assignment"]
         agents = []
+        # the agent that leads the trial: the forum's authority, or a majority vote's aggregator (shown once it starts)
+        lead = "aggregator" if ov.get("mode") == "vote" else "authority"
         names = [
-            "authority",
-            *[n for n in assigned if n != "authority"],
-            *[n for n in self.sessions if n not in assigned and n != "authority"],
+            *([lead] if lead == "authority" or lead in self.sessions else []),
+            *[n for n in assigned if n != lead],
+            *[n for n in self.sessions if n not in assigned and n != lead],
         ]
         for name in names:
             s = self.sessions.get(name)
@@ -400,7 +405,7 @@ class TrialState:
                     if (f is None or f.get("status") == "finished")
                     else "stopped"
                 )
-                if name == "authority":
+                if name == lead:
                     state = "finished"
             elif (
                 f is not None
@@ -415,7 +420,7 @@ class TrialState:
             agents.append(
                 {
                     "name": name,
-                    "role": "authority" if name == "authority" else "worker",
+                    "role": lead if name == lead else "worker",
                     "model": s.model if s else None,
                     "thread": a["thread"] if a else None,
                     "persona": a["persona"] if a else None,
@@ -434,6 +439,26 @@ class TrialState:
             "epoch": self.epoch,
             "agents": agents,
         }
+
+
+def _mode_of(import_path: str) -> str:
+    """The condition a run ran, from its Pier agent: DecorumSingle, DecorumVote, or the forum."""
+    if "Single" in import_path:
+        return "single"
+    return "vote" if "Vote" in import_path else "forum"
+
+
+def _vote_brief(vote: dict | None) -> dict | None:
+    """What became of a majority vote: how many workers made a patch, and whose patch was applied."""
+    if not vote:
+        return None
+    agg = vote.get("aggregator") or {}
+    return {
+        "workers": vote.get("workers"),
+        "patches": sum(1 for r in vote.get("reports") or [] if r.get("ok")),
+        "applied": bool((agg.get("apply") or {}).get("applied")),
+        "same_as": agg.get("same_as"),
+    }
 
 
 _TASK_INFO: dict[Path, dict] = {}
@@ -711,21 +736,21 @@ class Store:
             return v
 
         mode = body.get("mode", "forum")
-        if mode not in ("forum", "single"):
-            raise ValueError("mode must be forum or single")
+        if mode not in ("forum", "single", "vote"):
+            raise ValueError("mode must be forum, single or vote")
         scripted = body.get("scripted") is True
         models = {
             "authority_model": body.get("authority_model"),
-            "worker_model": body.get("worker_model") if mode == "forum" else None,
+            "worker_model": body.get("worker_model") if mode != "single" else None,
         }
         for name, m in models.items():
             if m is not None and (not isinstance(m, str) or not MODEL_RE.fullmatch(m)):
                 raise ValueError(f"{name} must look like provider/model, got {m!r}")
         if models["authority_model"] is None or (
-            mode == "forum" and models["worker_model"] is None
+            mode != "single" and models["worker_model"] is None
         ):
             raise ValueError(
-                "authority_model is required, and worker_model in forum mode"
+                "authority_model is required, and worker_model in forum and vote mode"
             )
         for name in ("authority_thinking", "worker_thinking"):
             if body.get(name, "high") not in THINKING:
@@ -733,8 +758,9 @@ class Store:
         lo, hi = whole("min_workers", 0, 8, 3), whole("max_workers", 1, 8, 6)
         if lo > hi:
             raise ValueError(f"min_workers ({lo}) is more than max_workers ({hi})")
+        workers = whole("workers", 1, 20, 5)
         live, conc, retries = (
-            whole("max_live_workers", 1, 8, 4),
+            whole("max_live_workers", 1, 20 if mode == "vote" else 8, 4),
             whole("concurrency", 1, 12, 2),
             whole("retries", 0, 3, 0),
         )
@@ -793,6 +819,15 @@ class Store:
                         "MAX_LIVE_WORKERS": str(live),
                     }
                 )
+            if mode == "vote":
+                env.update(
+                    {
+                        "WORKER_MODEL": models["worker_model"],
+                        "WORKER_THINKING": body.get("worker_thinking", "high"),
+                        "WORKERS": str(workers),
+                        "MAX_LIVE_WORKERS": str(min(live, workers)),
+                    }
+                )
             if scripted:
                 env["FAUX"] = "smoke"
             if name:
@@ -809,6 +844,7 @@ class Store:
                 "name": name or None,
                 "authority_model": models["authority_model"],
                 "worker_model": models["worker_model"],
+                "workers": workers if mode == "vote" else None,
                 "scripted": scripted,
                 "at": datetime.now(UTC).isoformat(),
             }
@@ -862,6 +898,7 @@ class Store:
                     "rulebook": "base-0",
                     "authority_model": s["authority_model"],
                     "worker_model": s["worker_model"],
+                    "workers": s.get("workers"),
                     "faux": s["scripted"],
                     "started_at": s["at"],
                     "finished_at": None,
@@ -1254,11 +1291,12 @@ class Store:
                         "job": job.name,
                         "name": self._names(root).get(job.name) or None,
                         "benchmark": bench,
-                        "mode": "single" if "Single" in import_path else "forum",
+                        "mode": _mode_of(import_path),
                         "rulebook": kw.get("rulebook")
                         or (trials[0]["rulebook"] if trials else None),
                         "authority_model": agent.get("model_name"),
                         "worker_model": kw.get("worker_model"),
+                        "workers": kw.get("workers") if _mode_of(import_path) == "vote" else None,
                         "faux": bool(kw.get("faux")),
                         "started_at": _local_iso(res.get("started_at"))
                         or min(

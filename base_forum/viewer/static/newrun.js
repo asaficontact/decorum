@@ -176,7 +176,7 @@ const ST = {
   mode: "random", n: 10, seed: 7, order: "first", paste: "", picked: new Set(), sameRun: 0,
   filters: { repo: "", language: "", band: "", category: "", hard51: false, q: "" },
   mix: "match", custom: { easy: 3, medium: 3, hard: 2, "very hard": 2 }, spread: true,
-  team: { mode: "forum", authority: "moonshotai/kimi-k3", athink: "max", worker: "moonshotai/kimi-k2.7-code", wthink: "high", min: 3, max: 6, live: 4 },
+  team: { mode: "forum", authority: "moonshotai/kimi-k3", athink: "max", worker: "moonshotai/kimi-k2.7-code", wthink: "high", min: 3, max: 6, live: 4, n: 5 },
   run: { name: "", concurrency: 3, retries: 0, budget: 10 },
 };
 const bench = () => CAT[ST.benchKey];
@@ -550,10 +550,22 @@ function seats() {
 }
 function teamControls() {
   const w = el("div", "team");
-  w.append(field("The team", segmented([["forum", "The forum: an authority and workers"], ["single", "One agent, no forum"]], ST.team.mode, (v) => { ST.team.mode = v; render(); }, "Mode")));
+  w.append(field("The team", segmented([["forum", "The forum: an authority and workers"], ["vote", "Majority vote: workers, then an aggregator"], ["single", "One agent, no forum"]], ST.team.mode, (v) => { ST.team.mode = v; render(); }, "Mode")));
+  const vote = ST.team.mode === "vote";
+  const lead = vote ? "Aggregator" : "Authority";
   const a = el("div", "nr-who");
-  a.append(el("h4", "", "Authority"), modelPicker(ST.team.authority, (v) => { ST.team.authority = v; render(); }, "Authority model"), field("Thinking", thinkingPicker(ST.team.athink, (v) => { ST.team.athink = v; render(); }, "Authority thinking")));
+  a.append(el("h4", "", lead), modelPicker(ST.team.authority, (v) => { ST.team.authority = v; render(); }, `${lead} model`), field("Thinking", thinkingPicker(ST.team.athink, (v) => { ST.team.athink = v; render(); }, `${lead} thinking`)));
+  if (vote) a.append(el("p", "f-hint", "Reads the task and every worker's patch, and answers with the final patch (EvoMAS's aggregator). It may read the code, not change it."));
   w.append(a);
+  if (vote) {
+    const wk = el("div", "nr-who");
+    wk.append(el("h4", "", "Workers"), modelPicker(ST.team.worker, (v) => { ST.team.worker = v; render(); }, "Worker model"), field("Thinking", thinkingPicker(ST.team.wthink, (v) => { ST.team.wthink = v; render(); }, "Worker thinking")));
+    const range = el("div", "range");
+    range.append(field("Workers", stepper(ST.team.n, 1, 20, (v) => { ST.team.n = v; render(); }, "Workers per task")),
+      field("At once", stepper(Math.min(ST.team.live, ST.team.n), 1, ST.team.n, (v) => { ST.team.live = v; refresh(); }, "Most workers working at the same time")));
+    wk.append(el("h5", "", "Workers per task"), range, el("p", "f-hint", `Each of the ${ST.team.n} workers solves the task alone in its own copy of the repository, as the single agent does; none sees another's work. 15% of the spend cap and of the time is kept for the aggregator.`));
+    w.append(wk);
+  }
   if (ST.team.mode === "forum") {
     const wk = el("div", "nr-who");
     wk.append(el("h4", "", "Workers"), modelPicker(ST.team.worker, (v) => { ST.team.worker = v; render(); }, "Worker model"), field("Thinking", thinkingPicker(ST.team.wthink, (v) => { ST.team.wthink = v; render(); }, "Worker thinking")));
@@ -608,7 +620,7 @@ function summary(full) {
   }
   w.append(bar, el("div", "sh-small", BANDS.filter((x) => s.bands[x]).map((x) => `${s.bands[x]} ${BAND_WORD[x].toLowerCase()}`).join(" · ") || "no tasks yet"));
   if (s.langs.length) w.append(el("div", "sh-small", s.langs.map(([l, n]) => `${n} ${langWord(l)}`).join(" · ") + ` · ${plural(s.repos.length, "repository")}`));
-  w.append(line("§ Team", ST.team.mode === "forum" ? `${modelName(ST.team.authority)} (${ST.team.athink}) leads ${ST.team.min} to ${ST.team.max} ${modelName(ST.team.worker)} workers (${ST.team.wthink})` : `${modelName(ST.team.authority)} alone (${ST.team.athink})`));
+  w.append(line("§ Team", teamLine(true)));
   w.append(line("§ Limits", `${limitLabel(b)}; at most ${money(ST.run.budget)} a task`));
   if (s.n) {
     const lo = s.ci50[0], hi = s.ci50[1];
@@ -637,12 +649,20 @@ function summary(full) {
   w.append(go);
   return w;
 }
+/** The team in one line, for the sheet and the start dialog. */
+function teamLine(thinking) {
+  const t = ST.team;
+  const th = (x) => (thinking ? ` (${x})` : "");
+  if (t.mode === "forum") return `${modelName(t.authority)}${th(t.athink)} leads ${t.min} to ${t.max} ${modelName(t.worker)} workers${th(t.wthink)}`;
+  if (t.mode === "vote") return `${t.n} ${modelName(t.worker)} workers${th(t.wthink)}, ${Math.min(t.live, t.n)} at once, then ${modelName(t.authority)}${th(t.athink)} aggregates`;
+  return `${modelName(t.authority)}${th(t.athink)} alone`;
+}
 function request(sel) {
   const t = ST.team;
   return {
     benchmark: ST.benchKey, tasks: sel.map((x) => x.id), mode: t.mode, scripted: ST.scripted,
     authority_model: t.authority, authority_thinking: t.athink, worker_model: t.worker, worker_thinking: t.wthink,
-    min_workers: t.min, max_workers: t.max, max_live_workers: t.live,
+    min_workers: t.min, max_workers: t.max, max_live_workers: t.mode === "vote" ? Math.min(t.live, t.n) : t.live, workers: t.n,
     concurrency: ST.run.concurrency, retries: ST.run.retries, budget_usd: ST.run.budget, name: ST.run.name.trim(),
   };
 }
@@ -650,6 +670,7 @@ function commandText(sel) {
   const r = request(sel);
   const lines = [`# the ${plural(sel.length, "task")} are written to base_forum/tasks/runs/<run>.tsv, then:`, `BENCHMARK=${r.benchmark} MODE=${r.mode} TASKS=base_forum/tasks/runs/<run>.tsv \\`, `AUTHORITY_MODEL=${r.authority_model} AUTHORITY_THINKING=${r.authority_thinking} \\`];
   if (r.mode === "forum") lines.push(`WORKER_MODEL=${r.worker_model} WORKER_THINKING=${r.worker_thinking} MIN_WORKERS=${r.min_workers} MAX_WORKERS=${r.max_workers} MAX_LIVE_WORKERS=${r.max_live_workers} \\`);
+  if (r.mode === "vote") lines.push(`WORKER_MODEL=${r.worker_model} WORKER_THINKING=${r.worker_thinking} WORKERS=${r.workers} MAX_LIVE_WORKERS=${r.max_live_workers} \\`);
   lines.push(`CONCURRENCY=${r.concurrency} RETRIES=${r.retries} BUDGET_USD=${r.budget_usd}${r.scripted ? " FAUX=smoke" : ""} \\`, "base_forum/scripts/run_baseline.sh");
   return lines.join("\n");
 }
@@ -675,7 +696,7 @@ function confirmStart(sel, s) {
     }
   };
   $("sd-title").textContent = `Start ${plural(s.n, "task")} on ${bench().name}?`;
-  $("sd-text").textContent = `${ST.team.mode === "forum" ? `${modelName(ST.team.authority)} leads ${ST.team.min} to ${ST.team.max} ${modelName(ST.team.worker)} workers` : `${modelName(ST.team.authority)} works alone`}, ${Math.min(ST.run.concurrency, s.n) > 1 ? `${Math.min(ST.run.concurrency, s.n)} tasks at a time` : "one task at a time"}. ${ST.scripted ? "Scripted agents: no model calls, no cost." : `It can spend up to ${money(s.n * ST.run.budget)}.`} It appears in the list at once.`;
+  $("sd-text").textContent = `${ST.team.mode === "single" ? `${modelName(ST.team.authority)} works alone` : teamLine(false)}, ${Math.min(ST.run.concurrency, s.n) > 1 ? `${Math.min(ST.run.concurrency, s.n)} tasks at a time` : "one task at a time"}. ${ST.scripted ? "Scripted agents: no model calls, no cost." : `It can spend up to ${money(s.n * ST.run.budget)}.`} It appears in the list at once.`;
   d.showModal();
 }
 

@@ -2,7 +2,7 @@
 
 The authority is the root trajectory; each worker is an embedded subagent trajectory, referenced from the
 assign_workers call that started it. The forum itself (forum.jsonl) stays beside the trajectory as the
-trial's coordination trace.
+trial's coordination trace. In a majority vote the aggregator is the root and the workers are its subagents.
 """
 
 from __future__ import annotations
@@ -145,7 +145,7 @@ def build_trajectory(summary: dict[str, Any], out_dir: Path, *, agent_name: str,
         )
 
     def trajectory(a: dict[str, Any], *, root: bool) -> Trajectory:
-        steps, t = built[a["name"]]
+        steps, t = built.get(a["name"], ([], {"session_id": None}))
         u = a.get("usage") or {}
         return Trajectory(
             schema_version="ATIF-v1.7",
@@ -173,7 +173,11 @@ def build_trajectory(summary: dict[str, Any], out_dir: Path, *, agent_name: str,
             ),
         )
 
-    authority = next((a for a in agents if a.get("role") == "authority"), None)
+    lead = "aggregator" if summary.get("mode") == "vote" else "authority"
+    authority = next((a for a in agents if a.get("role") == lead), None)
+    if authority is None and lead == "aggregator":
+        # the trial stopped before the aggregator started: the root is an empty aggregator
+        authority = {"name": "aggregator", "role": "aggregator", "model": (summary.get("models") or {}).get("authority")}
     if authority is None:
         raise ValueError("summary.json names no authority agent")
     root = trajectory(authority, root=True)
@@ -195,6 +199,7 @@ def build_trajectory(summary: dict[str, Any], out_dir: Path, *, agent_name: str,
             "rulebook": (summary.get("rulebook") or {}).get("name"),
             "forum": summary.get("forum"),
             "auto_committed": summary.get("auto_committed"),
+            "vote": summary.get("vote"),
         },
     )
     root.notes = f"decorum {summary.get('mode')} trial, rulebook {(summary.get('rulebook') or {}).get('name')}, ended: {summary.get('end_reason')}. Forum trace: agent/decorum/forum.jsonl."

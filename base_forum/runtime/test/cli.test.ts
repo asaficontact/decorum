@@ -75,3 +75,34 @@ test("--min-workers, --max-workers, --max-live-workers and --budget-usd set the 
 	assert.equal(word.code, 2);
 	assert.match(word.err, /--budget-usd must be a number, got "lots"/);
 });
+
+test("--mode vote --faux smoke runs a whole majority vote from the command line", () => {
+	const repo = gitRepo();
+	const out = tempDir();
+	const r = cli(["run", "--instruction", "Write smoke files.", "--repo", repo, "--out", out, "--work-dir", tempDir(), "--faux", "smoke",
+		"--mode", "vote", "--workers", "3", "--instance-id", "smoke__smoke-1", "--commit-policy", "leave"]);
+	assert.equal(r.code, 0, r.err);
+	const s = JSON.parse(readFileSync(join(out, "summary.json"), "utf8"));
+	assert.equal(s.mode, "vote");
+	assert.equal(s.end_reason, "vote_done");
+	assert.deepEqual(s.agents.map((a: { name: string }) => a.name), ["worker1", "worker2", "worker3", "aggregator"]);
+	assert.equal(s.vote.aggregator.same_as, "worker1");
+	assert.equal(gitOut(repo, "status", "--porcelain"), "?? DECORUM_SMOKE_worker1.md", "worker1's file, applied and left uncommitted");
+	assert.match(readFileSync(join(out, "vote", "aggregator_prompt.md"), "utf8"), /^Repository: .+\nInstance ID: smoke__smoke-1\n/);
+});
+
+test("vote mode checks its flags", () => {
+	const base = ["run", "--instruction", "x", "--repo", gitRepo(), "--out", tempDir(), "--work-dir", tempDir(), "--mode", "vote"];
+	const workers = cli([...base, "--faux", "smoke", "--workers", "0"]);
+	assert.equal(workers.code, 2);
+	assert.match(workers.err, /--workers must be a whole number from 1 to 20, got "0"/);
+	const reserve = cli([...base, "--faux", "smoke", "--aggregator-reserve", "1"]);
+	assert.equal(reserve.code, 2);
+	assert.match(reserve.err, /--aggregator-reserve must be a share from 0 to 0.9/);
+	const noWorker = cli([...base, "--authority-model", "moonshotai/kimi-k2.7-code"], { MOONSHOT_API_KEY: "sk-test" });
+	assert.equal(noWorker.code, 2);
+	assert.match(noWorker.err, /--worker-model is required in vote mode/);
+	const mode = cli([...base.slice(0, -1), "pairs", "--faux", "smoke"]);
+	assert.equal(mode.code, 2);
+	assert.match(mode.err, /--mode must be forum, single or vote/);
+});
