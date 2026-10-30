@@ -1257,12 +1257,21 @@ def test_the_mode_of_a_run_comes_from_its_pier_agent() -> None:
     assert fv._evomas_brief(None) is None
     # a vote from before peer review wrote "vote"
     old = {"vote": {"workers": 3, "reports": [{"ok": True}, {"ok": False}, {"ok": True}], "aggregator": {"apply": {"applied": True}, "same_as": "worker3"}}}
-    assert fv._evomas_brief(old) == {"topology": "vote", "workers": 3, "patches": 2, "applied": True, "same_as": "worker3"}
+    assert fv._evomas_brief(old) == {"topology": "vote", "workers": 3, "patches": 2, "applied": True, "same_as": "worker3", "recovered": None}
     peer = {"evomas": {"topology": "peer-review", "agents_per_layer": 2, "layers": [
         {"kind": "coder", "reports": [{"ok": True}, {"ok": True}]},
         {"kind": "reader", "reports": [{"ok": True}, {"ok": False}]},
     ], "aggregator": {"apply": {"applied": False}, "same_as": None}}}
-    assert fv._evomas_brief(peer) == {"topology": "peer-review", "workers": 2, "patches": 2, "applied": False, "same_as": None}
+    assert fv._evomas_brief(peer) == {"topology": "peer-review", "workers": 2, "patches": 2, "applied": False, "same_as": None, "recovered": None}
+
+
+def test_a_regraded_recovered_aggregator_patch_shows_how_it_was_recovered(tmp_path) -> None:
+    peer = {"evomas": {"topology": "peer-review", "agents_per_layer": 1, "layers": [{"kind": "coder", "reports": [{"ok": True}]}],
+                       "aggregator": {"apply": {"applied": False}, "same_as": None}}}
+    (tmp_path / "regrade").mkdir()
+    (tmp_path / "regrade" / "reward.json").write_text(json.dumps({"reward": 1.0, "recovery_method": "git apply --recount"}))
+    assert fv._evomas_brief(peer, tmp_path)["recovered"] == "git apply --recount"
+    assert fv._evomas_brief(peer)["recovered"] is None, "only a trial graded by its regrade"
 
 
 @pytest.mark.parametrize(
